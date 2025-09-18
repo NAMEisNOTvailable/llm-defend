@@ -1,0 +1,5 @@
+﻿datasets
+regex
+numpy
+scikit-learn
+pyyaml
