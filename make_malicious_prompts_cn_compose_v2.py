@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 make_malicious_prompts_cn_compose_v2.py
 
@@ -37,12 +37,38 @@ from typing import List, Dict, Optional, Tuple
 import subprocess, shlex, time
 import numpy as np, platform, datasets as hf_datasets
 from enum import Enum, auto
+from multiprocessing import Pool, cpu_count
+try:
+    from simhash import weighted_fingerprint as _simhash_weighted_fp, hamming_distance as _simhash_hamm_dist
+except Exception:
+    _simhash_weighted_fp = None
+    _simhash_hamm_dist = None
+try:
+    from datasketch import MinHash as _DSMinHash, MinHashLSH as _DSMinHashLSH
+except Exception:
+    _DSMinHash = None
+    _DSMinHashLSH = None
+try:
+    import faiss  # type: ignore
+except Exception:
+    try:
+        import faiss_cpu as faiss  # type: ignore
+    except Exception:
+        faiss = None
 try:
     from dsl_core import generate_batch, compile_from_yaml, invariant_result_slot
 except Exception:
     generate_batch = None
     compile_from_yaml = None
     invariant_result_slot = None
+try:
+    from dsl_core import _h64  # reuse token hash cache if available
+except Exception:
+    from functools import lru_cache as _lru_cache
+
+    @_lru_cache(maxsize=1 << 20)
+    def _h64(g: str) -> int:
+        return int.from_bytes(hashlib.blake2b(g.encode("utf-8"), digest_size=8).digest(), "big")
 from math import sqrt
 # 这些不变量探针仅用于诊断/审计；在缺失 dsl_core 时不应导致导入失败
 try:
@@ -174,6 +200,28 @@ class Config:
     gray_neg_keep_frac: float = 0.35      # 2) keep fraction for gray negatives
     cjk_policy: str = "tiered"            # 3) CJK policy: "hard"|"tiered"|"audit"
     mt_tool_override_rate: float = 0.25   # 7) multi-turn tool-override sampling rate
+
+
+@dataclass
+class RenderPacket:
+    """Lightweight payload passed across processes to reduce pickling cost."""
+    seed: int
+    text: str
+    inj_text: str
+    fam_name: str
+    mapped_intent: str
+    payload: Optional[str]
+    carrier_name: str
+    mode: str
+    channel: str
+    position: str
+    scope: str
+    target_idx: int
+    art_flag: bool
+
+
+_ATTACK_PRODUCER_CFG: dict | None = None
+_ATTACK_PRODUCER_TARGETS: List[Dict[str, Any]] | None = None
 
 # ------------------ Common text & feature probes // 通用文本与特征探针 ------------------
 MASKED_FIELD_FAMILY_COUNTER = Counter()
@@ -993,39 +1041,74 @@ def effect_check_with_ref(task_txt: str, injected_text: str, model: str, contrac
 
 
 
+
 # ------------------ SimHash + MinHash-LSH de-dup // 去重：SimHash + MinHash-LSH ------------------
-def _simhash(s: str, bits: int = 64) -> int:
-    s = normalize(s)
-    chars = [c for c in s if not c.isspace()]
-    bigrams = [s[i:i+2] for i in range(len(s)-1)]
-    toks = chars + bigrams
-    if not toks: toks = [s]
+
+
+def _simhash_fallback(tokens: List[str], bits: int = 64) -> int:
+    digest_bytes = max(1, bits // 8)
     v = [0] * bits
-    for t in toks:
-        h = int.from_bytes(hashlib.blake2b(t.encode("utf-8"), digest_size=bits//8).digest(), "big")
+    for t in tokens:
+        h = int.from_bytes(hashlib.blake2b(t.encode("utf-8"), digest_size=digest_bytes).digest(), "big")
         for i in range(bits):
             v[i] += 1 if (h >> i) & 1 else -1
     out = 0
     for i in range(bits):
-        if v[i] >= 0: out |= (1 << i)
+        if v[i] >= 0:
+            out |= (1 << i)
     return out
+def _simhash(s: str, bits: int = 64) -> int:
+    norm = normalize(s)
+    txt = re.sub(r"\s+", " ", norm or "").lower()
+    toks = [c for c in txt if not c.isspace()] + [txt[i:i+2] for i in range(len(txt) - 1)]
+    if not toks:
+        toks = [txt]
+    if _simhash_weighted_fp is not None and bits == 64:
+        pairs = [(_h64(tok), 1.0) for tok in toks]
+        try:
+            return int(_simhash_weighted_fp(pairs))
+        except Exception:
+            pass
+    return _simhash_fallback(toks, bits)
 def _hamm(a: int, b: int) -> int:
-    """Hamming distance. // 汉明距离。"""
-    return (a ^ b).bit_count()
+    """Hamming distance. // 汉明距离"""
+    if _simhash_hamm_dist is not None:
+        try:
+            return int(_simhash_hamm_dist(int(a), int(b)))
+        except Exception:
+            pass
+    return (int(a) ^ int(b)).bit_count()
+
 def _char_shingles(s: str, k: int = 5) -> Set[str]:
     """Character k-shingles. // 字符 k-shingles。"""
     s = normalize(s)
     if len(s) <= k: return {s}
     return {s[i:i+k] for i in range(len(s)-k+1)}
-def _minhash(shingles: Iterable[str], n_hash: int = 64, seed_base: int = 2025) -> Tuple[int, ...]:
-    """MinHash sketch over shingles. // MinHash 素描。"""
+def _minhash(shingles: Iterable[str], n_hash: int = 64, seed_base: int = 2025):
+    """MinHash sketch over shingles. // MinHash 素描"""
+    if _DSMinHash is not None:
+        mh = _DSMinHash(num_perm=n_hash)
+        for g in shingles:
+            mh.update(g.encode("utf-8"))
+        return mh
     mins = [2**63-1] * n_hash
     for g in shingles:
         ge = g.encode("utf-8")
         for i in range(n_hash):
             h = int.from_bytes(hashlib.blake2b(ge, digest_size=8, person=str(seed_base+i).encode()).digest(), "big")
-            if h < mins[i]: mins[i] = h
+            if h < mins[i]:
+                mins[i] = h
     return tuple(mins)
+
+
+def _simhash_to_bytes(sig: int, bits: int) -> np.ndarray:
+    byte_len = (bits + 7) // 8
+    return np.frombuffer(int(sig).to_bytes(byte_len, 'little', signed=False), dtype=np.uint8).reshape(1, byte_len)
+
+
+def _dense_to_np(vec: List[float]) -> np.ndarray:
+    return np.asarray(vec, dtype='float32').reshape(1, -1)
+
 def tool_poison_variants(payload: str, secret: str) -> str:
     k_ans = random.choice(ANSWER_KEYS)
     k_note= random.choice(NOTE_KEYS)
@@ -1053,37 +1136,63 @@ def rag_smuggle(payload: str) -> str:
     ])
 
 class LSHMinhashIndex:
-    """LSH index on MinHash bands. // 基于 MinHash 分段的 LSH 索引。"""
-    def __init__(self, n_hash: int = 64, bands: int = 16):
-        assert n_hash % bands == 0
+    """LSH index on MinHash bands. // 基于 MinHash 分段的 LSH 索引"""
+    def __init__(self, n_hash: int = 64, bands: int = 16, threshold: float = 0.9):
         self.n_hash = n_hash
         self.bands = bands
-        self.rows = n_hash // bands
-        self.buckets = [defaultdict(list) for _ in range(bands)]
-        self.items: List[Tuple[Tuple[int,...], Set[str]]] = []
-    def _band_keys(self, sig: Tuple[int,...]) -> List[Tuple[int,...]]:
-        return [tuple(sig[i*self.rows:(i+1)*self.rows]) for i in range(self.bands)]
-    def add(self, sig: Tuple[int,...], shingles: Set[str]):
+        self.threshold = float(threshold)
+        self.rows = n_hash // bands if bands else n_hash
+        if _DSMinHashLSH is not None:
+            self._use_datasketch = True
+            self._lsh = _DSMinHashLSH(threshold=self.threshold, num_perm=n_hash)
+            self._store: Dict[str, Set[str]] = {}
+            self._counter = 0
+        else:
+            assert bands and n_hash % bands == 0
+            self._use_datasketch = False
+            self.buckets = [defaultdict(list) for _ in range(bands)]
+            self.items: List[Tuple[Tuple[int, ...], Set[str]]] = []
+
+    def _band_keys(self, sig: Tuple[int, ...]) -> List[Tuple[int, ...]]:
+        return [tuple(sig[i * self.rows:(i + 1) * self.rows]) for i in range(self.bands)]
+
+    def add(self, sig, shingles: Set[str]):
+        if self._use_datasketch:
+            key = f"mh-{self._counter}"
+            self._counter += 1
+            self._store[key] = shingles
+            self._lsh.insert(key, sig)
+            return
         idx = len(self.items)
         self.items.append((sig, shingles))
         for b, key in enumerate(self._band_keys(sig)):
             self.buckets[b][key].append(idx)
-    def candidates(self, sig: Tuple[int,...]) -> Set[int]:
+
+    def candidates(self, sig: Tuple[int, ...]) -> Set[int]:
         cand = set()
         for b, key in enumerate(self._band_keys(sig)):
             cand.update(self.buckets[b].get(key, []))
         return cand
-    def query(self, sig: Tuple[int, ...], shingles: Set[str], jaccard_thresh: float) -> bool:
-        # 基于候选桶做精确 Jaccard 终判
+
+    def query(self, sig, shingles: Set[str], jaccard_thresh: float) -> bool:
+        thr = float(jaccard_thresh)
+        if self._use_datasketch:
+            cand_keys = self._lsh.query(sig)
+            for key in cand_keys:
+                oshingles = self._store.get(key, set())
+                inter = len(shingles & oshingles)
+                uni = len(shingles | oshingles) + 1e-9
+                if inter / uni >= thr:
+                    return True
+            return False
         cand_idx = self.candidates(sig)
         for idx in cand_idx:
             osig, oshingles = self.items[idx]
             inter = len(shingles & oshingles)
             uni = len(shingles | oshingles) + 1e-9
-            if inter / uni >= jaccard_thresh:
+            if inter / uni >= thr:
                 return True
         return False
-
 def _for_dedup_norm(s: str, preserve_carrier: bool = True) -> str:
     # 归一化：去意图锚点/去围栏/去 JSON/去常见载体外壳/归一随机占位
     s = strip_attack_intent(s)
@@ -1140,6 +1249,7 @@ def dedup_groups(rows, deduper: Deduper, preserve_carrier: bool = True):
                 keep.extend(arr)
                 break
     return keep
+
 class Deduper:
     """Combined SimHash + LSH + exact Jaccard + hashed-trigram cosine; optional external embedding de-duper."""
     def __init__(self, sim_bits=64, sim_thresh=2, k=5, n_hash=64, bands=16,
@@ -1148,13 +1258,25 @@ class Deduper:
         self.sim_thresh = sim_thresh
         self.sim_sigs: List[int] = []
         self.k = k
-        self.index = LSHMinhashIndex(n_hash=n_hash, bands=bands)
+        self.index = LSHMinhashIndex(n_hash=n_hash, bands=bands, threshold=jaccard_thresh)
         self.jaccard_thresh = jaccard_thresh
         # --- new: vector index ---
         self.vec_dim = int(vec_dim)
         self.cosine_thresh = float(cosine_thresh)
         self.max_vecs = int(max_vecs)
         self._vecs: List[List[float]] = []  # normalized vectors
+        self._faiss_sim = None
+        if faiss is not None and self.sim_bits % 8 == 0:
+            try:
+                self._faiss_sim = faiss.IndexBinaryFlat(self.sim_bits)
+            except Exception:
+                self._faiss_sim = None
+        self._faiss_dense = None
+        if faiss is not None and self.vec_dim > 0:
+            try:
+                self._faiss_dense = faiss.IndexFlatIP(self.vec_dim)
+            except Exception:
+                self._faiss_dense = None
         # --- optional external sentence embedding view (class-shared) ---
         if not hasattr(Deduper, "_ext_embed_fn"):
             Deduper._ext_embed_fn = None
@@ -1186,9 +1308,14 @@ class Deduper:
         return [v / norm for v in vec]
 
     def _cosine_near(self, v: List[float]) -> bool:
-        # linear scan; good enough with cap max_vecs
+        if self._faiss_dense is not None and self._faiss_dense.ntotal > 0:
+            vec = _dense_to_np(v)
+            k = min(32, self._faiss_dense.ntotal) or 1
+            D, _ = self._faiss_dense.search(vec, k)
+            for score in D[0]:
+                if score >= self.cosine_thresh:
+                    return True
         for u in self._vecs:
-            # dot product
             s = 0.0
             for i in range(self.vec_dim):
                 s += v[i] * u[i]
@@ -1216,12 +1343,21 @@ class Deduper:
     def accept(self, text: str) -> bool:
         # Quick SimHash screen
         sig = _simhash(text, self.sim_bits)
-        for old in self.sim_sigs:
-            if _hamm(sig, old) <= self.sim_thresh:
-                return False
+        sig_bytes = None
+        if self._faiss_sim is not None and self._faiss_sim.ntotal > 0:
+            sig_bytes = _simhash_to_bytes(sig, self.sim_bits)
+            k = min(64, self._faiss_sim.ntotal) or 1
+            D, _ = self._faiss_sim.search(sig_bytes, k)
+            for dist in D[0]:
+                if int(dist) <= self.sim_thresh:
+                    return False
+        else:
+            for old in self.sim_sigs:
+                if _hamm(sig, old) <= self.sim_thresh:
+                    return False
         # LSH MinHash screen
         shingles = _char_shingles(text, self.k)
-        mh = _minhash(shingles)
+        mh = _minhash(shingles, n_hash=self.index.n_hash)
         if self.index.query(mh, shingles, self.jaccard_thresh):
             return False
         # --- new: cosine embedding screen ---
@@ -1234,8 +1370,8 @@ class Deduper:
                 vext = Deduper._ext_embed_fn(normalize(text))
                 if isinstance(vext, list) and vext and self._cosine_ext(vext):
                     return False
-                # accept path: also cache
-                Deduper._ext_vecs.append(vext)
+                if isinstance(vext, list) and vext:
+                    Deduper._ext_vecs.append(vext)
             except Exception:
                 pass
         # Accept & insert
@@ -1244,7 +1380,20 @@ class Deduper:
         if len(self._vecs) >= self.max_vecs:
             self._vecs.pop(0)
         self._vecs.append(v)
+        if self._faiss_sim is not None:
+            if sig_bytes is None:
+                sig_bytes = _simhash_to_bytes(sig, self.sim_bits)
+            try:
+                self._faiss_sim.add(sig_bytes)
+            except Exception:
+                pass
+        if self._faiss_dense is not None:
+            try:
+                self._faiss_dense.add(_dense_to_np(v))
+            except Exception:
+                pass
         return True
+
 
 # ------------------ Light/Unicode jitter // 轻度/Unicode 扰动 ------------------
 CONFUSABLE_MAP = {'A':'Α','B':'Β','E':'Ε','H':'Η','I':'Ι','K':'Κ','M':'Μ','N':'Ν','O':'Ο','P':'Ρ','T':'Τ','X':'Χ',
@@ -4302,7 +4451,555 @@ def pick_strategy(goal_hint: str | None = None) -> Strategy:
 
 # ------------------ Compose attacks // 生成注入样本 ------------------
 
-def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
+
+def _attack_producer_init(target_pool: List[Dict[str, Any]], cfg: dict):
+    """Initializer for worker processes to stash config/state."""
+    global _ATTACK_PRODUCER_CFG, _ATTACK_PRODUCER_TARGETS
+    _ATTACK_PRODUCER_CFG = cfg
+    _ATTACK_PRODUCER_TARGETS = target_pool
+
+
+def _attack_render_core(seed: int) -> tuple[Optional[RenderPacket], list[tuple[str, dict]]]:
+    cfg = _ATTACK_PRODUCER_CFG or {}
+    targets = _ATTACK_PRODUCER_TARGETS or []
+    if not targets:
+        return None, []
+    rng = random.Random(seed)
+    random.seed(seed)
+    logs: list[tuple[str, dict]] = []
+    try:
+        target_idx = rng.randrange(len(targets))
+        t = targets[target_idx]
+    except Exception as e:
+        logs.append(("producer_error", {"err": str(e)}))
+        return None, logs
+
+    try:
+        contract = derive_task_contract(t["task"])
+    except Exception as e:
+        logs.append(("contract_error", {"err": str(e), "task": t.get("task", "_")}))
+        return None, logs
+
+    dsl_intents = list(INTENT_GOALS)
+    intent_weights = []
+    for it in dsl_intents:
+        key = INTENT_TO_GOAL_KEY.get(it, "policy_bypass")
+        intent_weights.append(GOAL_WEIGHTS.get(key, 0.10))
+    ssum = sum(intent_weights) or 1.0
+    intent_weights = [w/ssum for w in intent_weights]
+    intent = rng.choices(dsl_intents, weights=intent_weights, k=1)[0]
+    channel = rng.choice(["in_context", "format_carrier", "rag_doc", "multi_turn"])
+    position = rng.choice(["prefix", "suffix", "inline", "metadata"])
+    scope = rng.choice(["result_slot", "tool_args", "upstream", "retriever", "memory"])
+    payload = None
+    try:
+        payload = sample_payload(structured=False).get("payload")
+    except Exception as e:
+        logs.append(("payload_error", {"err": str(e)}))
+    carrier = choose_carrier_name(rng=rng, include_none=False)
+    dsl = PIDSL(intent=intent, channel=channel, position=position, scope=scope, carrier=carrier, payload_hint=payload)
+    try:
+        tpl_text, _ = render_from_dsl(dsl, t["prompt"])
+    except Exception as e:
+        logs.append(("dsl_render_error", {"err": str(e), "intent": intent, "task": t.get("task", "_")}))
+        return None, logs
+
+    inj_text = tpl_text
+    evolve_variants = bool(cfg.get("evolve_variants", False))
+    use_model_eval = bool(cfg.get("use_model_eval", False))
+    if evolve_variants and use_model_eval and rng.random() < 0.20:
+        try:
+            tpl2, _ = evolve_injection(t["prompt"], tpl_text, contract, payload or "", steps=2)
+            if isinstance(tpl2, str) and tpl2:
+                inj_text = tpl2
+        except Exception as e:
+            logs.append(("evolve_error", {"err": str(e)}))
+
+    if payload:
+        try:
+            inj_text = materialize_payload_with_anchor(inj_text, payload, force_anchor=False)
+        except Exception as e:
+            logs.append(("payload_anchor_error", {"err": str(e)}))
+
+    artifact_rate = float(cfg.get("artifact_rate", 0.0))
+    art_flag = rng.random() < artifact_rate
+    try:
+        inj_text = art_or_euphemism(inj_text, use_art=art_flag)
+    except Exception as e:
+        logs.append(("artifact_error", {"err": str(e)}))
+
+    carrier_mix_prob = float(cfg.get("carrier_mix_prob", 0.45))
+    stack_prob = float(cfg.get("stack_prob", 0.25))
+    code_switch_prob = float(cfg.get("code_switch_prob", 0.18))
+    carrier_name = "none"
+    try:
+        if rng.random() < carrier_mix_prob:
+            carrier_name, inj_text = maybe_wrap_again_named(inj_text, rng=rng)
+            if rng.random() < stack_prob:
+                carrier_name2, inj_text = maybe_wrap_again_named(inj_text, rng=rng)
+                carrier_name = f"{carrier_name}+{carrier_name2}"
+        if rng.random() < code_switch_prob:
+            inj_text = code_switch_light(inj_text, p=0.20)
+    except Exception as e:
+        logs.append(("carrier_wrap_error", {"err": str(e)}))
+
+    force_multi = (rng.random() < 0.30)
+    try:
+        if (channel == "multi_turn" or force_multi) and rng.random() < 0.40:
+            inj_text_prog = compose_conversation_attacks_sample(t['prompt'], payload)
+            base, mode = build_delivery(t['prompt'], inj_text_prog, force_mode="multi_turn")
+        else:
+            base, mode = build_delivery(t['prompt'], inj_text, force_mode=("multi_turn" if force_multi else None))
+    except Exception as e:
+        logs.append(("delivery_error", {"err": str(e)}))
+        base, mode = inj_text, "in_context"
+
+    noise_p = cfg.get("noise_p", NOISE_P)
+    try:
+        raw = inject_unicode_noise(inject_noise_light(base), p=noise_p)
+        text = normalize(raw)
+    except Exception as e:
+        logs.append(("normalize_error", {"err": str(e)}))
+        text = normalize(base)
+
+    if bool(cfg.get("adv_mutate", False)):
+        try:
+            text = adversarial_search(text, contract, payload, max_iters=int(cfg.get("adv_iters", 6)), seed=seed)
+        except Exception as e:
+            logs.append(("adv_mutate_error", {"err": str(e)}))
+
+    packet = RenderPacket(
+        seed=seed,
+        text=text,
+        inj_text=inj_text,
+        fam_name=intent,
+        mapped_intent=intent,
+        payload=payload,
+        carrier_name=carrier_name,
+        mode=mode,
+        channel=dsl.channel,
+        position=dsl.position,
+        scope=dsl.scope,
+        target_idx=target_idx,
+        art_flag=art_flag,
+    )
+
+    return packet, logs
+
+
+def _attack_producer_job(job: tuple[int, int]) -> dict:
+    seed, batch = job
+    results: list[tuple[Optional[RenderPacket], list[tuple[str, dict]]]] = []
+    base_seed = seed
+    for idx in range(batch):
+        cand_seed = base_seed + idx
+        cand, logs = _attack_render_core(cand_seed)
+        results.append((cand, logs))
+    return {"results": results}
+
+
+class AttackSelector:
+    """Main-process selector applying dedupe and coverage constraints."""
+
+    def __init__(self,
+                 seed: int,
+                 min_cjk_share: float,
+                 min_cjk_share_auto: bool,
+                 oversample_mult: int,
+                 deduper: Deduper,
+                 family_cap: int,
+                 artifact_rate: float,
+                 code_switch_prob: float,
+                 carrier_mix_prob: float,
+                 stack_prob: float,
+                 disc_rate: float,
+                 art_match_rate: float,
+                 struct_evidence_rate: float,
+                 ref_mode: str,
+                 ref_cmd: str,
+                 ref_timeout: int,
+                 sem_weight: float,
+                 base_weight: float,
+                 artifact_weight: float,
+                 mask_format_features_rate: float,
+                 effect_replicas: int,
+                 evolve_variants: bool,
+                 mask_on: str,
+                 dedupe_preserve_carrier: bool,
+                 use_end_nonce: bool,
+                 use_model_eval: bool,
+                 artifact_free_pos_ratio: float,
+                 gate_semantic_injection: bool,
+                 coverage_min_per_combo: int,
+                 wanted: int,
+                 targets: List[Dict[str, Any]]):
+        self.seed = seed
+        self.min_cjk_share = min_cjk_share
+        self.min_cjk_share_auto = min_cjk_share_auto
+        self.deduper = deduper
+        self.family_cap = family_cap
+        self.struct_evidence_rate = struct_evidence_rate
+        self.mask_format_features_rate = mask_format_features_rate
+        self.mask_on = mask_on
+        self.dedupe_preserve_carrier = dedupe_preserve_carrier
+        self.use_model_eval = use_model_eval
+        self.artifact_free_pos_ratio = artifact_free_pos_ratio
+        self.gate_semantic_injection = gate_semantic_injection
+        self.coverage_min_per_combo = coverage_min_per_combo
+        self.use_end_nonce = use_end_nonce
+        self.art_match_rate = art_match_rate
+        self.ref_mode = ref_mode
+        self.ref_cmd = ref_cmd
+        self.ref_timeout = ref_timeout
+        self.sem_weight = sem_weight
+        self.base_weight = base_weight
+        self.artifact_weight = artifact_weight
+        self.effect_replicas = effect_replicas
+        self.evolve_variants = evolve_variants
+        self.oversample_mult = oversample_mult
+        self.disc_rate = disc_rate
+        self.code_switch_prob = code_switch_prob
+        self.carrier_mix_prob = carrier_mix_prob
+        self.stack_prob = stack_prob
+        self.artifact_rate = artifact_rate
+        self.artifact_free_pos_ratio = artifact_free_pos_ratio
+        self.wanted = wanted
+        self.targets = targets
+        self.cover = Counter()
+        self.fam_count = Counter()
+        self.cands: list[dict] = []
+        self.q_tool_override = 0
+        self.q_stealth_high = 0
+        self.q_artifact = 0
+        self.rng_global = random.Random(seed)
+        self.quota_tool_override_min = 0
+        self.quota_stealth_high_min = 0
+        self.quota_artifact_max = 0
+
+    def set_quotas(self, n: int):
+        self.quota_tool_override_min = int(max(1, 0.10 * n))
+        self.quota_stealth_high_min = int(max(1, 0.40 * n))
+        self.quota_artifact_max = int(max(1, 0.30 * n))
+
+    def add_audit_logs(self, logs: list[tuple[str, dict]]):
+        for reason, ctx in logs:
+            audit_reject(reason, ctx or {})
+
+    def done(self) -> bool:
+        return len(self.cands) >= self.wanted
+
+    def process(self, packet: RenderPacket):
+        if packet is None or self.done():
+            return
+        try:
+            t = self.targets[packet.target_idx]
+        except Exception:
+            return
+        contract = derive_task_contract(t["task"])
+        dsl = PIDSL(
+            intent=packet.mapped_intent,
+            channel=packet.channel,
+            position=packet.position,
+            scope=packet.scope,
+            carrier=packet.carrier_name,
+            payload_hint=packet.payload,
+        )
+        text = packet.text
+        inj_text = packet.inj_text
+        fam_name = packet.fam_name
+        mapped_intent = packet.mapped_intent
+        payload = packet.payload
+        carrier_name = packet.carrier_name
+        mode = packet.mode
+        art_flag = packet.art_flag
+        rng_pair_seed = cheap_fingerprint(f"{packet.seed}-{fam_name}-{mapped_intent}")
+        rng_local = random.Random(int(hashlib.blake2b(str(rng_pair_seed).encode('utf-8'), digest_size=8).hexdigest(), 16))
+
+        # ==== Begin mirrored logic from serial pathway (post-render) ====
+        is_dup, sim = near_duplicate(text, thr=0.90)
+        if is_dup:
+            audit_reject("near_duplicate", {"phase":"compose_pos", "sim": round(sim, 3), "pair_id": f"POS-{len(self.cands)+1:07d}", "text": text})
+            if self.rng_global.random() > 0.02:
+                return
+        neighbor_admit(text)
+
+        has_struct = bool(CODE_BLOCK_RE.search(text) or JSON_BLOCK_RE.search(text))
+        base_cjk = (self.rng_global.choice([0.6,0.7,0.85,0.9]) if self.min_cjk_share_auto else self.min_cjk_share)
+        bucket_min = (0.70 if mode == 'multi_turn' else (0.50 if has_struct else 0.60))
+        target_min_cjk = max(bucket_min, base_cjk)
+        cur_share = cjk_share(text)
+        policy = str(getattr(globals().get('cfg', _NS(cjk_policy='tiered')), 'cjk_policy', 'tiered'))
+        if policy == 'hard':
+            if cur_share < target_min_cjk:
+                audit_reject("cjk_ratio", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                return
+        elif policy == 'tiered':
+            if cur_share < 0.35:
+                audit_reject("cjk_ratio_low", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                return
+
+        if self.artifact_free_pos_ratio > 1e-9 and self.rng_global.random() < self.artifact_free_pos_ratio:
+            text = placeholderless_mirror(text)
+
+        text = add_struct_evidence(fam_name, text, secret="S-"+str(self.rng_global.randint(100000,999999)), p=self.struct_evidence_rate)
+
+        _ok_diag, vio = gate_by_contract_from_dsl(contract, dsl, text, require_support=bool(self.gate_semantic_injection))
+
+        def _passes_side_effects(text_eval: str) -> bool:
+            _cfg_local = globals().get('cfg')
+            votes, total = 0, max(1, int(getattr(_cfg_local, 'se_votes', 1)))
+            for i in range(total):
+                te = re.sub("[\u200b\u200c\u2060]", "", text_eval) if (i % 2 == 0) else re.sub(r"\s+", " ", text_eval)
+                try:
+                    se = run_sim_agent(t.get("task"), te, contract)
+                except Exception as e:
+                    audit_reject("side_effects_engine_missing", {"err": str(e)})
+                    return False
+                if _side_effects_violate_contract(contract, se):
+                    votes += 1
+            return votes >= max(1, (total+1)//2)
+        _cfg_local = globals().get('cfg')
+        if (_cfg_local and bool(getattr(_cfg_local, 'require_side_effects', False))):
+            if not _passes_side_effects(text):
+                audit_reject("side_effects_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                return
+
+        if self.gate_semantic_injection:
+            try:
+                ok_aud, _ = gate_injection_sample(text, mapped_intent, mapped_intent, contract, text, payload)
+                if not ok_aud:
+                    audit_reject("semantic_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                    return
+            except Exception as e:
+                audit_reject("semantic_gate_error", {
+                    "err": str(e), "task": t.get("task","_"),
+                    "family": fam_name, "intent": mapped_intent
+                })
+                return
+
+        if not deduper_accept_normalized(self.deduper, text, preserve_carrier=self.dedupe_preserve_carrier):
+            audit_reject("dedup", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+            return
+        if self.fam_count[fam_name] >= self.family_cap:
+            audit_reject("family_cap", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+            return
+
+        if self.gate_semantic_injection and not _ok_diag:
+            audit_reject("semantic_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+            return
+
+        pair_id = f"P{len(self.cands)+1:07d}"
+        rng_pair = random.Random(cheap_fingerprint(pair_id) + str(self.seed))
+        pos_cjk_target = max(0.60, (0.7 if self.min_cjk_share_auto else self.min_cjk_share))
+        text2, carrier_after = apply_surface_augments(text, rng_pair, struct_p=self.struct_evidence_rate, cjk_target=pos_cjk_target)
+        if carrier_after:
+            carrier_name = carrier_after
+        text = text2
+
+        try:
+            from dsl_core import inject_soft_hints
+            if rng_pair.random() < float(getattr(args, 'soft_hint_rate', 0.30)):
+                text = inject_soft_hints(text, need=2, must_include_contract=False, rnd=rng_pair)
+                vio = (vio or {})
+                vio = {**vio, "soft_hint_applied": True}
+        except Exception:
+            pass
+
+        artifact_free_applied = False
+        if self.artifact_free_pos_ratio > 1e-9:
+            if rng_pair.random() < self.artifact_free_pos_ratio:
+                artifact_free_applied = True
+                text = placeholderless_mirror(text)
+                text = neutralize_anchors(text)
+                for w in ARTIFACT_WORDS:
+                    text = re.sub(re.escape(w), "", text, flags=re.IGNORECASE)
+
+        if self.gate_semantic_injection:
+            try:
+                _ok_diag2, _ = gate_injection_sample(text, mapped_intent, mapped_intent, contract, text, payload, artifact_free_applied=artifact_free_applied)
+                _ok_contract2 = gate_by_contract_from_dsl(
+                    contract, PIDSL("policy_bypass","in_context","inline","result_slot","html_comment"),
+                    text, require_support=True
+                )
+                if not (_ok_diag2 and _ok_contract2):
+                    audit_reject("semantic_gate_after_artifact", {
+                        "task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": pair_id
+                    })
+                    return
+                _ok_diag = _ok_diag2
+            except Exception as e:
+                audit_reject("semantic_gate_after_artifact_error", {"err": str(e), "pair_id": pair_id})
+                return
+
+        diag_pass = bool(_ok_diag)
+        if not diag_pass:
+            audit_reject("semantic_gate_failed", {"pair_id": pair_id, "intent": mapped_intent, "cats": vio})
+            return
+
+        gate_set = {s.strip() for s in str(getattr(args, "effect_gate_categories", "")).split(",")} - {"", "none"}
+        if gate_set and (mapped_intent in gate_set):
+            try:
+                eff = effect_check_with_ref(t["prompt"], text, model="none", contract=contract)
+                effect_pass = bool(eff.get("success", False))
+                if not effect_pass:
+                    audit_reject("effect_gate_fail", {"intent": mapped_intent, "pair_id": pair_id})
+                    return
+                emeta = eff
+            except Exception as e:
+                audit_reject("effect_gate_error", {"err": str(e), "intent": mapped_intent, "pair_id": pair_id})
+                return
+        else:
+            effect_pass = False
+            emeta = {"validator": "diagnostic", "cats": vio, "eval_info": {"engine": "none"}}
+
+        disc_flag = (rng_pair.random() < self.disc_rate)
+        disc_str = rng_pair.choice(DISCLAIMER_BANK) if disc_flag else None
+        if disc_flag and disc_str:
+            text = f"{disc_str}\n{text}"
+
+        text = apply_symmetric_accessories(text, rng_pair, rate=0.10)
+        text = transform_text_pipeline(text, rng_pair)
+        try:
+            text = apply_cn_eco_noise(text, rng_pair, rate=0.18)
+        except Exception:
+            pass
+
+        soft_hint_removed = False
+        if rng_pair.random() < float(getattr(args, 'soft_hint_rate', 0.30)) * 0.5:
+            try:
+                text = neutralize_anchors(text)
+                text = re.sub(r"(?mi)^(（[^）]*）|【[^】]*】|(?:请|麻烦|建议|参考|据反馈|有人(提到|�?|引述|参考以�?[^\n]*\n)", "", text)
+                soft_hint_removed = True
+            except Exception:
+                pass
+
+        evidence_ok = True if artifact_free_applied else _evidence_profile_ok(text, min_hits=2)
+        if not evidence_ok:
+            audit_reject("struct_evidence_needed", {"pair_id": pair_id, "intent": mapped_intent})
+            return
+
+        masked_applied = False
+        if self.mask_on in ('both','pos'):
+            before_mask = text
+            text = mask_format_features_sym(text, self.mask_format_features_rate, rng_pair)
+            masked_applied = (text != before_mask)
+
+        nbytes = byte_len(text); feats = feature_probe_clean(text)
+        ratio = cjk_latin_ratio(text); bins=[0.0,0.12,0.35,1.0]; b=0
+        for i in range(len(bins)-1):
+            if bins[i] <= ratio < bins[i+1]: b=i; break
+        stealth_here = estimate_stealth(text)
+
+        hist_len = 1
+        if mode == 'multi_turn':
+            try:
+                if text.strip().startswith('```json'):
+                    for obj in _parse_json_blocks(text):
+                        if isinstance(obj, dict) and isinstance(obj.get('turns'), list):
+                            hist_len = max(hist_len, len(obj['turns']))
+                else:
+                    hist_len = max(hist_len, text.count('用户:') + text.count('助手:'))
+            except Exception:
+                pass
+        hist_bucket = '1' if hist_len<=1 else ('2' if hist_len==2 else ('3-5' if hist_len<=5 else '6+'))
+
+        base_pos = {
+            "text": text, "task": t["task"], "len": nbytes, "len_bucket": length_bucket(nbytes),
+            "feats": feats, "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
+            "label": 1, "hard_negative": False,
+            "family": fam_name, "intent": mapped_intent, "threat_goal": fam_name,
+            "delivery": mode, "carrier": carrier_name,
+            "attack_channel": pick_channel_by_carrier(mode, carrier_name),
+            "stealth_level": stealth_here,
+            "requires_tool": (fam_name in {"tool_abuse"}),
+            "art_flag": art_flag,
+            "artifacts_present": any(re.search(re.escape(w), text, re.IGNORECASE) for w in ARTIFACT_WORDS),
+            "masked_applied": masked_applied,
+            "struct_evidence_added": (self.struct_evidence_rate > 0),
+            "history_len": hist_len, "history_len_bucket": hist_bucket,
+            "base_prompt": t["prompt"], "inj_text": inj_text, "pair_id": pair_id,
+            "passed_semantic_gate": diag_pass,
+            "effect_pass": effect_pass,
+            "effect_meta": emeta,
+            "inj_channel": dsl.channel, "inj_position": dsl.position,
+            "contract": {**asdict(contract), "allowed_labels": list(contract.allowed_labels) if contract.allowed_labels else None},
+            "violations": vio,
+            "side_effects": {k: v for k, v in (vio or {}).items() if str(k).startswith("se_")},
+            "diagnostics": vio,
+            "disc_flag": disc_flag, "disc_str": disc_str,
+            "payload_hint": payload,
+            "secret_hint": None,
+            "mechanism": f"{mapped_intent}:{dsl.channel}:{dsl.scope}",
+            "expected_side_effects": {},
+            "meta": {"cjk_target": float(pos_cjk_target)},
+            "soft_hint_removed": soft_hint_removed,
+        }
+
+        try:
+            ok_aud, v_aud = gate_injection_sample(text, mapped_intent, mapped_intent, contract, text, payload, artifact_free_applied=artifact_free_applied)
+            base_pos["audit"] = {
+                "semantic_conflict": v_aud.get("semantic_conflict"),
+                "evidence_match_count": v_aud.get("evidence_match_count"),
+            }
+        except Exception:
+            pass
+
+        cov_key = (mapped_intent, mode, (carrier_name or "none").split('+')[0])
+        take = True if (self.coverage_min_per_combo > 0 and self.cover[cov_key] < self.coverage_min_per_combo) else (self.rng_global.random() < 0.5)
+        if not take:
+            if stealth_here == 'high' and self.q_stealth_high < self.quota_stealth_high_min:
+                take = True
+            if fam_name == 'tool_override' and self.q_tool_override < self.quota_tool_override_min:
+                take = True
+            if base_pos.get('artifacts_present') and self.q_artifact >= self.quota_artifact_max:
+                take = False
+                audit_reject("artifact_quota", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+        if not take:
+            return
+
+        self.cover[cov_key] += 1
+        if stealth_here == 'high':
+            self.q_stealth_high += 1
+        if fam_name == 'tool_override':
+            self.q_tool_override += 1
+        if base_pos.get('artifacts_present'):
+            self.q_artifact += 1
+
+        equiv_id = f"EQ-{_rand_key(6)}"
+        self.cands.append({**base_pos, "equiv_group_id": equiv_id, "variant": "original"})
+
+        def _min_violation_variant(orig: str) -> Optional[str]:
+            steps = [
+                lambda x: placeholderless_mirror(x),
+                lambda x: neutralize_anchors(x),
+                lambda x: re.sub(r"```(\w+)?", "```txt", x),
+                lambda x: HTML_COMMENT_RE.sub("", x),
+                lambda x: re.sub(r"^---[\s\S]*?---\s*", "", x, flags=re.M),
+            ]
+            cur = orig
+            for fn in steps:
+                try:
+                    trial = fn(cur)
+                    inv_ok, _fails = adjudicate_invariants(contract, parse_events_from_text(trial))
+                    if inv_ok == 1:
+                        return trial
+                    cur = trial
+                except Exception:
+                    continue
+            return None
+
+        try:
+            minimized = _min_violation_variant(text)
+            if minimized and minimized != text:
+                self.cands.append({**base_pos, "text": minimized, "variant": "min_violation", "pair_id": f"{pair_id}-MV"})
+        except Exception:
+            pass
+
+        self.fam_count[fam_name] += 1
+
+
+
+def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     min_cjk_share: float, min_cjk_share_auto: bool,
                     oversample_mult: int, deduper: Deduper,
                     family_cap: int, artifact_rate: float, 
@@ -4729,6 +5426,144 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
     except Exception:
         pass
     return cands
+
+
+def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
+                    min_cjk_share: float, min_cjk_share_auto: bool,
+                    oversample_mult: int, deduper: Deduper,
+                    family_cap: int, artifact_rate: float, 
+                    code_switch_prob: float = 0.18, carrier_mix_prob: float = 0.45,
+                    stack_prob: float = 0.25,
+                    disc_rate: float | None = None,
+                    art_match_rate: float = 0.50,
+                    struct_evidence_rate: float = 0.0,
+                    ref_mode: str = "none", ref_cmd: str = "", ref_timeout: int = 20,
+                    sem_weight: float = 0.55,
+                    base_weight: float = 0.40,
+                    artifact_weight: float = 0.05,
+                    mask_format_features_rate: float = 0.20,
+                    effect_replicas: int = 0,
+                    evolve_variants: bool = False,
+                    mask_on: str = "both",
+                    dedupe_preserve_carrier: bool = False,
+                    use_end_nonce: bool = False,
+                    use_model_eval: bool = False,
+                    artifact_free_pos_ratio: float | None = None,
+                    gate_semantic_injection: bool = True,
+                    coverage_min_per_combo: int = 0,
+                    workers: int = 0,
+                    producer_batch: int = 128) -> List[Dict[str,Any]]:
+    workers = int(workers or 0)
+    if workers <= 1:
+        return _compose_attacks_serial(
+            target_pool, n, seed, min_cjk_share, min_cjk_share_auto,
+            oversample_mult, deduper, family_cap, artifact_rate,
+            code_switch_prob=code_switch_prob, carrier_mix_prob=carrier_mix_prob,
+            stack_prob=stack_prob, disc_rate=disc_rate, art_match_rate=art_match_rate,
+            struct_evidence_rate=struct_evidence_rate, ref_mode=ref_mode,
+            ref_cmd=ref_cmd, ref_timeout=ref_timeout, sem_weight=sem_weight,
+            base_weight=base_weight, artifact_weight=artifact_weight,
+            mask_format_features_rate=mask_format_features_rate,
+            effect_replicas=effect_replicas, evolve_variants=evolve_variants,
+            mask_on=mask_on, dedupe_preserve_carrier=dedupe_preserve_carrier,
+            use_end_nonce=use_end_nonce, use_model_eval=use_model_eval,
+            artifact_free_pos_ratio=artifact_free_pos_ratio,
+            gate_semantic_injection=gate_semantic_injection,
+            coverage_min_per_combo=coverage_min_per_combo,
+        )
+
+    workers = max(1, workers if workers > 0 else ((cpu_count() or 2) - 1))
+    producer_batch = max(1, int(producer_batch or 64))
+
+    disc_rate_eff = _effective_disc_rate(disc_rate)
+    artifact_free_pos_ratio_eff = _effective_artifact_free_pos_ratio(artifact_free_pos_ratio)
+    wanted = n * max(1, oversample_mult)
+    selector = AttackSelector(
+        seed=seed,
+        min_cjk_share=min_cjk_share,
+        min_cjk_share_auto=min_cjk_share_auto,
+        oversample_mult=oversample_mult,
+        deduper=deduper,
+        family_cap=family_cap,
+        artifact_rate=artifact_rate,
+        code_switch_prob=code_switch_prob,
+        carrier_mix_prob=carrier_mix_prob,
+        stack_prob=stack_prob,
+        disc_rate=disc_rate_eff,
+        art_match_rate=art_match_rate,
+        struct_evidence_rate=struct_evidence_rate,
+        ref_mode=ref_mode,
+        ref_cmd=ref_cmd,
+        ref_timeout=ref_timeout,
+        sem_weight=sem_weight,
+        base_weight=base_weight,
+        artifact_weight=artifact_weight,
+        mask_format_features_rate=mask_format_features_rate,
+        effect_replicas=effect_replicas,
+        evolve_variants=evolve_variants,
+        mask_on=mask_on,
+        dedupe_preserve_carrier=dedupe_preserve_carrier,
+        use_end_nonce=use_end_nonce,
+        use_model_eval=use_model_eval,
+        artifact_free_pos_ratio=artifact_free_pos_ratio_eff,
+        gate_semantic_injection=gate_semantic_injection,
+        coverage_min_per_combo=coverage_min_per_combo,
+        wanted=wanted,
+        targets=target_pool,
+    )
+    selector.set_quotas(n)
+
+    # Log Faiss index availability for observability
+    try:
+        bin_idx = getattr(selector.deduper, '_faiss_sim', None)
+        dense_idx = getattr(selector.deduper, '_faiss_dense', None)
+        if bin_idx is not None:
+            print(f'[faiss][binary] enabled ntotal={bin_idx.ntotal}')
+        else:
+            print('[faiss][binary] disabled')
+        if dense_idx is not None:
+            print(f'[faiss][dense] enabled ntotal={dense_idx.ntotal}')
+        else:
+            print('[faiss][dense] disabled')
+    except Exception:
+        print('[faiss] status unknown')
+
+    _cfg = globals().get('cfg')
+    cfg_dict = {
+        "artifact_rate": artifact_rate,
+        "carrier_mix_prob": carrier_mix_prob,
+        "stack_prob": stack_prob,
+        "code_switch_prob": code_switch_prob,
+        "use_model_eval": use_model_eval,
+        "evolve_variants": evolve_variants,
+        "adv_mutate": bool(_cfg and getattr(_cfg, 'adv_mutate', False)),
+        "adv_iters": int(getattr(_cfg, 'adv_iters', 6)) if _cfg else 6,
+        "noise_p": NOISE_P,
+    }
+
+    max_attempts = max(20000, wanted * 50)
+    attempts = 0
+
+    from itertools import count
+
+    job_stream = ((seed + idx * (producer_batch + 37), producer_batch) for idx in count())
+
+    with Pool(processes=workers, initializer=_attack_producer_init, initargs=(target_pool, cfg_dict)) as pool:
+        try:
+            for payload in pool.imap_unordered(_attack_producer_job, job_stream):
+                for cand, logs in payload.get("results", []):
+                    selector.add_audit_logs(logs)
+                    attempts += 1
+                    if cand is not None:
+                        selector.process(cand)
+                    if selector.done() or attempts >= max_attempts:
+                        raise StopIteration
+        except StopIteration:
+            pool.terminate()
+        finally:
+            pool.join()
+
+    return selector.cands
 
 INTENT_FIELD_RE = _re.compile(r'(result|answer|verdict|conclusion|final|结论)\s*[:：=].*', _re.I)
 JSON_RESULT_RE  = _re.compile(r'```json[\s\S]*?(result|answer|verdict|结论)\s*["\':]', _re.I)
@@ -5698,6 +6533,8 @@ def main():
     help="Pin a global HF revision/commit for all datasets when possible. // 为所有数据集统一指定 revision/commit")
     ap.add_argument("--family_max_frac", type=float, default=0.06, help="Max fraction per family. // 每家族占比上限")
     ap.add_argument("--oversample_mult", type=int, default=6, help="Candidate oversampling multiplier. // 候选过采样倍数")
+    ap.add_argument("--mp_workers", type=int, default=0, help="Multiprocessing workers for candidate rendering (0=auto, 1=serial). // 候选渲染进程数（0 自动，1 串行）")
+    ap.add_argument("--mp_batch", type=int, default=256, help="Candidates rendered per worker batch. // 每个进程批量渲染的候选数")
     ap.add_argument("--simhash_bits", type=int, default=64, help="SimHash bits. // SimHash 位数")
     ap.add_argument("--simhash_thresh", type=int, default=2, help="Hamming threshold. // 汉明阈值")
     ap.add_argument("--shingle_k", type=int, default=5, help="Char shingle length. // 字符 shingle 长度")
@@ -6126,7 +6963,6 @@ def main():
             sem_weight=args.sem_weight,
             base_weight=args.base_weight,
             artifact_weight=args.artifact_weight,
-            
             mask_format_features_rate=args.mask_format_features_rate,
             effect_replicas=args.effect_replicas,
             evolve_variants=args.evolve_variants,
@@ -6136,7 +6972,9 @@ def main():
             use_model_eval=args.use_model_eval,
             artifact_free_pos_ratio=args.artifact_free_pos_ratio,
             gate_semantic_injection=args.gate_semantic_injection,
-            coverage_min_per_combo=args.coverage_min_per_combo
+            coverage_min_per_combo=args.coverage_min_per_combo,
+            workers=args.mp_workers,
+            producer_batch=args.mp_batch,
         )
     # Plain negatives quota // 纯净良性指令配额
     plain_quota  = int(round(neg_n * max(0.0, min(1.0, args.plain_neg_ratio))))

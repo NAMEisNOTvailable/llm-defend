@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 DSL core utilities for Chinese prompt‑injection data generation and auditing.
 中文提示注入数据生成与审计的 DSL 核心工具集。
@@ -9,10 +9,81 @@ DSL core utilities for Chinese prompt‑injection data generation and auditing.
   YAML 编译辅助等能力。
 """
 # ===== dsl_core.py — Minimal usable scaffold
-# ===== dsl_core.py — 最小可用骨架（可直接粘贴进现脚本） =====
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Tuple, Optional
-import random, json, re, hashlib
+import random, json, re
+import numpy as np
+
+# --- Speed patch: cache token hashes & avoid hexdigest paths ---
+from functools import lru_cache
+import hashlib as _hlib
+try:
+    from xxhash import xxh64 as _xxh64
+except Exception:
+    _xxh64 = None
+try:
+    from simhash import weighted_fingerprint as _dc_simhash_weighted, hamming_distance as _dc_hamming_dist
+except Exception:
+    _dc_simhash_weighted = None
+    _dc_hamming_dist = None
+
+@lru_cache(maxsize=1 << 20)  # cache up to ~1M grams across the run
+def _h64(g: str) -> int:
+    if _xxh64 is not None:
+        return _xxh64(g.encode("utf-8")).intdigest()
+    return int.from_bytes(_hlib.blake2b(g.encode("utf-8"), digest_size=8).digest(), "big")
+
+
+def _simhash_weighted_fast(s: str, bits: int = 64) -> int:
+    txt = re.sub(r"\s+", " ", s or "").lower()
+    if not txt:
+        return 0
+    chars = [c for c in txt if not c.isspace()]
+    bigrams = [txt[i:i+2] for i in range(len(txt) - 1)]
+    tokens = chars + bigrams
+    if not tokens:
+        tokens = [txt]
+    if _dc_simhash_weighted is not None and bits == 64:
+        pairs = [(_h64(tok), 1.0) for tok in tokens]
+        try:
+            return int(_dc_simhash_weighted(pairs))
+        except Exception:
+            pass
+    hashes = np.fromiter((_h64(tok) for tok in tokens), dtype=np.uint64, count=len(tokens))
+    if hashes.size == 0:
+        return 0
+    bits_u8 = hashes.view(np.uint8).reshape(-1, 8)
+    bit_matrix = np.unpackbits(bits_u8, axis=1, bitorder='little').astype(np.int16)
+    weights = (bit_matrix * 2 - 1).sum(axis=0)
+    if bits < weights.size:
+        weights = weights[:bits]
+    elif bits > weights.size:
+        weights = np.pad(weights, (0, bits - weights.size), constant_values=0)
+    bit_flags = (weights >= 0).astype(np.uint8)
+    if bits % 8 != 0:
+        padded = bits + (-bits % 8)
+        bit_flags = np.pad(bit_flags, (0, padded - bits), constant_values=0)
+    packed = np.packbits(bit_flags, bitorder='little')
+    return int.from_bytes(packed.tobytes(), 'little')
+
+
+def _sketch_5gram_fast(s: str, buckets: int = 1 << 16) -> Dict[int, float]:
+    txt = re.sub(r"\s+", " ", (s or "").lower())
+    L = len(txt)
+    if L < 5:
+        return {}
+    mask = buckets - 1
+    grams = (txt[i:i+5] for i in range(L - 4))
+    hashes = np.fromiter((_h64(g) & mask for g in grams), dtype=np.uint32, count=L - 4)
+    if hashes.size == 0:
+        return {}
+    uniq, counts = np.unique(hashes, return_counts=True)
+    vals = counts.astype(np.float64)
+    norm = np.linalg.norm(vals)
+    if norm == 0.0:
+        return {}
+    vals /= norm
+    return {int(k): float(v) for k, v in zip(uniq.tolist(), vals.tolist())}
 
 try:
     import yaml  # pip install pyyaml
@@ -25,8 +96,8 @@ def bucket_hash(items) -> str:
         s = "|".join(sorted([str(x) for x in (items or []) if x]))
     except Exception:
         s = ""
-    import hashlib
-    return hashlib.md5(s.encode("utf-8")).hexdigest()[:12]
+
+    return _hlib.md5(s.encode("utf-8")).hexdigest()[:12]
 
 
 
@@ -2372,22 +2443,15 @@ def generate_batch(
             continue
 
         near_thr = float((pin or {}).get("near_dup_thr", 0.92))
-        # --- Weighted SimHash (char+bigram), blake2b as base hash ---
+        # --- Weighted SimHash (char+bigram), fast cached impl ---
         def _simhash_weighted(s: str, bits: int = 64) -> int:
-            txt = re.sub(r"\s+", " ", s or "").lower()
-            chars = [c for c in txt if not c.isspace()]
-            bigrams = [txt[i:i+2] for i in range(len(txt)-1)]
-            toks = (chars + bigrams) or [txt]
-            v = [0] * bits
-            for t in toks:
-                h = int.from_bytes(hashlib.blake2b(t.encode("utf-8"), digest_size=bits//8).digest(), "big")
-                for i in range(bits):
-                    v[i] += 1 if (h >> i) & 1 else -1
-            out = 0
-            for i in range(bits):
-                if v[i] >= 0: out |= (1 << i)
-            return out
+            return _simhash_weighted_fast(s, bits)
         def _hamm(a: int, b: int) -> int:
+            if _dc_hamming_dist is not None:
+                try:
+                    return int(_dc_hamming_dist(int(a), int(b)))
+                except Exception:
+                    pass
             x = a ^ b
             try:
                 return x.bit_count()
@@ -2419,17 +2483,7 @@ def generate_batch(
                 continue
         # Additional vector-like view: hashed 5-gram sparse cosine
         def _sketch_5gram(s: str, buckets: int = 1<<18) -> Dict[int, float]:
-            ss = re.sub(r"\s+", " ", (s or "").lower())
-            from collections import defaultdict as _dd
-            v = _dd(float)
-            for i in range(max(0, len(ss)-4)):
-                g = ss[i:i+5]
-                h = int(hashlib.blake2b(g.encode("utf-8"), digest_size=8).hexdigest(), 16) & (buckets-1)
-                v[h] += 1.0
-            import math
-            norm = math.sqrt(sum(x*x for x in v.values())) or 1.0
-            for k in list(v.keys()): v[k] /= norm
-            return v
+            return _sketch_5gram_fast(s, buckets)
         def _cos_sparse(a: Dict[int,float], b: Dict[int,float]) -> float:
             if len(a) > len(b): a, b = b, a
             return sum(val * b.get(k, 0.0) for k, val in a.items())
