@@ -53,6 +53,37 @@ except Exception:  # 运行在精简环境时允许跳过
     def invariant_path(_txt:str) -> bool: return False
 
 
+# --- Semantic neighbor audit helper (TF-IDF char 3-5 grams) ---
+def audit_semantic_neighbors(rows_all, topk: int = 5):
+    """Compute high-percentile nearest-neighbor cosine similarity on text fields.
+    Returns {'semantic_neighbor_max_sim_p95', 'semantic_neighbor_max_sim_p99'} or {'skipped': reason}.
+    """
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        texts = [str((r or {}).get('text', '')) for r in rows_all]
+        if not texts:
+            return {'skipped': 'empty'}
+        vec = TfidfVectorizer(analyzer='char', ngram_range=(3, 5), min_df=2)
+        X = vec.fit_transform(texts)
+        if X.shape[0] < 2:
+            return {'skipped': 'not_enough_samples'}
+        sims = cosine_similarity(X)
+        max_sim = []
+        for idx in range(len(texts)):
+            row = sims[idx]
+            row[idx] = 0.0
+            max_sim.append(float(row.max()))
+        if not max_sim:
+            return {'skipped': 'empty'}
+        return {
+            'semantic_neighbor_max_sim_p95': float(np.percentile(max_sim, 95)),
+            'semantic_neighbor_max_sim_p99': float(np.percentile(max_sim, 99)),
+        }
+    except Exception as e:
+        return {'skipped': str(e)}
+
+
 # ---- plain negatives CJK 修复统计（按载体） ----
 PLAIN_ATTEMPTS_BY_CARRIER   = defaultdict(int)
 PLAIN_REJECT_CJK_BY_CARRIER = defaultdict(int)
@@ -162,9 +193,10 @@ NOISE_P = 0.05
 MAX_WRAP_RATE   = 0.05
 REF_CACHE = {}
 PIN_REV = {
-    # revision/版本
-    ("wikipedia", "20220301.zh"): {"revision": "main"},
-    ("clue", "afqmc"): {"revision": "v1.0"},
+    # 固定 revision（尽量选择无需脚本的仓库/分支）
+    ("wikimedia/wikipedia", "20231101.zh"): {"revision": "main"},
+    ("C-MTEB/AFQMC", None): {"revision": "main"},
+    ("C-MTEB/LCQMC", None): {"revision": "main"},
 }
 # High-leak terms // 高伪迹/显词
 ARTIFACT_WORDS = [
@@ -1618,8 +1650,13 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
     random.seed(seed)
     pool: List[Dict[str, Any]] = []
     # --- Classic CLUE style tasks // 经典 CLUE 任务 ---
-    for src in [("lansinuote/LCQMC", {}), ("clue", {"name":"afqmc"})]:
+    for src in [("C-MTEB/LCQMC", {}), ("C-MTEB/AFQMC", {})]:
         ds = try_load(*src, hf_rev=hf_rev)
+        # fallback for rare mirrors / offline envs
+        if (ds is None) and (src[0] == "C-MTEB/LCQMC"):
+            ds = try_load("mteb/LCQMC", {}, hf_rev=hf_rev)
+        if (ds is None) and (src[0] == "C-MTEB/AFQMC"):
+            ds = try_load("clue", {"name": "afqmc"}, hf_rev=hf_rev)
         if not ds: continue
         for split in ds.keys():
             rows = ds[split]; idxs = list(range(len(rows))); random.shuffle(idxs)
@@ -1632,7 +1669,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
                 if len(a)<4 or len(b)<4: continue
                 pool.append({"task":"similarity","prompt":f"判断两句话是否表达同一含义，仅答“是/否”。\n句子A：{a}\n句子B：{b}"})
     for sub in ["ocnli","cmnli"]:
-        ds = try_load("clue", {"name":sub})
+        ds = try_load("clue", {"name": sub}, hf_rev=hf_rev)
         if not ds: continue
         for split in ds.keys():
             rows = ds[split]; idxs = list(range(len(rows))); random.shuffle(idxs)
@@ -1644,8 +1681,9 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
                 p,h = normalize(p), normalize(h)
                 if len(p)<4 or len(h)<4: continue
                 pool.append({"task":"nli","prompt":f"判定前提与假设的关系：只答“蕴含/矛盾/中立”。\n前提：{p}\n假设：{h}"})
-    for src in [("seamew/ChnSentiCorp", {}), ("lansinuote/ChnSentiCorp", {})]:
-        ds = try_load(*src)
+    # Sentiment (ChnSentiCorp): avoid script loaders; prefer parquet mirrors
+    for src in [("lansinuote/ChnSentiCorp", {})]:
+        ds = try_load(*src, hf_rev=hf_rev)
         if not ds: continue
         for split in ds.keys():
             rows = ds[split]; idxs = list(range(len(rows))); random.shuffle(idxs)
@@ -1655,7 +1693,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
                 x = normalize(x)
                 if len(x)<8: continue
                 pool.append({"task":"sentiment","prompt":f"判断情感倾向，仅答“正/负”。\n{x}"})
-    for src in [("seamew/LCSTS_New", {}), ("ZhuiyiTechnology/LCSTS", {})]:
+    for src in [("hugcyp/LCSTS", {}), ("suolyer/lcsts", {})]:
         ds = try_load(*src)
         if not ds: continue
         for split in ds.keys():
@@ -1667,9 +1705,10 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
                 if len(x)<20: continue
                 pool.append({"task":"summarization","prompt":f"请概括下文，生成≤30字摘要：\n{x}"})
     # --- Expanded domains // 扩展域 ---
-    # Wikipedia // 维基中文
-    for src in [("wikipedia", {"name":"20220301.zh"})]:
-        ds = try_load(*src)
+    # Wikipedia // 维基中文（改成 wikimedia/wikipedia 的新仓库；失败时兜底镜像）
+    for src in [("wikimedia/wikipedia", {"name":"20231101.zh"}),
+                ("shaowenchen/wiki_zh", {})]:
+        ds = try_load(*src, hf_rev=hf_rev)
         if ds:
             for split in ds.keys():
                 rows = ds[split]; idxs = list(range(min(len(rows), max_per_task))); random.shuffle(idxs)
@@ -1682,8 +1721,8 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
                     # Create doc-style tasks // 生成文档风任务
                     pool.append({"task":"wiki_summarize","prompt":f"阅读片段并给出50字内要点：\n{x}"})
                     pool.append({"task":"wiki_ents","prompt":f"从片段中抽取专有名词并以逗号分隔：\n{x}"})
-    # Chinese tech/news/forum style corpora (if present) // 中文技术/论坛风（若可用）
-    for trial in [("CLUECorpusSmall", {}), ("thu-coai/COAE2019", {}), ("brightmart/nlp_chinese_corpus", {"name":"wiki_zh"})]:
+    # Chinese tech/news/forum style corpora（替换为可加载数据集）
+    for trial in [("SirlyDreamer/THUCNews", {})]:
         ds = try_load(*trial)
         if not ds: continue
         for split in ds.keys():
@@ -1896,7 +1935,7 @@ def _rx_any(words):
     esc = [re.escape(w) for w in words]
     core = r"(?:%s)" % "|".join(esc)
     jitter = r"[\s\u3000，,。:：·・/\\-]{0,2}"
-    return re.compile(core.replace(r"\ ", r"\s*").join(["", ""]), re.I)
+    return re.compile(jitter + core.replace(" ", r"\s*") + jitter, re.I)
 
 def _rx_pair(a_words, b_words, gap=8):
     a = r"(?:%s)" % "|".join(map(re.escape, a_words))
@@ -3346,19 +3385,27 @@ def choose_carrier_name(rng: random.Random | None = None, include_none: bool = T
     templates = templates or CARRIER_TEMPLATES
     weights = weights or CARRIER_WEIGHTS
     picker = rng if rng is not None else random
+    names: list[str] = []
+    weight_list: list[float] = []
     choices = list(templates.keys())
     if include_none:
-        names = ['none'] + choices
-        weight_list = [weights.get('none', 0.0)] + [weights.get(n, 1.0) for n in choices]
-    else:
-        names = choices
-        weight_list = [weights.get(n, 1.0) for n in choices]
+        base_none = float(weights.get('none', 0.0))
+        if base_none <= 0.0:
+            base_none = 0.05
+        names.append('none')
+        weight_list.append(base_none)
+    names.extend(choices)
+    weight_list.extend(float(weights.get(n, 1.0)) for n in choices)
     if not names:
         return 'none'
+    normed = [max(0.0, w) for w in weight_list]
+    total = sum(normed)
+    if total <= 0.0:
+        return picker.choice(names)
     try:
-        return picker.choices(names, weights=weight_list, k=1)[0]
+        return picker.choices(names, weights=normed, k=1)[0]
     except Exception:
-        return names[0] if names else 'none'
+        return picker.choice(names)
 
 def wrap_with_domain(body: str) -> Tuple[str,str]:
     # 简单轮询+配额控制
@@ -4152,7 +4199,7 @@ def _has_semantic_support(text: str) -> bool:
     if re.search(r"(将|把).{0,4}(结果|答案).{0,2}(写入|放入|填入).{0,6}(槽|字段|位|key)", text or ""):
         return True
     # 7) 跨轮状态/回合漂移（无显式锚）
-    if re.search(r"(从本回合起|后续回合|下一回合|跨轮|状态漂移|R\d+\s*[→->]\s*R\d+)", text or ""):
+    if re.search(r"(从本回合起|后续回合|下一回合|跨轮|状态漂移|R\d+\s*(?:→|->)\s*R\d+)", text or ""):
         return True
     return False
 
@@ -4455,7 +4502,7 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
         # 8) 先生成 pair_id / rng_pair，再做表面增强（要用到 rng_pair）
         pair_id = f"P{len(cands)+1:07d}"
         rng_pair = random.Random(cheap_fingerprint(pair_id) + str(seed))
-        pos_cjk_target = max(0.60, (0.7 if args.min_cjk_share_auto else args.min_cjk_share))
+        pos_cjk_target = max(0.60, (0.7 if min_cjk_share_auto else min_cjk_share))
         text, carrier_name = apply_surface_augments(
             text, rng_pair, struct_p=struct_evidence_rate, cjk_target=pos_cjk_target
         )
@@ -5046,8 +5093,8 @@ def is_benign_strict(text: str, contract: TaskContract) -> bool:
     contract0 = derive_task_contract("benign")  # 或者从样本 task 推导
     ok_inv, fails = True, []
     try:
-        from dsl_core import adjudicate_invariants as _dsl_inv
-        ok_inv, fails = _dsl_inv(text, None)  # 不依赖 spec 的通用检查
+        events = parse_events_from_text(text)
+        ok_inv, fails = adjudicate_invariants(contract, events)
     except Exception:
         ok_inv, fails = True, []
 
@@ -5182,7 +5229,7 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
         # do not add disclaimers; keep structure aligned and apply symmetric transforms
         # 新增：结构证据（良性版本），保持与正类同频
         if disc_flag and disc_str:
-            txt = f"{disc_str}\\n{txt}"
+            txt = f"{disc_str}\n{txt}"
         txt = add_struct_evidence_benign(txt, p=struct_evidence_rate, rng=rng_pair if 'rng_pair' in locals() else (rng if 'rng' in locals() else None))
         if not _evidence_profile_ok(txt, min_hits=2):
             audit_reject("struct_evidence_needed", {"pair_id": pair_id, "intent": "benign", "family": "plain"})
@@ -5278,7 +5325,7 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
         disc_flag = (random.Random(cheap_fingerprint(txt) + str(seed)).random() < disc_rate)
         disc_str = random.choice(DISCLAIMER_BANK) if disc_flag else None
         if disc_flag and disc_str:
-            txt = f"{disc_str}\\n{txt}"
+            txt = f"{disc_str}\n{txt}"
         rng_pair = random.Random(cheap_fingerprint(txt) + str(seed))
         # symmetric transforms
         txt = apply_symmetric_accessories(txt, rng_pair, rate=0.10)
@@ -5739,7 +5786,7 @@ def main():
     ap.add_argument("--cjk_policy", choices=["hard","tiered","audit"], default="tiered")
     ap.add_argument("--mt_tool_override_rate", type=float, default=0.25)
     ap.add_argument("--soft_hint_rate", type=float, default=0.30, help="Probability to add soft conversational hints (both classes). // 软话术注入概率（正负类对称）")
-    ap.add_argument("--strip_common_boilerplate", action="store_true", default=True, help="Strip common disclaimers/wrappers from final train texts for both classes. // 训练写盘前去常见免责声明/包裹")
+    ap.add_argument("--strip_common_boilerplate", action=argparse.BooleanOptionalAction, default=True, help="Strip common disclaimers/wrappers from final train texts for both classes. // 训练写盘前去常见免责声明/包裹")
     global args
     DEFAULTS = dict(
             effect_gate_for="none",
@@ -5785,9 +5832,9 @@ def main():
     # 关键参数一致性（硬断言）：默认必须与 DEFAULTS 一致
     _critical = list(DEFAULTS.keys())
     for k in _critical:
-        actual = getattr(args, k, None)
+        parser_default = ap.get_default(k)
         expected = DEFAULTS[k]
-        if actual != expected:
+        if parser_default != expected:
             raise SystemExit(f"defaults-mismatch: {k} actual={actual} expected={expected}. "
                             "Please fix argparse defaults or update DEFAULTS coherently.")
     random.seed(args.seed); np.random.seed(args.seed)
@@ -5909,20 +5956,6 @@ def main():
 }, fs, ensure_ascii=False, indent=2)
         print("[dry_run] wrote stats fingerprint:", fid)
         return
-    try:
-        sem_audit = audit_semantic_neighbors(rows)
-        stats_path = Path(str(outp).replace('.jsonl','_stats.json'))
-        try:
-            with open(stats_path, 'r+', encoding='utf-8') as fs:
-                data = json.load(fs)
-                data["semantic_neighbor_audit"] = sem_audit
-                fs.seek(0); fs.truncate()
-                json.dump(data, fs, ensure_ascii=False, indent=2)
-        except FileNotFoundError:
-            with open(stats_path, 'w', encoding='utf-8') as fs:
-                json.dump({"semantic_neighbor_audit": sem_audit, 'dsl_coverage': coverage if 'coverage' in locals() else None}, fs, ensure_ascii=False, indent=2)
-    except Exception as _e:
-        print("[warn] semantic neighbor audit skipped:", _e)
     total_n = max(1, args.n)
     neg_n = int(round(total_n * max(0.0, min(1.0, args.neg_ratio))))
     pos_n = max(0, total_n - neg_n)
@@ -6544,6 +6577,25 @@ def main():
     print(f"[done] wrote: {outp} & {auditp} | total={len(rows)} "
           f"(neg_ratio≈{(sum(1 for x in rows if x['label']==0)/(len(rows)+1e-9)):.3f})")
 
+     # --- now rows exists; it is safe to run any audits that depend on 'rows'
+    try:
+        sem_audit = audit_semantic_neighbors(rows)
+        stats_path = Path(str(outp).replace(".jsonl", "_stats.json"))
+        _stats = {"semantic_neighbors": sem_audit}
+        # append or create stats file
+        if stats_path.exists():
+            with open(stats_path, "r", encoding="utf-8") as fr:
+                try:
+                    cur = json.load(fr)
+                    cur.update(_stats)
+                    _stats = cur
+                except Exception:
+                    pass
+        with open(stats_path, "w", encoding="utf-8") as fw:
+            json.dump(_stats, fw, ensure_ascii=False, indent=2)
+    except Exception as _e:
+        print("[warn] semantic neighbor audit skipped:", _e)
+
     # Stats // 统计
     def agg(rows2: List[Dict[str,Any]]):
         Ls = Counter(r["len_bucket"] for r in rows2)
@@ -6911,27 +6963,6 @@ def main():
         if (len(multi_neg)/(len(neg)+1e-9)) > 0 and mt_taskshift_neg_rate < 0.40:
             print(f"[report][warn] multi_turn_neg_taskshift_rate={mt_taskshift_neg_rate:.3f} < 0.40 target")
 
-    # --- [PATCH-5] 近邻语义相似度审计（TF-IDF char 3-5gram） ---
-    def audit_semantic_neighbors(rows_all, topk=5):
-        try:
-            import numpy as np
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            from sklearn.metrics.pairwise import cosine_similarity
-            texts = [r.get("text","") for r in rows_all]
-            vec = TfidfVectorizer(analyzer="char", ngram_range=(3,5), min_df=2)
-            X = vec.fit_transform(texts)
-            sims = cosine_similarity(X)
-            max_sim = []
-            for i in range(len(texts)):
-                s = sims[i]
-                s[i] = 0.0
-                max_sim.append(float(s.max()))
-            return {
-                "semantic_neighbor_max_sim_p95": float(np.percentile(max_sim, 95)),
-                "semantic_neighbor_max_sim_p99": float(np.percentile(max_sim, 99)),
-            }
-        except Exception as e:
-            return {"semantic_neighbor_audit": f"skipped: {e}"}
     if args.mirror_placeholderless > 1e-9:
         aug = []
         for r in rows:

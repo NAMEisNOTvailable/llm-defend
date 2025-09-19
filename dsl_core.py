@@ -1052,21 +1052,21 @@ def render_jsonc(spec: AttackSpec, anchors: Anchors, structural: bool=False, anc
 
 ALIAS_MAP = {
     # 英 <-> 中 的常见键名 / 槽位
-    r'\b(note|remark|comment)\b':            ["备注","说明","注记"],
-    r'\b(result|answer|verdict|final)\b':    ["结果","答案","结论"],
-    r'\b(role)\b':                           ["角色","通道角色"],
-    r'\b(path|file|location)\b':             ["路径","文件路径"],
-    r'\b(upstream|source)\b':                ["上游","来源"],
-    r'\b(append|suffix|footer)\b':           ["附加","后缀","脚注"],
-    r'\b(tool|function_call|args|arguments)\b': ["工具","函数调用","参数"],
-    r'\b(directives?)\b':                    ["指令","提示"],
-    r'\b(title)\b':                          ["标题","题名"],
-    r'\b(summary|abstract)\b':               ["摘要","简介"],
-    r'\b(tags?)\b':                          ["标签","关键字"],
-    r'\b(status)\b':                         ["状态","进度"],
-    r'\b(category|type)\b':                  ["类别","类型"],
-    r'\b(author|owner)\b':                   ["作者","负责人"],
-    r'\b(date|time|datetime|timestamp)\b':   ["日期","时间"],
+    r'\b(?:note|remark|comment)\b':            ["备注","说明","注记"],
+    r'\b(?:result|answer|verdict|final)\b':    ["结果","答案","结论"],
+    r'\brole\b':                           ["角色","通道角色"],
+    r'\b(?:path|file|location)\b':             ["路径","文件路径"],
+    r'\b(?:upstream|source)\b':                ["上游","来源"],
+    r'\b(?:append|suffix|footer)\b':           ["附加","后缀","脚注"],
+    r'\b(?:tool|function_call|args|arguments)\b': ["工具","函数调用","参数"],
+    r'\bdirectives?\b':                    ["指令","提示"],
+    r'\btitle\b':                          ["标题","题名"],
+    r'\b(?:summary|abstract)\b':               ["摘要","简介"],
+    r'\btags?\b':                          ["标签","关键字"],
+    r'\bstatus\b':                         ["状态","进度"],
+    r'\b(?:category|type)\b':                  ["类别","类型"],
+    r'\b(?:author|owner)\b':                   ["作者","负责人"],
+    r'\b(?:date|time|datetime|timestamp)\b':   ["日期","时间"],
 }
 CN_ALIAS_MAP = {
     "评测通道": ["评测通道","评分通道","评审通道","打分通道","审查通道"],
@@ -2205,6 +2205,7 @@ def generate_batch(
             "ev_family": fam_sig,
             "ev_bucket": bucket_hash(spec.evidence),
             "appearance": ("openpi" if str(spec.strategy).startswith('openpi_') else 'normal'),
+            "contract_type": infer_contract_type(spec),
         }
         key_tmp = combo_key(meta_tmp)
         # —— 网格可达性短路 —— 
