@@ -231,13 +231,16 @@ class RenderPacket:
 
 _ATTACK_PRODUCER_CFG: dict | None = None
 _ATTACK_PRODUCER_TARGETS: List[Dict[str, Any]] | None = None
+_ATTACK_TARGET_SLICE: tuple[Dict[str, Any], ...] | None = None
 
 _HARD_NEG_PRODUCER_CFG: dict | None = None
 _HARD_NEG_PRODUCER_TARGETS: List[Dict[str, Any]] | None = None
 _PLAIN_NEG_PRODUCER_CFG: dict | None = None
 _PLAIN_NEG_PRODUCER_TARGETS: List[Dict[str, Any]] | None = None
+_PLAIN_NEG_TARGET_SLICE: tuple[Dict[str, Any], ...] | None = None
 _TOPIC_NEG_PRODUCER_CFG: dict | None = None
 _TOPIC_NEG_PRODUCER_TARGETS: List[Dict[str, Any]] | None = None
+_TOPIC_NEG_TARGET_SLICE: tuple[Dict[str, Any], ...] | None = None
 
 # ------------------ Common text & feature probes // 通用文本与特征探针 ------------------
 MASKED_FIELD_FAMILY_COUNTER = Counter()
@@ -4613,14 +4616,25 @@ def pick_strategy(goal_hint: str | None = None) -> Strategy:
 
 def _attack_producer_init(target_pool: List[Dict[str, Any]], cfg: dict):
     """Initializer for worker processes to stash config/state."""
-    global _ATTACK_PRODUCER_CFG, _ATTACK_PRODUCER_TARGETS
+    global _ATTACK_PRODUCER_CFG, _ATTACK_PRODUCER_TARGETS, _ATTACK_TARGET_SLICE
     _ATTACK_PRODUCER_CFG = cfg
     _ATTACK_PRODUCER_TARGETS = target_pool
+    random.shuffle(_ATTACK_PRODUCER_TARGETS)
+    _ATTACK_TARGET_SLICE = tuple(_ATTACK_PRODUCER_TARGETS)
 
 
 def _attack_render_core(seed: int) -> tuple[Optional[RenderPacket], list[tuple[str, dict]]]:
     cfg = _ATTACK_PRODUCER_CFG or {}
-    targets = _ATTACK_PRODUCER_TARGETS or []
+    global _ATTACK_TARGET_SLICE
+    targets = _ATTACK_TARGET_SLICE
+    if not targets:
+        base = _ATTACK_PRODUCER_TARGETS or []
+        if not base:
+            return None, []
+        try:
+            targets = _ATTACK_TARGET_SLICE = tuple(base)
+        except Exception:
+            targets = tuple(base)
     if not targets:
         return None, []
     rng = random.Random(seed)
@@ -4748,11 +4762,20 @@ def _attack_render_core(seed: int) -> tuple[Optional[RenderPacket], list[tuple[s
 
 def _attack_producer_job(job: tuple[int, int]) -> dict:
     seed, batch = job
+    cfg = _ATTACK_PRODUCER_CFG or {}
     results: list[tuple[Optional[RenderPacket], list[tuple[str, dict]]]] = []
     base_seed = seed
+    log_cap = int(cfg.get('producer_log_sample', 6))
     for idx in range(batch):
         cand_seed = base_seed + idx
         cand, logs = _attack_render_core(cand_seed)
+        if logs and log_cap > 0 and len(logs) > log_cap:
+            rng = random.Random(cand_seed ^ seed)
+            try:
+                pick = rng.sample(range(len(logs)), log_cap)
+                logs = [logs[i] for i in sorted(pick)]
+            except ValueError:
+                logs = logs[:log_cap]
         results.append((cand, logs))
     return {"results": results}
 
@@ -4808,15 +4831,26 @@ def _hard_neg_producer_job(job: tuple[int, int]) -> dict:
 
 
 def _plain_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict):
-    global _PLAIN_NEG_PRODUCER_CFG, _PLAIN_NEG_PRODUCER_TARGETS
+    global _PLAIN_NEG_PRODUCER_CFG, _PLAIN_NEG_PRODUCER_TARGETS, _PLAIN_NEG_TARGET_SLICE
     _PLAIN_NEG_PRODUCER_CFG = cfg
     _PLAIN_NEG_PRODUCER_TARGETS = target_pool
+    random.shuffle(_PLAIN_NEG_PRODUCER_TARGETS)
+    _PLAIN_NEG_TARGET_SLICE = tuple(_PLAIN_NEG_PRODUCER_TARGETS)
 
 
 def _plain_neg_producer_job(job: tuple[int, int]) -> dict:
     seed, batch = job
     cfg = _PLAIN_NEG_PRODUCER_CFG or {}
-    targets = _PLAIN_NEG_PRODUCER_TARGETS or []
+    global _PLAIN_NEG_TARGET_SLICE
+    targets = _PLAIN_NEG_TARGET_SLICE
+    if not targets:
+        base = _PLAIN_NEG_PRODUCER_TARGETS or []
+        if not base:
+            return {"cands": [], "stats": {}}
+        try:
+            targets = _PLAIN_NEG_TARGET_SLICE = tuple(base)
+        except Exception:
+            targets = tuple(base)
     if not targets:
         return {"cands": [], "stats": {}}
     deduper_params = cfg.get('deduper_params', {})
@@ -4849,15 +4883,26 @@ def _plain_neg_producer_job(job: tuple[int, int]) -> dict:
 
 
 def _topic_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict):
-    global _TOPIC_NEG_PRODUCER_CFG, _TOPIC_NEG_PRODUCER_TARGETS
+    global _TOPIC_NEG_PRODUCER_CFG, _TOPIC_NEG_PRODUCER_TARGETS, _TOPIC_NEG_TARGET_SLICE
     _TOPIC_NEG_PRODUCER_CFG = cfg
     _TOPIC_NEG_PRODUCER_TARGETS = target_pool
+    random.shuffle(_TOPIC_NEG_PRODUCER_TARGETS)
+    _TOPIC_NEG_TARGET_SLICE = tuple(_TOPIC_NEG_PRODUCER_TARGETS)
 
 
 def _topic_neg_producer_job(job: tuple[int, int]) -> dict:
     seed, batch = job
     cfg = _TOPIC_NEG_PRODUCER_CFG or {}
-    targets = _TOPIC_NEG_PRODUCER_TARGETS or []
+    global _TOPIC_NEG_TARGET_SLICE
+    targets = _TOPIC_NEG_TARGET_SLICE
+    if not targets:
+        base = _TOPIC_NEG_PRODUCER_TARGETS or []
+        if not base:
+            return {"cands": []}
+        try:
+            targets = _TOPIC_NEG_TARGET_SLICE = tuple(base)
+        except Exception:
+            targets = tuple(base)
     if not targets:
         return {"cands": []}
     deduper_params = cfg.get('deduper_params', {})
@@ -6364,6 +6409,8 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
     disc_rate = _effective_disc_rate(disc_rate)
     rng = random.Random(seed)
     out = []
+    if not isinstance(target_pool, list):
+        target_pool = list(target_pool)
     random.shuffle(target_pool)
     # benign values used to fill structured carriers
     BENIGN_VALUES = ["已接收","处理中","—","N/A","OK","已记录","通过","无"]
