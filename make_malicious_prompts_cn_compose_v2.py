@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Iterable, Set
 import itertools
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datasets import load_dataset, DatasetDict
 import base64, urllib.parse
 import regex as _re
@@ -222,6 +223,13 @@ class RenderPacket:
 
 _ATTACK_PRODUCER_CFG: dict | None = None
 _ATTACK_PRODUCER_TARGETS: List[Dict[str, Any]] | None = None
+
+_HARD_NEG_PRODUCER_CFG: dict | None = None
+_HARD_NEG_PRODUCER_TARGETS: List[Dict[str, Any]] | None = None
+_PLAIN_NEG_PRODUCER_CFG: dict | None = None
+_PLAIN_NEG_PRODUCER_TARGETS: List[Dict[str, Any]] | None = None
+_TOPIC_NEG_PRODUCER_CFG: dict | None = None
+_TOPIC_NEG_PRODUCER_TARGETS: List[Dict[str, Any]] | None = None
 
 # ------------------ Common text & feature probes // 通用文本与特征探针 ------------------
 MASKED_FIELD_FAMILY_COUNTER = Counter()
@@ -1619,17 +1627,68 @@ EXTRA_CONTAINERS = [
 ]
 
 # ------------------ Target task pool // 任务上下文池 ------------------
-def try_load(name: str, kwargs: Dict[str, Any], hf_rev: Optional[str]=None) -> Optional[DatasetDict]:
+def try_load(name: str, kwargs: Dict[str, Any], hf_rev: Optional[str]=None, streaming: bool = False, cache_dir: Optional[str] = None) -> Optional[DatasetDict]:
     if load_dataset is None:
         return None
     key = (name, kwargs.get("name"))
-    rev = {"revision": (hf_rev or PIN_REV.get(key, {}).get("revision") or "main")}
+    params = dict(kwargs)
+    params.update({"revision": (hf_rev or PIN_REV.get(key, {}).get("revision") or "main")})
+    if streaming:
+        params["streaming"] = True
+    if cache_dir:
+        params["cache_dir"] = cache_dir
     try:
-        return load_dataset(name, **{**kwargs, **rev})
+        return load_dataset(name, **params)
     except Exception as e:
         print(f"[warn] dataset skip {name} {kwargs}: {e}", file=sys.stderr)
         return None
     
+def _load_many_datasets(specs: List[Tuple[str, Dict[str, Any]]], hf_rev: Optional[str], streaming: bool, cache_dir: Optional[str], workers: int) -> List[Tuple[Tuple[str, Dict[str, Any]], Optional[DatasetDict]]]:
+    results: Dict[Tuple[str, Tuple[Tuple[str, Any], ...]], Optional[DatasetDict]] = {}
+    workers = int(workers or 0)
+    if workers <= 1:
+        for name, kw in specs:
+            results[(name, tuple(sorted(kw.items())))] = try_load(name, kw, hf_rev=hf_rev, streaming=streaming, cache_dir=cache_dir)
+        return [((name, kw), results.get((name, tuple(sorted(kw.items()))))) for name, kw in specs]
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        future_map = {ex.submit(try_load, name, kw, hf_rev, streaming, cache_dir): (name, kw) for name, kw in specs}
+        for fut in as_completed(future_map):
+            name, kw = future_map[fut]
+            key = (name, tuple(sorted(kw.items())))
+            try:
+                results[key] = fut.result()
+            except Exception as exc:
+                print(f"[warn] dataset skip {name} {kw}: {exc}", file=sys.stderr)
+                results[key] = None
+    return [((name, kw), results.get((name, tuple(sorted(kw.items()))))) for name, kw in specs]
+
+
+def _sample_rows(rows, limit: int, seed: int) -> List[Any]:
+    if limit <= 0:
+        return []
+    rng = random.Random(seed)
+    try:
+        length = len(rows)  # type: ignore
+    except Exception:
+        length = None
+    if length is not None:
+        idxs = list(range(length))
+        rng.shuffle(idxs)
+        return [rows[i] for i in idxs[:limit]]
+    buffer: List[Any] = []
+    for idx, row in enumerate(rows):
+        if len(buffer) < limit:
+            buffer.append(row)
+        else:
+            j = rng.randint(0, idx)
+            if j < limit:
+                buffer[j] = row
+        if idx + 1 >= limit * 10:
+            break
+    rng.shuffle(buffer)
+    return buffer
+
+
 # ------------------ External corpora adapters // 外部评测数据适配器 ------------------
 def _yield_wildchat(lang: str = "zh", n: int = 2000, seed: int = 0):
     try:
@@ -1794,102 +1853,118 @@ def _yield_text_fields(row: Dict[str, Any]) -> Iterable[str]:
         v = row.get(k)
         if isinstance(v, str) and len(v.strip())>0:
             yield v
-def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]=None) -> List[Dict[str, Any]]:
-    """Random benign tasks from diverse CN corpora. // 从多中文语料随机构建良性任务池。"""
+def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]=None,
+                      workers: int = 0, streaming: bool = False, cache_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Random benign tasks from diverse CN corpora. Supports optional concurrent loading and streaming.
+    // 从多中文语料随机构建良性任务池，可选择并行加载与 streaming。"""
     random.seed(seed)
     pool: List[Dict[str, Any]] = []
+    loader_workers = int(workers or 0)
+
+    def _iter_dataset(ds, tag: str):
+        if ds is None:
+            return
+        try:
+            splits = list(ds.keys())
+        except Exception:
+            splits = []
+        for split in splits:
+            rows = ds[split]
+            sample_seed = cheap_fingerprint(f"{tag}-{split}-{seed}")
+            for row in _sample_rows(rows, max_per_task, sample_seed):
+                yield row, split
+
     # --- Classic CLUE style tasks // 经典 CLUE 任务 ---
-    for src in [("C-MTEB/LCQMC", {}), ("C-MTEB/AFQMC", {})]:
-        ds = try_load(*src, hf_rev=hf_rev)
-        # fallback for rare mirrors / offline envs
-        if (ds is None) and (src[0] == "C-MTEB/LCQMC"):
-            ds = try_load("mteb/LCQMC", {}, hf_rev=hf_rev)
-        if (ds is None) and (src[0] == "C-MTEB/AFQMC"):
-            ds = try_load("clue", {"name": "afqmc"}, hf_rev=hf_rev)
-        if not ds: continue
-        for split in ds.keys():
-            rows = ds[split]; idxs = list(range(len(rows))); random.shuffle(idxs)
-            for i in idxs[:max_per_task]:
-                r = rows[i]
-                a = r.get("sentence1") or r.get("text1") or r.get("query1") or r.get("sentence")
-                b = r.get("sentence2") or r.get("text2") or r.get("query2")
-                if not (isinstance(a,str) and isinstance(b,str)): continue
-                a,b = normalize(a), normalize(b)
-                if len(a)<4 or len(b)<4: continue
-                pool.append({"task":"similarity","prompt":f"判断两句话是否表达同一含义，仅答“是/否”。\n句子A：{a}\n句子B：{b}"})
+    classic_specs = [("C-MTEB/LCQMC", {}), ("C-MTEB/AFQMC", {})]
+    for (name, kw), ds in _load_many_datasets(classic_specs, hf_rev, streaming, cache_dir, loader_workers):
+        if ds is None and name == "C-MTEB/LCQMC":
+            ds = try_load("mteb/LCQMC", {}, hf_rev=hf_rev, streaming=streaming, cache_dir=cache_dir)
+        if ds is None and name == "C-MTEB/AFQMC":
+            ds = try_load("clue", {"name": "afqmc"}, hf_rev=hf_rev, streaming=streaming, cache_dir=cache_dir)
+        if not ds:
+            continue
+        for r, _ in _iter_dataset(ds, f"classic-{name}"):
+            a = r.get("sentence1") or r.get("text1") or r.get("query1") or r.get("sentence")
+            b = r.get("sentence2") or r.get("text2") or r.get("query2")
+            if not (isinstance(a, str) and isinstance(b, str)):
+                continue
+            a, b = normalize(a), normalize(b)
+            if len(a) < 4 or len(b) < 4:
+                continue
+            pool.append({"task":"similarity","prompt":f"判断两句话是否表达同一含义，仅答“是/否”。\n句子A：{a}\n句子B：{b}"})
     for sub in ["ocnli","cmnli"]:
-        ds = try_load("clue", {"name": sub}, hf_rev=hf_rev)
-        if not ds: continue
-        for split in ds.keys():
-            rows = ds[split]; idxs = list(range(len(rows))); random.shuffle(idxs)
-            for i in idxs[:max_per_task]:
-                r = rows[i]
-                p = r.get("sentence1") or r.get("premise")
-                h = r.get("sentence2") or r.get("hypothesis")
-                if not (isinstance(p,str) and isinstance(h,str)): continue
-                p,h = normalize(p), normalize(h)
-                if len(p)<4 or len(h)<4: continue
-                pool.append({"task":"nli","prompt":f"判定前提与假设的关系：只答“蕴含/矛盾/中立”。\n前提：{p}\n假设：{h}"})
+        ds = try_load("clue", {"name": sub}, hf_rev=hf_rev, streaming=streaming, cache_dir=cache_dir)
+        if not ds:
+            continue
+        for r, _ in _iter_dataset(ds, f"nli-{sub}"):
+            p = r.get("sentence1") or r.get("premise")
+            h = r.get("sentence2") or r.get("hypothesis")
+            if not (isinstance(p, str) and isinstance(h, str)):
+                continue
+            p, h = normalize(p), normalize(h)
+            if len(p) < 4 or len(h) < 4:
+                continue
+            pool.append({"task":"nli","prompt":f"判定前提与假设的关系：只答“蕴含/矛盾/中立”。\n前提：{p}\n假设：{h}"})
     # Sentiment (ChnSentiCorp): avoid script loaders; prefer parquet mirrors
-    for src in [("lansinuote/ChnSentiCorp", {})]:
-        ds = try_load(*src, hf_rev=hf_rev)
-        if not ds: continue
-        for split in ds.keys():
-            rows = ds[split]; idxs = list(range(len(rows))); random.shuffle(idxs)
-            for i in idxs[:max_per_task]:
-                x = rows[i].get("text") or rows[i].get("sentence") or rows[i].get("content")
-                if not isinstance(x,str): continue
-                x = normalize(x)
-                if len(x)<8: continue
-                pool.append({"task":"sentiment","prompt":f"判断情感倾向，仅答“正/负”。\n{x}"})
-    for src in [("hugcyp/LCSTS", {}), ("suolyer/lcsts", {})]:
-        ds = try_load(*src)
-        if not ds: continue
-        for split in ds.keys():
-            rows = ds[split]; idxs = list(range(len(rows))); random.shuffle(idxs)
-            for i in idxs[:max_per_task]:
-                x = rows[i].get("text") or rows[i].get("content") or rows[i].get("passage") or rows[i].get("summary") or rows[i].get("Document")
-                if not isinstance(x,str): continue
-                x = normalize(x)
-                if len(x)<20: continue
-                pool.append({"task":"summarization","prompt":f"请概括下文，生成≤30字摘要：\n{x}"})
+    sentiment_specs = [("lansinuote/ChnSentiCorp", {})]
+    for (name, kw), ds in _load_many_datasets(sentiment_specs, hf_rev, streaming, cache_dir, loader_workers):
+        if not ds:
+            continue
+        for r, _ in _iter_dataset(ds, f"sentiment-{name}"):
+            x = r.get("text") or r.get("sentence") or r.get("content")
+            if not isinstance(x, str):
+                continue
+            x = normalize(x)
+            if len(x) < 8:
+                continue
+            pool.append({"task":"sentiment","prompt":f"判断情感倾向，仅答“正/负”。\n{x}"})
+    # LCSTS summarization
+    lcsts_specs = [("hugcyp/LCSTS", {}), ("suolyer/lcsts", {})]
+    for (name, kw), ds in _load_many_datasets(lcsts_specs, hf_rev, streaming, cache_dir, loader_workers):
+        if not ds:
+            continue
+        for r, _ in _iter_dataset(ds, f"lcsts-{name}"):
+            x = r.get("text") or r.get("content") or r.get("passage") or r.get("summary") or r.get("Document")
+            if not isinstance(x, str):
+                continue
+            x = normalize(x)
+            if len(x) < 20:
+                continue
+            pool.append({"task":"summarization","prompt":f"请概括下文，生成≤30字摘要：\n{x}"})
     # --- Expanded domains // 扩展域 ---
-    # Wikipedia // 维基中文（改成 wikimedia/wikipedia 的新仓库；失败时兜底镜像）
-    for src in [("wikimedia/wikipedia", {"name":"20231101.zh"}),
-                ("shaowenchen/wiki_zh", {})]:
-        ds = try_load(*src, hf_rev=hf_rev)
-        if ds:
-            for split in ds.keys():
-                rows = ds[split]; idxs = list(range(min(len(rows), max_per_task))); random.shuffle(idxs)
-                for i in idxs:
-                    r = rows[i]
-                    text_fields = list(_yield_text_fields(r))
-                    if not text_fields: continue
-                    x = normalize("。".join(text_fields)[:800])
-                    if len(x) < 60: continue
-                    # Create doc-style tasks // 生成文档风任务
-                    pool.append({"task":"wiki_summarize","prompt":f"阅读片段并给出50字内要点：\n{x}"})
-                    pool.append({"task":"wiki_ents","prompt":f"从片段中抽取专有名词并以逗号分隔：\n{x}"})
-    # Chinese tech/news/forum style corpora（替换为可加载数据集）
-    for trial in [("SirlyDreamer/THUCNews", {})]:
-        ds = try_load(*trial)
-        if not ds: continue
-        for split in ds.keys():
-            rows = ds[split]; idxs = list(range(len(rows))); random.shuffle(idxs)
-            for i in idxs[:max_per_task]:
-                for x in _yield_text_fields(rows[i]):
-                    x = normalize(x)
-                    if len(x) < 60: continue
-                    task = random.choice(["extract_kv","classify_topic","clean_markup","make_outline"])
-                    if task == "extract_kv":
-                        pool.append({"task":task,"prompt":f"抽取段落中的关键实体（人/地/机构）并用JSON返回：\n{x}"})
-                    elif task == "classify_topic":
-                        pool.append({"task":task,"prompt":f"判断该段属于“技术/新闻/论坛/说明/评论”中的哪一类，仅答其一：\n{x}"})
-                    elif task == "clean_markup":
-                        pool.append({"task":task,"prompt":f"去除段落中的标记/符号并输出干净文本：\n{x}"})
-                    else:
-                        pool.append({"task":task,"prompt":f"基于段落生成三级提纲（1-3条）：\n{x}"})
-                    break  # one field per row
+    wiki_specs = [("wikimedia/wikipedia", {"name":"20231101.zh"}), ("shaowenchen/wiki_zh", {})]
+    for (name, kw), ds in _load_many_datasets(wiki_specs, hf_rev, streaming, cache_dir, loader_workers):
+        if not ds:
+            continue
+        for r, split in _iter_dataset(ds, f"wiki-{name}"):
+            text_fields = list(_yield_text_fields(r))
+            if not text_fields:
+                continue
+            x = normalize("。".join(text_fields)[:800])
+            if len(x) < 60:
+                continue
+            pool.append({"task":"wiki_summarize","prompt":f"阅读片段并给出50字内要点：\n{x}"})
+            pool.append({"task":"wiki_ents","prompt":f"从片段中抽取专有名词并以逗号分隔：\n{x}"})
+    # Chinese tech/news/forum style corpora
+    news_specs = [("SirlyDreamer/THUCNews", {})]
+    for (name, kw), ds in _load_many_datasets(news_specs, hf_rev=None, streaming=streaming, cache_dir=cache_dir, workers=loader_workers):
+        if not ds:
+            continue
+        for r, _ in _iter_dataset(ds, f"news-{name}"):
+            for x in _yield_text_fields(r):
+                x = normalize(x)
+                if len(x) < 60:
+                    continue
+                task = random.choice(["extract_kv","classify_topic","clean_markup","make_outline"])
+                if task == "extract_kv":
+                    pool.append({"task":task,"prompt":f"抽取段落中的关键实体（人/地/组织），JSON返回：\n{x}"})
+                elif task == "classify_topic":
+                    pool.append({"task":task,"prompt":f"判断该段是“新闻/博客/论坛/说明/评论”中的一类，给出一项\n{x}"})
+                elif task == "clean_markup":
+                    pool.append({"task":task,"prompt":f"去除段落中的标记/括注并输出整洁文本\n{x}"})
+                else:
+                    pool.append({"task":task,"prompt":f"根据段落生成提纲，1-3条要点\n{x}"})
+                break  # one field per row
 
     random.shuffle(pool)
     return pool
@@ -4598,6 +4673,134 @@ def _attack_producer_job(job: tuple[int, int]) -> dict:
     return {"results": results}
 
 
+def _hard_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict):
+    global _HARD_NEG_PRODUCER_CFG, _HARD_NEG_PRODUCER_TARGETS
+    _HARD_NEG_PRODUCER_CFG = cfg
+    _HARD_NEG_PRODUCER_TARGETS = target_pool
+
+
+def _hard_neg_producer_job(job: tuple[int, int]) -> dict:
+    seed, batch = job
+    cfg = _HARD_NEG_PRODUCER_CFG or {}
+    targets = _HARD_NEG_PRODUCER_TARGETS or []
+    if not targets:
+        return {"cands": []}
+    deduper_params = cfg.get('deduper_params', {})
+    local_deduper = Deduper(
+        sim_bits=int(deduper_params.get('sim_bits', 64)),
+        sim_thresh=int(deduper_params.get('sim_thresh', 2)),
+        k=int(deduper_params.get('k', 5)),
+        n_hash=int(deduper_params.get('n_hash', 64)),
+        bands=int(deduper_params.get('bands', 16)),
+        jaccard_thresh=float(deduper_params.get('jaccard_thresh', 0.90)),
+        vec_dim=int(deduper_params.get('vec_dim', 1024)),
+        cosine_thresh=float(deduper_params.get('cosine_thresh', 0.92)),
+        max_vecs=int(deduper_params.get('max_vecs', 20000)),
+    )
+    worker_cap = cfg.get('worker_family_cap')
+    if worker_cap is None:
+        worker_cap = int(batch) * max(1, int(cfg.get('oversample_mult', 1)))
+    cands = _compose_hard_negs_serial(
+        target_pool=targets,
+        k=int(batch),
+        seed=int(seed),
+        min_cjk_share=float(cfg.get('min_cjk_share', 0.60)),
+        min_cjk_share_auto=bool(cfg.get('min_cjk_share_auto', False)),
+        oversample_mult=int(cfg.get('oversample_mult', 1)),
+        deduper=local_deduper,
+        family_cap=int(worker_cap),
+        disc_rate=cfg.get('disc_rate'),
+        art_match_rate=float(cfg.get('art_match_rate', 0.50)),
+        struct_evidence_rate=float(cfg.get('struct_evidence_rate', 0.0)),
+        mask_format_features_rate=float(cfg.get('mask_format_features_rate', 0.0)),
+        neg_effect_guard=bool(cfg.get('neg_effect_guard', False)),
+        mask_on=str(cfg.get('mask_on', 'both')),
+        dedupe_preserve_carrier=bool(cfg.get('dedupe_preserve_carrier', False)),
+        use_end_nonce=bool(cfg.get('use_end_nonce', False)),
+        use_model_eval=bool(cfg.get('use_model_eval', False)),
+        strict_neg_diag_gate=bool(cfg.get('strict_neg_diag_gate', True)),
+    )
+    return {"cands": cands}
+
+
+def _plain_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict):
+    global _PLAIN_NEG_PRODUCER_CFG, _PLAIN_NEG_PRODUCER_TARGETS
+    _PLAIN_NEG_PRODUCER_CFG = cfg
+    _PLAIN_NEG_PRODUCER_TARGETS = target_pool
+
+
+def _plain_neg_producer_job(job: tuple[int, int]) -> dict:
+    seed, batch = job
+    cfg = _PLAIN_NEG_PRODUCER_CFG or {}
+    targets = _PLAIN_NEG_PRODUCER_TARGETS or []
+    if not targets:
+        return {"cands": [], "stats": {}}
+    deduper_params = cfg.get('deduper_params', {})
+    local_deduper = Deduper(
+        sim_bits=int(deduper_params.get('sim_bits', 64)),
+        sim_thresh=int(deduper_params.get('sim_thresh', 2)),
+        k=int(deduper_params.get('k', 5)),
+        n_hash=int(deduper_params.get('n_hash', 64)),
+        bands=int(deduper_params.get('bands', 16)),
+        jaccard_thresh=float(deduper_params.get('jaccard_thresh', 0.90)),
+        vec_dim=int(deduper_params.get('vec_dim', 1024)),
+        cosine_thresh=float(deduper_params.get('cosine_thresh', 0.92)),
+        max_vecs=int(deduper_params.get('max_vecs', 20000)),
+    )
+    cands, stats = _compose_plain_negatives_serial(
+        target_pool=targets,
+        k=int(batch),
+        seed=int(seed),
+        deduper=local_deduper,
+        disc_rate=cfg.get('disc_rate'),
+        carrier_mix_prob=float(cfg.get('carrier_mix_prob', 0.45)),
+        stack_prob=float(cfg.get('stack_prob', 0.25)),
+        struct_evidence_rate=float(cfg.get('struct_evidence_rate', 0.0)),
+        mask_format_features_rate=float(cfg.get('mask_format_features_rate', 0.0)),
+        mask_on=str(cfg.get('mask_on', 'both')),
+        dedupe_preserve_carrier=bool(cfg.get('dedupe_preserve_carrier', False)),
+        strict_neg_diag_gate=bool(cfg.get('strict_neg_diag_gate', True)),
+    )
+    return {"cands": cands, "stats": stats or {}}
+
+
+def _topic_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict):
+    global _TOPIC_NEG_PRODUCER_CFG, _TOPIC_NEG_PRODUCER_TARGETS
+    _TOPIC_NEG_PRODUCER_CFG = cfg
+    _TOPIC_NEG_PRODUCER_TARGETS = target_pool
+
+
+def _topic_neg_producer_job(job: tuple[int, int]) -> dict:
+    seed, batch = job
+    cfg = _TOPIC_NEG_PRODUCER_CFG or {}
+    targets = _TOPIC_NEG_PRODUCER_TARGETS or []
+    if not targets:
+        return {"cands": []}
+    deduper_params = cfg.get('deduper_params', {})
+    local_deduper = Deduper(
+        sim_bits=int(deduper_params.get('sim_bits', 64)),
+        sim_thresh=int(deduper_params.get('sim_thresh', 2)),
+        k=int(deduper_params.get('k', 5)),
+        n_hash=int(deduper_params.get('n_hash', 64)),
+        bands=int(deduper_params.get('bands', 16)),
+        jaccard_thresh=float(deduper_params.get('jaccard_thresh', 0.90)),
+        vec_dim=int(deduper_params.get('vec_dim', 1024)),
+        cosine_thresh=float(deduper_params.get('cosine_thresh', 0.92)),
+        max_vecs=int(deduper_params.get('max_vecs', 20000)),
+    )
+    cands = _compose_topic_shift_negatives_serial(
+        target_pool=targets,
+        k=int(batch),
+        seed=int(seed),
+        deduper=local_deduper,
+        mask_format_features_rate=float(cfg.get('mask_format_features_rate', 0.0)),
+        mask_on=str(cfg.get('mask_on', 'both')),
+        dedupe_preserve_carrier=bool(cfg.get('dedupe_preserve_carrier', False)),
+        disc_rate=cfg.get('disc_rate'),
+    )
+    return {"cands": cands}
+
+
 class AttackSelector:
     """Main-process selector applying dedupe and coverage constraints."""
 
@@ -5597,7 +5800,7 @@ HARDNEG_TPLS = [
     "---\nlayout: doc\nmeta: { stable: true, result: '{payload}' }\n---\n上述仅为字段命名示例。",
 ]
 
-def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
+def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: int,
                       min_cjk_share: float, min_cjk_share_auto: bool,
                       oversample_mult: int, deduper: Deduper, family_cap: int,
                       disc_rate: float | None = None, art_match_rate: float = 0.50,
@@ -5772,6 +5975,122 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
     except Exception:
         pass
     return cands
+
+def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
+                      min_cjk_share: float, min_cjk_share_auto: bool,
+                      oversample_mult: int, deduper: Deduper, family_cap: int,
+                      disc_rate: float | None = None, art_match_rate: float = 0.50,
+                      struct_evidence_rate: float = 0.0,
+                      mask_format_features_rate: float = 0.0,
+                      neg_effect_guard: bool = False,
+                      mask_on: str = "both",
+                      dedupe_preserve_carrier: bool = False,
+                      use_end_nonce: bool = False,
+                      use_model_eval: bool = False,
+                      strict_neg_diag_gate: bool = True,
+                      workers: int = 0,
+                      producer_batch: int = 128) -> List[Dict[str,Any]]:
+    workers = int(workers or 0)
+    if workers <= 1:
+        return _compose_hard_negs_serial(
+            target_pool, k, seed, min_cjk_share, min_cjk_share_auto,
+            oversample_mult, deduper, family_cap,
+            disc_rate=disc_rate, art_match_rate=art_match_rate,
+            struct_evidence_rate=struct_evidence_rate,
+            mask_format_features_rate=mask_format_features_rate,
+            neg_effect_guard=neg_effect_guard,
+            mask_on=mask_on,
+            dedupe_preserve_carrier=dedupe_preserve_carrier,
+            use_end_nonce=use_end_nonce,
+            use_model_eval=use_model_eval,
+            strict_neg_diag_gate=strict_neg_diag_gate,
+        )
+
+    workers = max(1, workers if workers > 0 else ((cpu_count() or 2) - 1))
+    producer_batch = max(1, int(producer_batch or 64))
+    disc_rate_eff = _effective_disc_rate(disc_rate)
+    wanted = k * max(1, oversample_mult)
+
+    index_attr = getattr(deduper, 'index', None)
+    deduper_params = {
+        'sim_bits': getattr(deduper, 'sim_bits', 64),
+        'sim_thresh': getattr(deduper, 'sim_thresh', 2),
+        'k': getattr(deduper, 'k', 5),
+        'n_hash': getattr(index_attr, 'n_hash', 64) if index_attr else 64,
+        'bands': getattr(index_attr, 'bands', 16) if index_attr else 16,
+        'jaccard_thresh': getattr(deduper, 'jaccard_thresh', 0.90),
+        'vec_dim': getattr(deduper, 'vec_dim', 1024),
+        'cosine_thresh': getattr(deduper, 'cosine_thresh', 0.92),
+        'max_vecs': getattr(deduper, 'max_vecs', 20000),
+    }
+
+    cfg = {
+        'seed': seed,
+        'min_cjk_share': min_cjk_share,
+        'min_cjk_share_auto': bool(min_cjk_share_auto),
+        'oversample_mult': oversample_mult,
+        'disc_rate': disc_rate_eff,
+        'art_match_rate': art_match_rate,
+        'struct_evidence_rate': struct_evidence_rate,
+        'mask_format_features_rate': mask_format_features_rate,
+        'neg_effect_guard': neg_effect_guard,
+        'mask_on': mask_on,
+        'dedupe_preserve_carrier': dedupe_preserve_carrier,
+        'use_end_nonce': use_end_nonce,
+        'use_model_eval': use_model_eval,
+        'strict_neg_diag_gate': strict_neg_diag_gate,
+        'worker_family_cap': max(1, producer_batch * max(1, oversample_mult)),
+        'deduper_params': deduper_params,
+    }
+
+    job_stream = ((seed + (idx * producer_batch * 9973), producer_batch) for idx in itertools.count())
+    results: List[Dict[str, Any]] = []
+    fam_count: Counter[str] = Counter()
+    attempts = 0
+    max_attempts = max(wanted * 50, producer_batch * workers * 10)
+
+    with Pool(processes=workers, initializer=_hard_neg_producer_init,
+              initargs=(target_pool, cfg)) as pool:
+        try:
+            for payload in pool.imap_unordered(_hard_neg_producer_job, job_stream):
+                chunk = payload.get('cands', []) if isinstance(payload, dict) else []
+                for cand in chunk:
+                    if not isinstance(cand, dict):
+                        continue
+                    attempts += 1
+                    text_val = cand.get('text', '')
+                    if not text_val:
+                        continue
+                    if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier):
+                        continue
+                    fam = cand.get('family', 'hardneg')
+                    if fam_count[fam] >= family_cap:
+                        continue
+                    cand = dict(cand)
+                    pair_id = f"HARD-{len(results)+1:07d}"
+                    cand['pair_id'] = pair_id
+                    try:
+                        carrier_base = (cand.get('carrier') or 'none').split('+')[0]
+                        RUNTIME_NEG_ACCEPTS_BY_CARRIER[carrier_base] += 1
+                    except Exception:
+                        pass
+                    results.append(cand)
+                    fam_count[fam] += 1
+                    if len(results) >= wanted:
+                        raise StopIteration
+                if len(results) >= wanted or attempts >= max_attempts:
+                    raise StopIteration
+        except StopIteration:
+            pool.terminate()
+        finally:
+            pool.join()
+
+    try:
+        print(f"[gate][hardneg] attempts={attempts} kept={len(results)} accept_rate={(len(results)/(attempts+1e-9)):.3f}")
+    except Exception:
+        pass
+    return results
+
 def intent_balanced_pick(rows_pos, pos_n, seed: int):
     """目标配额优先：按 INTENT_TARGET_DIST 分配配额，不足再回填。"""
     random.seed(seed)
@@ -5948,7 +6267,7 @@ def is_benign_strict(text: str, contract: TaskContract) -> bool:
         pass  # 如果 DSL 不可用，忽略此步
     return True
 # ----  plain negatives (真实世界良性指令) ----
-def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
+def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Deduper,
                             disc_rate: float | None = None,
                             carrier_mix_prob: float = 0.45,
                             stack_prob: float = 0.25,
@@ -6125,7 +6444,100 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
         ))
     return out, {'suspect_neg': suspect_neg, 'total_neg_checked': total_neg_checked}
 
-def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Deduper,
+
+def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
+                            disc_rate: float | None = None,
+                            carrier_mix_prob: float = 0.45,
+                            stack_prob: float = 0.25,
+                            struct_evidence_rate: float = 0.0,
+                            mask_format_features_rate: float = 0.0,
+                            mask_on: str = "both",
+                            dedupe_preserve_carrier: bool = False,
+                            strict_neg_diag_gate: bool = True,
+                            workers: int = 0,
+                            producer_batch: int = 128):
+    workers = int(workers or 0)
+    if workers <= 1:
+        return _compose_plain_negatives_serial(
+            target_pool, k, seed, deduper,
+            disc_rate=disc_rate,
+            carrier_mix_prob=carrier_mix_prob,
+            stack_prob=stack_prob,
+            struct_evidence_rate=struct_evidence_rate,
+            mask_format_features_rate=mask_format_features_rate,
+            mask_on=mask_on,
+            dedupe_preserve_carrier=dedupe_preserve_carrier,
+            strict_neg_diag_gate=strict_neg_diag_gate,
+        )
+
+    workers = max(1, workers if workers > 0 else ((cpu_count() or 2) - 1))
+    producer_batch = max(1, int(producer_batch or 64))
+    disc_rate_eff = _effective_disc_rate(disc_rate)
+
+    index_attr = getattr(deduper, 'index', None)
+    deduper_params = {
+        'sim_bits': getattr(deduper, 'sim_bits', 64),
+        'sim_thresh': getattr(deduper, 'sim_thresh', 2),
+        'k': getattr(deduper, 'k', 5),
+        'n_hash': getattr(index_attr, 'n_hash', 64) if index_attr else 64,
+        'bands': getattr(index_attr, 'bands', 16) if index_attr else 16,
+        'jaccard_thresh': getattr(deduper, 'jaccard_thresh', 0.90),
+        'vec_dim': getattr(deduper, 'vec_dim', 1024),
+        'cosine_thresh': getattr(deduper, 'cosine_thresh', 0.92),
+        'max_vecs': getattr(deduper, 'max_vecs', 20000),
+    }
+
+    cfg = {
+        'disc_rate': disc_rate_eff,
+        'carrier_mix_prob': carrier_mix_prob,
+        'stack_prob': stack_prob,
+        'struct_evidence_rate': struct_evidence_rate,
+        'mask_format_features_rate': mask_format_features_rate,
+        'mask_on': mask_on,
+        'dedupe_preserve_carrier': dedupe_preserve_carrier,
+        'strict_neg_diag_gate': strict_neg_diag_gate,
+        'deduper_params': deduper_params,
+    }
+
+    job_stream = ((seed + (idx * producer_batch * 8369), producer_batch) for idx in itertools.count())
+    results: List[Dict[str, Any]] = []
+    agg_stats = {'suspect_neg': 0, 'total_neg_checked': 0}
+    attempts = 0
+    max_attempts = max(k * max(1, producer_batch) * 10, producer_batch * workers * 8)
+
+    with Pool(processes=workers, initializer=_plain_neg_producer_init,
+              initargs=(target_pool, cfg)) as pool:
+        try:
+            for payload in pool.imap_unordered(_plain_neg_producer_job, job_stream):
+                if not isinstance(payload, dict):
+                    continue
+                for cand in payload.get('cands', []):
+                    if not isinstance(cand, dict):
+                        continue
+                    attempts += 1
+                    text_val = cand.get('text', '')
+                    if not text_val:
+                        continue
+                    if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier):
+                        continue
+                    cand = dict(cand)
+                    pair_id = f"NPLAIN-{len(results)+1:07d}"
+                    cand['pair_id'] = pair_id
+                    results.append(cand)
+                    agg_stats['suspect_neg'] += int(cand.get('suspect_neg', 0))
+                    agg_stats['total_neg_checked'] += int(cand.get('total_neg_checked', 0))
+                    if len(results) >= k:
+                        raise StopIteration
+                if len(results) >= k or attempts >= max_attempts:
+                    raise StopIteration
+        except StopIteration:
+            pool.terminate()
+        finally:
+            pool.join()
+
+    return results, agg_stats
+
+def _compose_topic_shift_negatives_serial(target_pool, k: int, seed: int, deduper: Deduper,
                                   mask_format_features_rate: float = 0.0,
                                   mask_on: str = "both",
                                   dedupe_preserve_carrier: bool = False,
@@ -6205,6 +6617,83 @@ def mask_leaky_keywords(s: str) -> str:
     for w in LEAKY_KEYWORDS:
         out = re.sub(re.escape(w), "[MASK]", out, flags=re.IGNORECASE)
     return out
+
+
+def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Deduper,
+                                  mask_format_features_rate: float = 0.0,
+                                  mask_on: str = "both",
+                                  dedupe_preserve_carrier: bool = False,
+                                  disc_rate: float | None = None,
+                                  workers: int = 0,
+                                  producer_batch: int = 128) -> list[dict]:
+    workers = int(workers or 0)
+    if workers <= 1:
+        return _compose_topic_shift_negatives_serial(
+            target_pool, k, seed, deduper,
+            mask_format_features_rate=mask_format_features_rate,
+            mask_on=mask_on,
+            dedupe_preserve_carrier=dedupe_preserve_carrier,
+            disc_rate=disc_rate,
+        )
+
+    workers = max(1, workers if workers > 0 else ((cpu_count() or 2) - 1))
+    producer_batch = max(1, int(producer_batch or 64))
+    disc_rate_eff = _effective_disc_rate(disc_rate)
+
+    index_attr = getattr(deduper, 'index', None)
+    deduper_params = {
+        'sim_bits': getattr(deduper, 'sim_bits', 64),
+        'sim_thresh': getattr(deduper, 'sim_thresh', 2),
+        'k': getattr(deduper, 'k', 5),
+        'n_hash': getattr(index_attr, 'n_hash', 64) if index_attr else 64,
+        'bands': getattr(index_attr, 'bands', 16) if index_attr else 16,
+        'jaccard_thresh': getattr(deduper, 'jaccard_thresh', 0.90),
+        'vec_dim': getattr(deduper, 'vec_dim', 1024),
+        'cosine_thresh': getattr(deduper, 'cosine_thresh', 0.92),
+        'max_vecs': getattr(deduper, 'max_vecs', 20000),
+    }
+
+    cfg = {
+        'mask_format_features_rate': mask_format_features_rate,
+        'mask_on': mask_on,
+        'dedupe_preserve_carrier': dedupe_preserve_carrier,
+        'disc_rate': disc_rate_eff,
+        'deduper_params': deduper_params,
+    }
+
+    job_stream = ((seed + (idx * producer_batch * 7121), producer_batch) for idx in itertools.count())
+    results: List[Dict[str, Any]] = []
+    attempts = 0
+    max_attempts = max(k * max(1, producer_batch) * 10, producer_batch * workers * 8)
+
+    with Pool(processes=workers, initializer=_topic_neg_producer_init,
+              initargs=(target_pool, cfg)) as pool:
+        try:
+            for payload in pool.imap_unordered(_topic_neg_producer_job, job_stream):
+                if not isinstance(payload, dict):
+                    continue
+                for cand in payload.get('cands', []):
+                    if not isinstance(cand, dict):
+                        continue
+                    attempts += 1
+                    text_val = cand.get('text', '')
+                    if not text_val:
+                        continue
+                    if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier):
+                        continue
+                    cand = dict(cand)
+                    results.append(cand)
+                    if len(results) >= k:
+                        raise StopIteration
+                if len(results) >= k or attempts >= max_attempts:
+                    raise StopIteration
+        except StopIteration:
+            pool.terminate()
+        finally:
+            pool.join()
+
+    return results
+
 
 def strip_common_boilerplate(text: str) -> str:
     """Remove common disclaimers/wrappers that could leak label info; apply symmetrically.
@@ -6531,6 +7020,9 @@ def main():
     ap.add_argument("--targets_json", default=None, help="Load targets from local JSON/JSONL with {task,prompt} to avoid external deps. // 离线目标池")
     ap.add_argument("--hf_revision", default=None,
     help="Pin a global HF revision/commit for all datasets when possible. // 为所有数据集统一指定 revision/commit")
+    ap.add_argument("--target_workers", type=int, default=0, help="Concurrent loaders for build_target_pool (0=serial). // 目标池加载并发进程数(0=串行)")
+    ap.add_argument("--target_streaming", action="store_true", default=False, help="Enable datasets streaming when constructing target pool. // 构建目标池时启用 streaming")
+    ap.add_argument("--hf_cache_dir", default=None, help="Optional cache directory for datasets.load_dataset. // datasets 缓存目录")
     ap.add_argument("--family_max_frac", type=float, default=0.06, help="Max fraction per family. // 每家族占比上限")
     ap.add_argument("--oversample_mult", type=int, default=6, help="Candidate oversampling multiplier. // 候选过采样倍数")
     ap.add_argument("--mp_workers", type=int, default=0, help="Multiprocessing workers for candidate rendering (0=auto, 1=serial). // 候选渲染进程数（0 自动，1 串行）")
@@ -6800,7 +7292,13 @@ def main():
     if args.targets_json:
         target_pool = load_targets_offline(args.targets_json)
     else:
-        target_pool = build_target_pool(seed=args.seed, hf_rev=args.hf_revision)
+        target_pool = build_target_pool(
+            seed=args.seed,
+            hf_rev=args.hf_revision,
+            workers=args.target_workers,
+            streaming=args.target_streaming,
+            cache_dir=args.hf_cache_dir
+        )
     print("[target_pool]", len(target_pool))
     # Deduper instances // 去重器
     deduper_pos = Deduper(sim_bits=args.simhash_bits, sim_thresh=args.simhash_thresh,
@@ -6981,7 +7479,7 @@ def main():
     paired_quota = int(round(neg_n * 0.40))
     shift_quota  = int(round(neg_n * 0.15))
     other_quota  = max(0, neg_n - plain_quota - paired_quota - shift_quota)
-    plain_negs = compose_plain_negatives(
+    plain_negs, _plain_neg_meta = compose_plain_negatives(
         target_pool, plain_quota, args.seed+7, deduper=deduper_neg,
         disc_rate=args.disc_rate,
         carrier_mix_prob=args.carrier_mix_prob,
@@ -6990,7 +7488,9 @@ def main():
         mask_format_features_rate=args.mask_format_features_rate,
         mask_on=args.mask_on,
         dedupe_preserve_carrier=args.dedupe_preserve_carrier,
-        strict_neg_diag_gate=(args.balance_mode=="strict" or args.effect_gate_for in {"devtest","all"})
+        strict_neg_diag_gate=(args.balance_mode=="strict" or args.effect_gate_for in {"devtest","all"}),
+        workers=args.mp_workers,
+        producer_batch=args.mp_batch
     )
     shift_negs = compose_topic_shift_negatives(
         target_pool, shift_quota, args.seed+13, deduper=deduper_neg,
@@ -6998,6 +7498,8 @@ def main():
         mask_on=args.mask_on,
         dedupe_preserve_carrier=args.dedupe_preserve_carrier,
         disc_rate=args.disc_rate,
+        workers=args.mp_workers,
+        producer_batch=args.mp_batch
     ) if shift_quota>0 else []
     neg_cands = compose_hard_negs(
         target_pool, other_quota, seed=args.seed,
@@ -7012,7 +7514,9 @@ def main():
         dedupe_preserve_carrier=args.dedupe_preserve_carrier,
         use_end_nonce=args.invariance_end_nonce,
         use_model_eval=args.use_model_eval,
-        strict_neg_diag_gate=(args.balance_mode=="strict" or args.effect_gate_for in {"devtest","all"})
+        strict_neg_diag_gate=(args.balance_mode=="strict" or args.effect_gate_for in {"devtest","all"}),
+        workers=args.mp_workers,
+        producer_batch=args.mp_batch
     ) if other_quota>0 else []
     # Real-world negatives (optional)
     if args.neg_real_sources and args.neg_real_ratio > 1e-9:
@@ -7812,6 +8316,8 @@ def main():
         if aug:
             rows.extend(aug)
             print(f"[mirror] added placeholderless mirrors: {len(aug)} (p={args.mirror_placeholderless})")
+    total_neg_checked_all = sum(int(r.get('total_neg_checked', 0)) for r in rows if r.get('label') == 0)
+    suspect_neg_all = sum(int(r.get('suspect_neg', 0)) for r in rows if r.get('label') == 0)
     rep['neg_suspect_report'] = {
     'checked': int(total_neg_checked_all),
     'suspect': int(suspect_neg_all),
