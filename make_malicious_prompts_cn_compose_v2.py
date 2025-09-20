@@ -71,6 +71,14 @@ except Exception:
     def _h64(g: str) -> int:
         return int.from_bytes(hashlib.blake2b(g.encode("utf-8"), digest_size=8).digest(), "big")
 from math import sqrt
+try:
+    from dsl_core import _simhash_weighted_fast as _dc_simhash_weighted_fast
+except Exception:
+    _dc_simhash_weighted_fast = None
+try:
+    from dsl_core import _sketch_5gram_fast as _dc_sketch_5gram_fast
+except Exception:
+    _dc_sketch_5gram_fast = None
 # 这些不变量探针仅用于诊断/审计；在缺失 dsl_core 时不应导致导入失败
 try:
     from dsl_core import invariant_reward_channel, invariant_reward_field, invariant_path
@@ -1068,6 +1076,13 @@ def _simhash_fallback(tokens: List[str], bits: int = 64) -> int:
 def _simhash(s: str, bits: int = 64) -> int:
     norm = normalize(s)
     txt = re.sub(r"\s+", " ", norm or "").lower()
+    if not txt:
+        return 0
+    if bits == 64 and _dc_simhash_weighted_fast is not None:
+        try:
+            return int(_dc_simhash_weighted_fast(txt))
+        except Exception:
+            pass
     toks = [c for c in txt if not c.isspace()] + [txt[i:i+2] for i in range(len(txt) - 1)]
     if not toks:
         toks = [txt]
@@ -1086,6 +1101,53 @@ def _hamm(a: int, b: int) -> int:
         except Exception:
             pass
     return (int(a) ^ int(b)).bit_count()
+
+
+class _BKHammingNode:
+    __slots__ = ("value", "children")
+
+    def __init__(self, value: int):
+        self.value = value
+        self.children: Dict[int, '_BKHammingNode'] = {}
+
+
+class _HammingBKTree:
+    __slots__ = ("_root", "_dist")
+
+    def __init__(self, dist_fn):
+        self._root: _BKHammingNode | None = None
+        self._dist = dist_fn
+
+    def add(self, value: int) -> None:
+        if self._root is None:
+            self._root = _BKHammingNode(value)
+            return
+        node = self._root
+        while True:
+            d = self._dist(value, node.value)
+            child = node.children.get(d)
+            if child is None:
+                node.children[d] = _BKHammingNode(value)
+                return
+            node = child
+
+    def search(self, value: int, tol: int) -> bool:
+        root = self._root
+        if root is None:
+            return False
+        stack = [root]
+        dist_fn = self._dist
+        while stack:
+            node = stack.pop()
+            d = dist_fn(value, node.value)
+            if d <= tol:
+                return True
+            lo = d - tol
+            hi = d + tol
+            for child_dist, child in node.children.items():
+                if lo <= child_dist <= hi:
+                    stack.append(child)
+        return False
 
 def _char_shingles(s: str, k: int = 5) -> Set[str]:
     """Character k-shingles. // 字符 k-shingles。"""
@@ -1266,8 +1328,16 @@ class Deduper:
         self.sim_thresh = sim_thresh
         self.sim_sigs: List[int] = []
         self.k = k
-        self.index = LSHMinhashIndex(n_hash=n_hash, bands=bands, threshold=jaccard_thresh)
+        eff_n_hash = n_hash if _DSMinHash is not None else min(n_hash, 32)
+        eff_bands = bands or eff_n_hash
+        if eff_bands <= 0:
+            eff_bands = 1
+        if eff_n_hash % eff_bands != 0:
+            eff_bands = math.gcd(eff_n_hash, eff_bands) or 1
+        self.index = LSHMinhashIndex(n_hash=eff_n_hash, bands=eff_bands, threshold=jaccard_thresh)
         self.jaccard_thresh = jaccard_thresh
+        self.n_hash = eff_n_hash
+        self.bands = eff_bands
         # --- new: vector index ---
         self.vec_dim = int(vec_dim)
         self.cosine_thresh = float(cosine_thresh)
@@ -1285,6 +1355,7 @@ class Deduper:
                 self._faiss_dense = faiss.IndexFlatIP(self.vec_dim)
             except Exception:
                 self._faiss_dense = None
+        self._bk_tree = None if self._faiss_sim is not None else _HammingBKTree(_hamm)
         # --- optional external sentence embedding view (class-shared) ---
         if not hasattr(Deduper, "_ext_embed_fn"):
             Deduper._ext_embed_fn = None
@@ -1360,9 +1431,12 @@ class Deduper:
                 if int(dist) <= self.sim_thresh:
                     return False
         else:
-            for old in self.sim_sigs:
-                if _hamm(sig, old) <= self.sim_thresh:
-                    return False
+            if self._bk_tree is not None and self._bk_tree.search(sig, self.sim_thresh):
+                return False
+            if self._bk_tree is None:
+                for old in self.sim_sigs:
+                    if _hamm(sig, old) <= self.sim_thresh:
+                        return False
         # LSH MinHash screen
         shingles = _char_shingles(text, self.k)
         mh = _minhash(shingles, n_hash=self.index.n_hash)
@@ -1384,6 +1458,8 @@ class Deduper:
                 pass
         # Accept & insert
         self.sim_sigs.append(sig)
+        if self._bk_tree is not None:
+            self._bk_tree.add(sig)
         self.index.add(mh, shingles)
         if len(self._vecs) >= self.max_vecs:
             self._vecs.pop(0)
@@ -1483,15 +1559,20 @@ from math import sqrt
 from collections import defaultdict as _dd
 import hashlib as _hashlib
 
-def _sketch_5gram(text: str, buckets: int = 1<<20) -> dict[int, float]:
+def _sketch_5gram(text: str, buckets: int = 1 << 16) -> dict[int, float]:
+    if _dc_sketch_5gram_fast is not None:
+        try:
+            return _dc_sketch_5gram_fast(text, buckets=buckets)
+        except Exception:
+            pass
     s = re.sub(r"\s+", " ", (text or "").lower())
     v = _dd(float)
-    for i in range(max(0, len(s)-4)):
+    mask = buckets - 1
+    for i in range(max(0, len(s) - 4)):
         g = s[i:i+5]
-        h = int(_hashlib.blake2b(g.encode("utf-8"), digest_size=8).hexdigest(), 16) & (buckets-1)
+        h = int(_hashlib.blake2b(g.encode("utf-8"), digest_size=8).hexdigest(), 16) & mask
         v[h] += 1.0
-    # L2 normalize
-    norm = sqrt(sum(x*x for x in v.values())) or 1.0
+    norm = sqrt(sum(x * x for x in v.values())) or 1.0
     for k in list(v.keys()):
         v[k] /= norm
     return v
@@ -6693,7 +6774,6 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
             pool.join()
 
     return results
-
 
 def strip_common_boilerplate(text: str) -> str:
     """Remove common disclaimers/wrappers that could leak label info; apply symmetrically.
