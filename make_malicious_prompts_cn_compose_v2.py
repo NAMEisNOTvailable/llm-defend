@@ -1488,7 +1488,8 @@ def inject_noise_light(s: str) -> str:
     """Light stylistic jitter. // 轻度风格扰动。"""
     if random.random() < 0.20: s = s.replace("：", ":").replace("，", ",")
     if random.random() < 0.18: s = s.replace("请", "麻烦").replace("判断", "帮看看")
-    if random.random() < 0.18: s = re.sub(r"\s+", " ", s)
+    if random.random() < 0.18: s = " ".join(s.split())
+
     return s
 def inject_unicode_noise(s: str, p: float = 0.10) -> str:
     """Unicode adversarial jitter. // Unicode 级对抗扰动。"""
@@ -1599,19 +1600,21 @@ ANCHOR_SURFACE_TOKENS = [
     "仅","只","统一","固定","限定","设为","填入","写入","结尾","末尾","最后一行",
     "字段","结果","答案","结论","回复","输出"
 ] + sum(SYNONYM_BANK.values(), [])
+ANCHOR_SURFACE_PATTERN = re.compile("|".join(sorted((re.escape(t) for t in set(ANCHOR_SURFACE_TOKENS)), key=len, reverse=True)), re.IGNORECASE) if ANCHOR_SURFACE_TOKENS else None
 def canonicalize_surface_anchors(s: str) -> str:
     """Remove obvious surface anchor words AND strip structural anchor tokens (TOOL_CALL/APPEND/UPSTREAM/PATH/etc.)."""
-    # 先去除结构型锚点（不改变自然语言语义）
     s0 = placeholderless_mirror(s)
     def _neutralize(chunk: str) -> str:
-        s2 = chunk
-        for w in set(ANCHOR_SURFACE_TOKENS):
-            s2 = re.sub(re.escape(w), " ", s2, flags=re.IGNORECASE)
-        for _, v in PINYIN_MAP.items():
-            s2 = re.sub(re.escape(v), " ", s2, flags=re.IGNORECASE)
-        for _, v in ENG_MAP.items():
-            s2 = re.sub(re.escape(v), " ", s2, flags=re.IGNORECASE)
-        return re.sub(r"\s+", " ", s2)
+        if not chunk:
+            return chunk
+        s2 = ANCHOR_SURFACE_PATTERN.sub(" ", chunk) if ANCHOR_SURFACE_PATTERN else chunk
+        for v in PINYIN_MAP.values():
+            if v:
+                s2 = s2.replace(v, " ")
+        for v in ENG_MAP.values():
+            if v:
+                s2 = s2.replace(v, " ")
+        return " ".join(s2.split())
     out, last = [], 0
     for m in CODE_BLOCK_RE.finditer(s0):
         out.append(_neutralize(s0[last:m.start()]))
@@ -6417,16 +6420,16 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
             txt = f"{ensure_cn_prompt(t['prompt'])}\n{random_sep()}{body}"
         # —— 统一字段别名中文化（与正类同一时机/同一概率/同一RNG）——
         try:
-            alias_p_cn = ALIAS_P_CN if "ALIAS_P_CN" in globals() else CJK_ALIAS_P
+            alias_p_cn = float(ALIAS_P_CN if "ALIAS_P_CN" in globals() else CJK_ALIAS_P)
+        except Exception:
+            alias_p_cn = CJK_ALIAS_P
+        try:
             txt = randomize_field_aliases(txt, p_cn=alias_p_cn, rng=rng)
         except Exception:
-            pass
-        # 再做规范化/轻噪声
-        try:
-            alias_p_cn = ALIAS_P_CN if "ALIAS_P_CN" in globals() else 0.70
-            txt = randomize_field_aliases(txt, p_cn=alias_p_cn)  # 此版本不传 rng
-        except Exception:
-            pass
+            try:
+                txt = randomize_field_aliases(txt, p_cn=alias_p_cn)
+            except Exception:
+                pass
         txt = normalize(inject_unicode_noise(txt, p=0.03))
         pair_id = f"NPLAIN-{len(out)+1:07d}"
         rng_pair = random.Random(cheap_fingerprint(pair_id) + str(seed))
