@@ -57,6 +57,10 @@ except Exception:
     except Exception:
         faiss = None
 try:
+    from annoy import AnnoyIndex as _AnnoyIndex
+except Exception:
+    _AnnoyIndex = None
+try:
     from dsl_core import generate_batch, compile_from_yaml, invariant_result_slot
 except Exception:
     generate_batch = None
@@ -1180,7 +1184,17 @@ def _simhash_to_bytes(sig: int, bits: int) -> np.ndarray:
 
 
 def _dense_to_np(vec: List[float]) -> np.ndarray:
-    return np.asarray(vec, dtype='float32').reshape(1, -1)
+    arr = np.asarray(vec, dtype='float32').reshape(1, -1)
+    norm = float(np.linalg.norm(arr) or 0.0)
+    if faiss is not None:
+        try:
+            faiss.normalize_L2(arr)
+            return arr
+        except Exception:
+            pass
+    if norm > 0.0:
+        arr /= norm
+    return arr
 
 def tool_poison_variants(payload: str, secret: str) -> str:
     k_ans = random.choice(ANSWER_KEYS)
@@ -1342,6 +1356,14 @@ class Deduper:
         self.n_hash = eff_n_hash
         self.bands = eff_bands
         # --- new: vector index ---
+        self._annoy = None
+        self._annoy_ids = 0
+        self._annoy_built = False
+        if '_AnnoyIndex' in globals() and _AnnoyIndex is not None and self.vec_dim > 0:
+            try:
+                self._annoy = _AnnoyIndex(self.vec_dim, 'angular')
+            except Exception:
+                self._annoy = None
         self.vec_dim = int(vec_dim)
         self.cosine_thresh = float(cosine_thresh)
         self.max_vecs = int(max_vecs)
@@ -1397,6 +1419,22 @@ class Deduper:
             for score in D[0]:
                 if score >= self.cosine_thresh:
                     return True
+        if self._annoy is not None and self._annoy_ids > 0:
+            if not self._annoy_built and self._annoy_ids >= 32:
+                try:
+                    self._annoy.build(16)
+                    self._annoy_built = True
+                except Exception:
+                    self._annoy_built = False
+            if self._annoy_built:
+                try:
+                    idxs, dists = self._annoy.get_nns_by_vector(v, min(32, self._annoy_ids), include_distances=True)
+                except Exception:
+                    idxs, dists = (), ()
+                for dist in dists:
+                    cos = 1.0 - (dist * dist) / 2.0
+                    if cos >= self.cosine_thresh:
+                        return True
         for u in self._vecs:
             s = 0.0
             for i in range(self.vec_dim):
@@ -1477,6 +1515,13 @@ class Deduper:
         if self._faiss_dense is not None:
             try:
                 self._faiss_dense.add(_dense_to_np(v))
+            except Exception:
+                pass
+        if self._annoy is not None:
+            try:
+                self._annoy.add_item(self._annoy_ids, v)
+                self._annoy_ids += 1
+                self._annoy_built = False
             except Exception:
                 pass
         return True
