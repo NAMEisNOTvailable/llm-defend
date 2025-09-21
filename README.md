@@ -81,9 +81,9 @@ For an output path like data.jsonl, the pipeline writes:
 
 ## Data pipeline (high level)
 
-1. Build target pool (benign task prompts) from HF datasets or local JSON, optionally streaming and revision‑pinned; configurable workers/cache.
+1. Build target pool (benign task prompts) from HF datasets or local JSON, optionally revision-pinned; configurable workers/cache.
 
-- CLI knobs: --targets_json, --hf_revision, --target_streaming, --target_workers, --hf_cache_dir.
+- CLI knobs: --targets_json, --hf_revision, --target_workers, --hf_cache_dir.
 
 2. Compose positives
 
@@ -206,7 +206,7 @@ Run -h for the full list. Important groups:
 
 # Targets
 
---targets_json, --hf_revision, --target_streaming, --target_workers, --hf_cache_dir.
+--targets_json, --hf_revision, --target_workers, --hf_cache_dir.
 
 # De‑dup (global)
 
@@ -412,7 +412,7 @@ data_stats.json —— 事后“语义近邻审计”（字符 3-5 元 TF-IDF �
 数据流水线（高级概览）
 
 构建目标池（良性任务提示）：来自 HF 数据集或本地 JSON；可选流式与版本固定；可配置并发/缓存。
-CLI 选项：--targets_json、--hf_revision、--target_streaming、--target_workers、--hf_cache_dir。
+CLI 选项：--targets_json、--hf_revision、--target_workers、--hf_cache_dir。
 
 生成正样本
 
@@ -527,7 +527,7 @@ CJK / 语言
 
 目标池
 
---targets_json, --hf_revision, --target_streaming, --target_workers, --hf_cache_dir。
+--targets_json, --hf_revision, --target_workers, --hf_cache_dir。
 
 全局去重
 

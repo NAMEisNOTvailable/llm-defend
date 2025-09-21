@@ -38,6 +38,7 @@ import regex as _re
 from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Optional, Tuple
 import subprocess, shlex, time
+import os
 import numpy as np, platform, datasets as hf_datasets
 from enum import Enum, auto
 from multiprocessing import Pool, cpu_count
@@ -1413,14 +1414,12 @@ EXTRA_CONTAINERS = [
 ]
 
 # ------------------ Target task pool // 任务上下文池 ------------------
-def try_load(name: str, kwargs: Dict[str, Any], hf_rev: Optional[str]=None, streaming: bool = False, cache_dir: Optional[str] = None) -> Optional[DatasetDict]:
+def try_load(name: str, kwargs: Dict[str, Any], hf_rev: Optional[str]=None, cache_dir: Optional[str] = None) -> Optional[DatasetDict]:
     if load_dataset is None:
         return None
     key = (name, kwargs.get("name"))
     params = dict(kwargs)
     params.update({"revision": (hf_rev or PIN_REV.get(key, {}).get("revision") or "main")})
-    if streaming:
-        params["streaming"] = True
     if cache_dir:
         params["cache_dir"] = cache_dir
     try:
@@ -1429,15 +1428,26 @@ def try_load(name: str, kwargs: Dict[str, Any], hf_rev: Optional[str]=None, stre
         print(f"[warn] dataset skip {name} {kwargs}: {e}", file=sys.stderr)
         return None
     
-def _load_many_datasets(specs: List[Tuple[str, Dict[str, Any]]], hf_rev: Optional[str], streaming: bool, cache_dir: Optional[str], workers: int) -> List[Tuple[Tuple[str, Dict[str, Any]], Optional[DatasetDict]]]:
+def _auto_io_workers() -> int:
+    """Pick a good default for IO-bound dataset loading."""
+    cpu = max(2, (cpu_count() or 2))
+    base = 2 * cpu
+    cap = int(os.getenv('TARGET_WORKERS_CAP', '16'))
+    auto = max(2, min(base, cap))
+    if os.getenv('HF_DATASETS_OFFLINE', '0') == '1':
+        auto = min(auto, 4)
+    return auto
+
+
+def _load_many_datasets(specs: List[Tuple[str, Dict[str, Any]]], hf_rev: Optional[str], cache_dir: Optional[str], workers: int) -> List[Tuple[Tuple[str, Dict[str, Any]], Optional[DatasetDict]]]:
     results: Dict[Tuple[str, Tuple[Tuple[str, Any], ...]], Optional[DatasetDict]] = {}
     workers = int(workers or 0)
     if workers <= 1:
         for name, kw in specs:
-            results[(name, tuple(sorted(kw.items())))] = try_load(name, kw, hf_rev=hf_rev, streaming=streaming, cache_dir=cache_dir)
+            results[(name, tuple(sorted(kw.items())))] = try_load(name, kw, hf_rev=hf_rev, cache_dir=cache_dir)
         return [((name, kw), results.get((name, tuple(sorted(kw.items()))))) for name, kw in specs]
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        future_map = {ex.submit(try_load, name, kw, hf_rev, streaming, cache_dir): (name, kw) for name, kw in specs}
+        future_map = {ex.submit(try_load, name, kw, hf_rev, cache_dir): (name, kw) for name, kw in specs}
         for fut in as_completed(future_map):
             name, kw = future_map[fut]
             key = (name, tuple(sorted(kw.items())))
@@ -1640,12 +1650,17 @@ def _yield_text_fields(row: Dict[str, Any]) -> Iterable[str]:
         if isinstance(v, str) and len(v.strip())>0:
             yield v
 def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]=None,
-                      workers: int = 0, streaming: bool = False, cache_dir: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Random benign tasks from diverse CN corpora. Supports optional concurrent loading and streaming.
-    // 从多中文语料随机构建良性任务池，可选择并行加载与 streaming。"""
+                      workers: int = -1, cache_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Random benign tasks from diverse CN corpora. Supports optional concurrent loading.
+    // 从多中文语料随机构建良性任务池，可选择并行加载。"""
     random.seed(seed)
     pool: List[Dict[str, Any]] = []
-    loader_workers = int(workers or 0)
+    try:
+        loader_workers = int(workers if workers is not None else -1)
+    except Exception:
+        loader_workers = -1
+    if loader_workers < 0:
+        loader_workers = _auto_io_workers()
 
     def _iter_dataset(ds, tag: str):
         if ds is None:
@@ -1662,11 +1677,11 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
 
     # --- Classic CLUE style tasks // 经典 CLUE 任务 ---
     classic_specs = [("C-MTEB/LCQMC", {}), ("C-MTEB/AFQMC", {})]
-    for (name, kw), ds in _load_many_datasets(classic_specs, hf_rev, streaming, cache_dir, loader_workers):
+    for (name, kw), ds in _load_many_datasets(classic_specs, hf_rev, cache_dir, loader_workers):
         if ds is None and name == "C-MTEB/LCQMC":
-            ds = try_load("mteb/LCQMC", {}, hf_rev=hf_rev, streaming=streaming, cache_dir=cache_dir)
+            ds = try_load("mteb/LCQMC", {}, hf_rev=hf_rev, cache_dir=cache_dir)
         if ds is None and name == "C-MTEB/AFQMC":
-            ds = try_load("clue", {"name": "afqmc"}, hf_rev=hf_rev, streaming=streaming, cache_dir=cache_dir)
+            ds = try_load("clue", {"name": "afqmc"}, hf_rev=hf_rev, cache_dir=cache_dir)
         if not ds:
             continue
         for r, _ in _iter_dataset(ds, f"classic-{name}"):
@@ -1679,7 +1694,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
                 continue
             pool.append({"task":"similarity","prompt":f"判断两句话是否表达同一含义，仅答“是/否”。\n句子A：{a}\n句子B：{b}"})
     for sub in ["ocnli","cmnli"]:
-        ds = try_load("clue", {"name": sub}, hf_rev=hf_rev, streaming=streaming, cache_dir=cache_dir)
+        ds = try_load("clue", {"name": sub}, hf_rev=hf_rev, cache_dir=cache_dir)
         if not ds:
             continue
         for r, _ in _iter_dataset(ds, f"nli-{sub}"):
@@ -1693,7 +1708,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
             pool.append({"task":"nli","prompt":f"判定前提与假设的关系：只答“蕴含/矛盾/中立”。\n前提：{p}\n假设：{h}"})
     # Sentiment (ChnSentiCorp): avoid script loaders; prefer parquet mirrors
     sentiment_specs = [("lansinuote/ChnSentiCorp", {})]
-    for (name, kw), ds in _load_many_datasets(sentiment_specs, hf_rev, streaming, cache_dir, loader_workers):
+    for (name, kw), ds in _load_many_datasets(sentiment_specs, hf_rev, cache_dir, loader_workers):
         if not ds:
             continue
         for r, _ in _iter_dataset(ds, f"sentiment-{name}"):
@@ -1706,7 +1721,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
             pool.append({"task":"sentiment","prompt":f"判断情感倾向，仅答“正/负”。\n{x}"})
     # LCSTS summarization
     lcsts_specs = [("hugcyp/LCSTS", {}), ("suolyer/lcsts", {})]
-    for (name, kw), ds in _load_many_datasets(lcsts_specs, hf_rev, streaming, cache_dir, loader_workers):
+    for (name, kw), ds in _load_many_datasets(lcsts_specs, hf_rev, cache_dir, loader_workers):
         if not ds:
             continue
         for r, _ in _iter_dataset(ds, f"lcsts-{name}"):
@@ -1719,7 +1734,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
             pool.append({"task":"summarization","prompt":f"请概括下文，生成≤30字摘要：\n{x}"})
     # --- Expanded domains // 扩展域 ---
     wiki_specs = [("wikimedia/wikipedia", {"name":"20231101.zh"}), ("shaowenchen/wiki_zh", {})]
-    for (name, kw), ds in _load_many_datasets(wiki_specs, hf_rev, streaming, cache_dir, loader_workers):
+    for (name, kw), ds in _load_many_datasets(wiki_specs, hf_rev, cache_dir, loader_workers):
         if not ds:
             continue
         for r, split in _iter_dataset(ds, f"wiki-{name}"):
@@ -1733,7 +1748,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
             pool.append({"task":"wiki_ents","prompt":f"从片段中抽取专有名词并以逗号分隔：\n{x}"})
     # Chinese tech/news/forum style corpora
     news_specs = [("SirlyDreamer/THUCNews", {})]
-    for (name, kw), ds in _load_many_datasets(news_specs, hf_rev=None, streaming=streaming, cache_dir=cache_dir, workers=loader_workers):
+    for (name, kw), ds in _load_many_datasets(news_specs, hf_rev=None, cache_dir=cache_dir, workers=loader_workers):
         if not ds:
             continue
         for r, _ in _iter_dataset(ds, f"news-{name}"):
@@ -6869,8 +6884,7 @@ def main():
     ap.add_argument("--targets_json", default=None, help="Load targets from local JSON/JSONL with {task,prompt} to avoid external deps. // 离线目标池")
     ap.add_argument("--hf_revision", default=None,
     help="Pin a global HF revision/commit for all datasets when possible. // 为所有数据集统一指定 revision/commit")
-    ap.add_argument("--target_workers", type=int, default=0, help="Concurrent loaders for build_target_pool (0=serial). // 目标池加载并发进程数(0=串行)")
-    ap.add_argument("--target_streaming", action="store_true", default=False, help="Enable datasets streaming when constructing target pool. // 构建目标池时启用 streaming")
+    ap.add_argument("--target_workers", type=int, default=-1, help="Concurrent loaders for build_target_pool (-1=auto, 0=serial). // 目标池加载并发进程数(-1=自动,0=串行)")
     ap.add_argument("--hf_cache_dir", default=None, help="Optional cache directory for datasets.load_dataset. // datasets 缓存目录")
     ap.add_argument("--family_max_frac", type=float, default=0.06, help="Max fraction per family. // 每家族占比上限")
     ap.add_argument("--oversample_mult", type=int, default=4, help="Candidate oversampling multiplier (default=4, tune 3-4). // 候选过采样倍数")
@@ -6889,7 +6903,7 @@ def main():
     ap.add_argument("--sem_weight", type=float, default=0.55, help="Weight for CN semantic attack families // 中文语义攻击家族权重")
     ap.add_argument("--base_weight", type=float, default=0.40, help="Weight for base euphemistic families // 基础委婉家族权重")
     ap.add_argument("--artifact_weight", type=float, default=0.03, help="Weight for explicit artifact families // 显词家族权重")
-    ap.add_argument("--disc_rate", type=float, default=0.20,
+    ap.add_argument("--disc_rate", type=float, default=0.15,
         help="Probability to add disclaimers to BOTH classes. // 正负类等概率加免责声明的概率")
     ap.add_argument("--art_match_rate", type=float, default=0.50,
         help="Match explicit artifact terms across classes. // 正负类显词对齐的概率")
@@ -7148,7 +7162,6 @@ def main():
             seed=args.seed,
             hf_rev=args.hf_revision,
             workers=args.target_workers,
-            streaming=args.target_streaming,
             cache_dir=args.hf_cache_dir
         )
     print("[target_pool]", len(target_pool))
