@@ -754,8 +754,10 @@ def _tune_pool_parameters(workers: int, producer_batch: int) -> Tuple[int, int, 
     else:
         workers = max(1, min(workers, cpu_total * 2))
     try:
-        producer_batch = int(producer_batch or 256)
+        producer_batch = int(producer_batch)
     except Exception:
+        producer_batch = 0
+    if producer_batch <= 0:
         producer_batch = 256
     producer_batch = max(32, min(512, producer_batch))
     # Cooperate with the pool by letting each worker chew through a bigger slice when memory allows.
@@ -4520,14 +4522,15 @@ def _hard_neg_producer_job(job: tuple[int, int]) -> dict:
     )
     worker_cap = cfg.get('worker_family_cap')
     if worker_cap is None:
-        worker_cap = int(batch) * max(1, int(cfg.get('oversample_mult', 1)))
+        eff_mult, _ = _resolve_oversample_multiplier(batch, cfg.get('oversample_mult', 1))
+        worker_cap = int(math.ceil(int(batch) * max(1.0, eff_mult)))
     cands = _compose_hard_negs_serial(
         target_pool=targets,
         k=int(batch),
         seed=int(seed),
         min_cjk_share=float(cfg.get('min_cjk_share', 0.60)),
         min_cjk_share_auto=bool(cfg.get('min_cjk_share_auto', False)),
-        oversample_mult=int(cfg.get('oversample_mult', 1)),
+        oversample_mult=cfg.get('oversample_mult', 1),
         deduper=local_deduper,
         family_cap=int(worker_cap),
         disc_rate=cfg.get('disc_rate'),
@@ -4642,6 +4645,33 @@ def _topic_neg_producer_job(job: tuple[int, int]) -> dict:
         disc_rate=cfg.get('disc_rate'),
     )
     return {"cands": cands}
+
+
+def _oversample_auto_multiplier(target: int) -> float:
+    """Lightweight heuristic for auto oversampling based on target size."""
+    t = max(1, int(target))
+    if t <= 400:
+        return 4.0
+    if t <= 1200:
+        return 3.4
+    if t <= 3200:
+        return 3.0
+    if t <= 6400:
+        return 2.6
+    if t <= 12000:
+        return 2.3
+    return 2.1
+
+
+def _resolve_oversample_multiplier(target: int, oversample_mult: int | float) -> tuple[float, bool]:
+    """Return effective multiplier and whether auto mode is enabled."""
+    try:
+        raw = float(oversample_mult)
+    except Exception:
+        raw = 0.0
+    auto = raw <= 0.0
+    base = _oversample_auto_multiplier(target) if auto else max(1.0, raw)
+    return base, auto
 
 
 class AdaptiveOversample:
@@ -5167,8 +5197,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
     # unify effective knobs with CLI defaults
     disc_rate = _effective_disc_rate(disc_rate)
     artifact_free_pos_ratio = _effective_artifact_free_pos_ratio(artifact_free_pos_ratio)
-    auto_oversample = oversample_mult <= 0
-    base_multiplier = float(oversample_mult if oversample_mult > 0 else 3)
+    base_multiplier, auto_oversample = _resolve_oversample_multiplier(n, oversample_mult)
     oversample_ctl = AdaptiveOversample(target=n, base_multiplier=base_multiplier, auto=auto_oversample)
     wanted = oversample_ctl.current_target()
     cands = []; fam_count = Counter()
@@ -5626,8 +5655,7 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
 
     workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
 
-    auto_oversample = oversample_mult <= 0
-    base_multiplier = float(oversample_mult if oversample_mult > 0 else 3)
+    base_multiplier, auto_oversample = _resolve_oversample_multiplier(n, oversample_mult)
     oversample_ctl = AdaptiveOversample(target=n, base_multiplier=base_multiplier, auto=auto_oversample)
 
     disc_rate_eff = _effective_disc_rate(disc_rate)
@@ -5793,7 +5821,8 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
                       strict_neg_diag_gate: bool = True) -> List[Dict[str,Any]]:
     random.seed(seed + 1337)
     disc_rate = _effective_disc_rate(disc_rate)
-    wanted = k * max(1, oversample_mult)
+    eff_mult, _ = _resolve_oversample_multiplier(k, oversample_mult)
+    wanted = int(math.ceil(k * max(1.0, eff_mult)))
     cands = []
     fam_count = Counter()
     attempts = 0
@@ -5987,7 +6016,8 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
 
     workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
     disc_rate_eff = _effective_disc_rate(disc_rate)
-    wanted = k * max(1, oversample_mult)
+    eff_mult, _ = _resolve_oversample_multiplier(k, oversample_mult)
+    wanted = int(math.ceil(k * max(1.0, eff_mult)))
 
     index_attr = getattr(deduper, 'index', None)
     deduper_params = {
@@ -6017,7 +6047,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
         'use_end_nonce': use_end_nonce,
         'use_model_eval': use_model_eval,
         'strict_neg_diag_gate': strict_neg_diag_gate,
-        'worker_family_cap': max(1, producer_batch * max(1, oversample_mult)),
+        'worker_family_cap': max(1, int(math.ceil(producer_batch * max(1.0, eff_mult)))),
         'deduper_params': deduper_params,
     }
 
@@ -6025,7 +6055,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
     results: List[Dict[str, Any]] = []
     fam_count: Counter[str] = Counter()
     attempts = 0
-    max_attempts = max(wanted * 50, producer_batch * workers * 10)
+    max_attempts = max(wanted * 50, int(producer_batch * workers * 10))
 
     with Pool(processes=workers, initializer=_hard_neg_producer_init,
               initargs=(target_pool, cfg)) as pool:
@@ -7000,9 +7030,11 @@ def main():
     help="Pin a global HF revision/commit for all datasets when possible. // 为所有数据集统一指定 revision/commit")
     ap.add_argument("--target_workers", type=int, default=-1, help="Concurrent loaders for build_target_pool (-1=auto, 0=serial). // 目标池加载并发进程数(-1=自动,0=串行)")
     ap.add_argument("--family_max_frac", type=float, default=0.06, help="Max fraction per family. // 每家族占比上限")
-    ap.add_argument("--oversample_mult", type=int, default=4, help="Candidate oversampling multiplier (default=4, tune 3-4). // 候选过采样倍数")
+    ap.add_argument("--oversample_mult", type=int, default=0,
+        help="Candidate oversampling multiplier (0=auto by target size). // 候选过采样倍数（0 自动按样本数调节）")
     ap.add_argument("--mp_workers", type=int, default=0, help="Multiprocessing workers for candidate rendering (0=auto, 1=serial). // 候选渲染进程数（0 自动，1 串行）")
-    ap.add_argument("--mp_batch", type=int, default=384, help="Candidates rendered per worker batch (default=384, tune 256-512). // 每个进程批量渲染的候选数")
+    ap.add_argument("--mp_batch", type=int, default=384,
+        help="Candidates per worker (0=auto≈256, clamp 32–512). // 每进程候选批量（0 自动≈256，范围 32–512）")
     ap.add_argument("--simhash_bits", type=int, default=64, help="SimHash bits. // SimHash 位数")
     ap.add_argument("--simhash_thresh", type=int, default=1, help="Hamming threshold (lower=faster, default=1). // 汉明阈值")
     ap.add_argument("--shingle_k", type=int, default=5, help="Char shingle length. // 字符 shingle 长度")
