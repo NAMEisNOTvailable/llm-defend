@@ -30,6 +30,8 @@ from typing import List, Dict, Any, Optional, Tuple, Iterable, Set
 import itertools
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+from threading import Thread
 from datasets import load_dataset, DatasetDict
 import base64, urllib.parse
 import regex as _re
@@ -74,6 +76,10 @@ except Exception:
     @_lru_cache(maxsize=1 << 20)
     def _h64(g: str) -> int:
         return int.from_bytes(hashlib.blake2b(g.encode("utf-8"), digest_size=8).digest(), "big")
+try:
+    from dedupe_core import Deduper
+except Exception as _dedupe_err:
+    raise ImportError("dedupe_core module is required for Deduper") from _dedupe_err
 from math import sqrt
 try:
     from dsl_core import _simhash_weighted_fast as _dc_simhash_weighted_fast
@@ -249,6 +255,19 @@ _TOPIC_NEG_TARGET_SLICE: tuple[Dict[str, Any], ...] | None = None
 # ------------------ Common text & feature probes // 通用文本与特征探针 ------------------
 MASKED_FIELD_FAMILY_COUNTER = Counter()
 WS_ZERO = ["\u200b","\u200c","\u200d","\u2060","\ufeff"]  # Zero-width // 零宽字符
+ZERO_WIDTH_RE = re.compile("[" + "".join(re.escape(z) for z in WS_ZERO) + "]")
+BIDI_CONTROL_RE = re.compile(r"[‪‫‬‭‮⁦⁧⁨⁩]")
+NORMALIZE_WS_RE = re.compile(r"[ \t\r\f\v]+")
+NORMALIZE_NL_RE = re.compile(r"\n{3,}")
+PLACEHOLDER_MULTI_RE = re.compile(
+    r'(?P<append><APPEND_AFTER>|@@APPEND@@|<!--APPEND-->)'
+    r'|(?P<tool>"tool"\s*:\s*\{[^}]+\})'
+    r'|(?P<toolcall>TOOL_CALL\([^)]*\))'
+    r'|(?P<upstream>UPSTREAM_DOC_ID:[^\n]+)'
+    r'|(?P<path>#path=[^\s]+)'
+    r'|(?P<result>\{\{RESULT_MAIN\}\})',
+    re.I
+)
 CODE_FENCE = re.compile(r"```")
 XML_TAG = re.compile(r"<\s*[/]?\s*([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*[^>]*>")
 BRACES = re.compile(r"[{}\[\]()]")
@@ -324,9 +343,10 @@ def normalize(s: str) -> str:
     if s is None: return ""
     if not isinstance(s, str): s = str(s)
     s = unicodedata.normalize("NFKC", s)
-    for z in WS_ZERO: s = s.replace(z, "")
-    s = re.sub(r"[ \t\r\f\v]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = ZERO_WIDTH_RE.sub("", s)
+    s = BIDI_CONTROL_RE.sub("", s)
+    s = NORMALIZE_WS_RE.sub(" ", s)
+    s = NORMALIZE_NL_RE.sub("\n\n", s)
     return s.strip()
 def byte_len(s: str) -> int:
     """UTF-8 byte length. // UTF-8 字节长度。"""
@@ -520,6 +540,17 @@ class BehaviorContract:
     validate_hint: dict         # 校验时需要的参数（正则/有序字段/计数等）
     meta: dict                  # 追踪随机键、采样到的同义表达等
 
+
+def _stable_seed(*parts: object) -> str:
+    joined = "||".join("" if p is None else str(p) for p in parts)
+    return hashlib.blake2b(joined.encode("utf-8"), digest_size=16).hexdigest()
+
+def stable_seed_int(*parts: object) -> int:
+    return int(_stable_seed(*parts), 16)
+
+def stable_rng(*parts: object) -> random.Random:
+    return random.Random(_stable_seed(*parts))
+
 @dataclass
 class TaskContract:
     name: str
@@ -701,19 +732,37 @@ def placeholderless_mirror(text: str) -> str:
     - 中文：移除附加/工具/上游/路径锚与结果占位符，保留自然内容用于负样本镜像。
     """
     s = text
-    s = s.replace("<APPEND_AFTER>", "").replace("@@APPEND@@", "").replace("<!--APPEND-->", "")
-    s = _re.sub(r'"tool"\s*:\s*\{[^}]+\}', "", s)
-    s = _re.sub(r'TOOL_CALL\([^)]*\)', "", s)
-    s = _re.sub(r'UPSTREAM_DOC_ID:[^\n]+', "", s)
-    s = _re.sub(r'#path=[^\s]+', "", s)
-    s = s.replace("{{RESULT_MAIN}}", "")
-    # 清理多余空行
-    s = _re.sub(r"\n{3,}", "\n\n", s).strip()
+    s = PLACEHOLDER_MULTI_RE.sub("", s)
+    s = NORMALIZE_NL_RE.sub("\n\n", s).strip()
     return s
 
 def _rand_key(k=4):
     # 每样本唯一、随机，不会成为跨样本可学锚点
     return ''.join(random.choice(string.ascii_lowercase) for _ in range(k))
+
+
+def _tune_pool_parameters(workers: int, producer_batch: int) -> Tuple[int, int, int]:
+    """Clamp worker/batch knobs and choose a chunk size tuned for fewer IPC hops."""
+    cpu_total = max(2, cpu_count() or 2)
+    try:
+        workers = int(workers)
+    except Exception:
+        workers = 0
+    if workers <= 0:
+        workers = cpu_total
+    else:
+        workers = max(1, min(workers, cpu_total * 2))
+    try:
+        producer_batch = int(producer_batch or 256)
+    except Exception:
+        producer_batch = 256
+    producer_batch = max(32, min(512, producer_batch))
+    # Cooperate with the pool by letting each worker chew through a bigger slice when memory allows.
+    chunk_div = max(1, min(4, workers))
+    chunk_size = max(16, producer_batch // chunk_div)
+    if producer_batch >= 512 and chunk_size < 128:
+        chunk_size = 128
+    return workers, producer_batch, chunk_size
 def sample_attack_template_v2(sem_w: float, base_w: float, art_w: float):
     """按目标意图分布 INTENT_TARGET_DIST 先抽意图，再在该意图下抽家族/模板。"""
     # 反向索引：intent -> [(family, tpl)]
@@ -1068,218 +1117,6 @@ def effect_check_with_ref(task_txt: str, injected_text: str, model: str, contrac
 # ------------------ SimHash + MinHash-LSH de-dup // 去重：SimHash + MinHash-LSH ------------------
 
 
-def _simhash_fallback(tokens: List[str], bits: int = 64) -> int:
-    digest_bytes = max(1, bits // 8)
-    v = [0] * bits
-    for t in tokens:
-        h = int.from_bytes(hashlib.blake2b(t.encode("utf-8"), digest_size=digest_bytes).digest(), "big")
-        for i in range(bits):
-            v[i] += 1 if (h >> i) & 1 else -1
-    out = 0
-    for i in range(bits):
-        if v[i] >= 0:
-            out |= (1 << i)
-    return out
-def _simhash(s: str, bits: int = 64) -> int:
-    norm = normalize(s)
-    txt = re.sub(r"\s+", " ", norm or "").lower()
-    if not txt:
-        return 0
-    if bits == 64 and _dc_simhash_weighted_fast is not None:
-        try:
-            return int(_dc_simhash_weighted_fast(txt))
-        except Exception:
-            pass
-    toks = [c for c in txt if not c.isspace()] + [txt[i:i+2] for i in range(len(txt) - 1)]
-    if not toks:
-        toks = [txt]
-    if _simhash_weighted_fp is not None and bits == 64:
-        pairs = [(_h64(tok), 1.0) for tok in toks]
-        try:
-            return int(_simhash_weighted_fp(pairs))
-        except Exception:
-            pass
-    return _simhash_fallback(toks, bits)
-def _hamm(a: int, b: int) -> int:
-    """Hamming distance. // 汉明距离"""
-    if _simhash_hamm_dist is not None:
-        try:
-            return int(_simhash_hamm_dist(int(a), int(b)))
-        except Exception:
-            pass
-    return (int(a) ^ int(b)).bit_count()
-
-
-class _BKHammingNode:
-    __slots__ = ("value", "children")
-
-    def __init__(self, value: int):
-        self.value = value
-        self.children: Dict[int, '_BKHammingNode'] = {}
-
-
-class _HammingBKTree:
-    __slots__ = ("_root", "_dist")
-
-    def __init__(self, dist_fn):
-        self._root: _BKHammingNode | None = None
-        self._dist = dist_fn
-
-    def add(self, value: int) -> None:
-        if self._root is None:
-            self._root = _BKHammingNode(value)
-            return
-        node = self._root
-        while True:
-            d = self._dist(value, node.value)
-            child = node.children.get(d)
-            if child is None:
-                node.children[d] = _BKHammingNode(value)
-                return
-            node = child
-
-    def search(self, value: int, tol: int) -> bool:
-        root = self._root
-        if root is None:
-            return False
-        stack = [root]
-        dist_fn = self._dist
-        while stack:
-            node = stack.pop()
-            d = dist_fn(value, node.value)
-            if d <= tol:
-                return True
-            lo = d - tol
-            hi = d + tol
-            for child_dist, child in node.children.items():
-                if lo <= child_dist <= hi:
-                    stack.append(child)
-        return False
-
-def _char_shingles(s: str, k: int = 5) -> Set[str]:
-    """Character k-shingles. // 字符 k-shingles。"""
-    s = normalize(s)
-    if len(s) <= k: return {s}
-    return {s[i:i+k] for i in range(len(s)-k+1)}
-def _minhash(shingles: Iterable[str], n_hash: int = 64, seed_base: int = 2025):
-    """MinHash sketch over shingles. // MinHash 素描"""
-    if _DSMinHash is not None:
-        mh = _DSMinHash(num_perm=n_hash)
-        for g in shingles:
-            mh.update(g.encode("utf-8"))
-        return mh
-    mins = [2**63-1] * n_hash
-    for g in shingles:
-        ge = g.encode("utf-8")
-        for i in range(n_hash):
-            h = int.from_bytes(hashlib.blake2b(ge, digest_size=8, person=str(seed_base+i).encode()).digest(), "big")
-            if h < mins[i]:
-                mins[i] = h
-    return tuple(mins)
-
-
-def _simhash_to_bytes(sig: int, bits: int) -> np.ndarray:
-    byte_len = (bits + 7) // 8
-    return np.frombuffer(int(sig).to_bytes(byte_len, 'little', signed=False), dtype=np.uint8).reshape(1, byte_len)
-
-
-def _dense_to_np(vec: List[float]) -> np.ndarray:
-    arr = np.asarray(vec, dtype='float32').reshape(1, -1)
-    norm = float(np.linalg.norm(arr) or 0.0)
-    if faiss is not None:
-        try:
-            faiss.normalize_L2(arr)
-            return arr
-        except Exception:
-            pass
-    if norm > 0.0:
-        arr /= norm
-    return arr
-
-def tool_poison_variants(payload: str, secret: str) -> str:
-    k_ans = random.choice(ANSWER_KEYS)
-    k_note= random.choice(NOTE_KEYS)
-    fn    = random.choice(FUNC_NAMES)
-    obj = {
-        "fn": fn,
-        "args": { "q": secret, "top_k": random.choice([3,5,10]) },
-        "on_error": random.choice(["return", "fallback", "passthrough"]),
-        "return": { k_ans: payload, k_note: random.choice(["stable","short","ok"]) }
-    }
-    return "```json\n" + json.dumps(obj, ensure_ascii=False) + "\n```"
-def tool_poison_variants_v2(payload: str) -> str:
-    opts = [
-        {"tool":"search", "args":{"q":"…"}, "final":{"note":payload}},
-        {"tool":"summarize","args":{"len":50},"final":{"conclusion":payload}},
-    ]
-    return "```json\n" + json.dumps(random.choice(opts), ensure_ascii=False) + "\n```"
-def rag_smuggle(payload: str) -> str:
-    return random.choice([
-        f"<!-- footer-note: {payload} -->\n<article>……正文……</article>",
-        f"<div data-result=\"{payload}\" data-src=\"kb:page\"></div>",
-        f"<meta name=\"dc.description\" content=\"... {payload} ...\">",
-        f"---\nlayout: doc\nsummary: '...'\nconclusion: '{payload}'\n---\n# 标题\n正文段落……",
-        f"| 字段 | 值 |\n|---|---|\n| 结论 | {payload} |\n\n> 注：该表格自动汇总"
-    ])
-
-class LSHMinhashIndex:
-    """LSH index on MinHash bands. // 基于 MinHash 分段的 LSH 索引"""
-    def __init__(self, n_hash: int = 64, bands: int = 16, threshold: float = 0.9):
-        self.n_hash = n_hash
-        self.bands = bands
-        self.threshold = float(threshold)
-        self.rows = n_hash // bands if bands else n_hash
-        if _DSMinHashLSH is not None:
-            self._use_datasketch = True
-            self._lsh = _DSMinHashLSH(threshold=self.threshold, num_perm=n_hash)
-            self._store: Dict[str, Set[str]] = {}
-            self._counter = 0
-        else:
-            assert bands and n_hash % bands == 0
-            self._use_datasketch = False
-            self.buckets = [defaultdict(list) for _ in range(bands)]
-            self.items: List[Tuple[Tuple[int, ...], Set[str]]] = []
-
-    def _band_keys(self, sig: Tuple[int, ...]) -> List[Tuple[int, ...]]:
-        return [tuple(sig[i * self.rows:(i + 1) * self.rows]) for i in range(self.bands)]
-
-    def add(self, sig, shingles: Set[str]):
-        if self._use_datasketch:
-            key = f"mh-{self._counter}"
-            self._counter += 1
-            self._store[key] = shingles
-            self._lsh.insert(key, sig)
-            return
-        idx = len(self.items)
-        self.items.append((sig, shingles))
-        for b, key in enumerate(self._band_keys(sig)):
-            self.buckets[b][key].append(idx)
-
-    def candidates(self, sig: Tuple[int, ...]) -> Set[int]:
-        cand = set()
-        for b, key in enumerate(self._band_keys(sig)):
-            cand.update(self.buckets[b].get(key, []))
-        return cand
-
-    def query(self, sig, shingles: Set[str], jaccard_thresh: float) -> bool:
-        thr = float(jaccard_thresh)
-        if self._use_datasketch:
-            cand_keys = self._lsh.query(sig)
-            for key in cand_keys:
-                oshingles = self._store.get(key, set())
-                inter = len(shingles & oshingles)
-                uni = len(shingles | oshingles) + 1e-9
-                if inter / uni >= thr:
-                    return True
-            return False
-        cand_idx = self.candidates(sig)
-        for idx in cand_idx:
-            osig, oshingles = self.items[idx]
-            inter = len(shingles & oshingles)
-            uni = len(shingles | oshingles) + 1e-9
-            if inter / uni >= thr:
-                return True
-        return False
 def _for_dedup_norm(s: str, preserve_carrier: bool = True) -> str:
     # 归一化：去意图锚点/去围栏/去 JSON/去常见载体外壳/归一随机占位
     s = strip_attack_intent(s)
@@ -1337,215 +1174,31 @@ def dedup_groups(rows, deduper: Deduper, preserve_carrier: bool = True):
                 break
     return keep
 
-class Deduper:
-    """Combined SimHash + LSH + exact Jaccard + hashed-trigram cosine; optional external embedding de-duper."""
-    def __init__(self, sim_bits=64, sim_thresh=2, k=5, n_hash=64, bands=16,
-                 jaccard_thresh=0.90, vec_dim=1024, cosine_thresh=0.92, max_vecs=20000):
-        self.sim_bits = sim_bits
-        self.sim_thresh = sim_thresh
-        self.sim_sigs: List[int] = []
-        self.k = k
-        eff_n_hash = n_hash if _DSMinHash is not None else min(n_hash, 32)
-        eff_bands = bands or eff_n_hash
-        if eff_bands <= 0:
-            eff_bands = 1
-        if eff_n_hash % eff_bands != 0:
-            eff_bands = math.gcd(eff_n_hash, eff_bands) or 1
-        self.index = LSHMinhashIndex(n_hash=eff_n_hash, bands=eff_bands, threshold=jaccard_thresh)
-        self.jaccard_thresh = jaccard_thresh
-        self.n_hash = eff_n_hash
-        self.bands = eff_bands
-        # --- new: vector index ---
-        self._annoy = None
-        self._annoy_ids = 0
-        self._annoy_built = False
-        if '_AnnoyIndex' in globals() and _AnnoyIndex is not None and self.vec_dim > 0:
-            try:
-                self._annoy = _AnnoyIndex(self.vec_dim, 'angular')
-            except Exception:
-                self._annoy = None
-        self.vec_dim = int(vec_dim)
-        self.cosine_thresh = float(cosine_thresh)
-        self.max_vecs = int(max_vecs)
-        self._vecs: List[List[float]] = []  # normalized vectors
-        self._faiss_sim = None
-        if faiss is not None and self.sim_bits % 8 == 0:
-            try:
-                self._faiss_sim = faiss.IndexBinaryFlat(self.sim_bits)
-            except Exception:
-                self._faiss_sim = None
-        self._faiss_dense = None
-        if faiss is not None and self.vec_dim > 0:
-            try:
-                self._faiss_dense = faiss.IndexFlatIP(self.vec_dim)
-            except Exception:
-                self._faiss_dense = None
-        self._bk_tree = None if self._faiss_sim is not None else _HammingBKTree(_hamm)
-        # --- optional external sentence embedding view (class-shared) ---
-        if not hasattr(Deduper, "_ext_embed_fn"):
-            Deduper._ext_embed_fn = None
-            Deduper._ext_vecs = []
-            Deduper._ext_cos = 0.90
-
-    @classmethod
-    def set_external_embedder(cls, fn, cos_thresh: float = 0.90):
-        """fn: Callable[[str], List[float]] -> unit-normalized vector"""
-        cls._ext_embed_fn = fn
-        cls._ext_cos = float(cos_thresh) if cos_thresh else 0.90
-
-    @staticmethod
-    def jaccard(a: Set[str], b: Set[str]) -> float:
-        if not a and not b: return 1.0
-        return len(a & b) / (len(a | b) + 1e-9)
-
-    # --- new: hashing trigram embedding ---
-    def _embed(self, text: str) -> List[float]:
-        s = normalize(text)
-        feats = [s[i:i+3] for i in range(len(s)-2)] if len(s) >= 3 else [s]
-        vec = [0.0] * self.vec_dim
-        for g in feats:
-            h = int.from_bytes(hashlib.blake2b(g.encode("utf-8"), digest_size=8).digest(), "big")
-            vec[h % self.vec_dim] += 1.0
-        # l2 normalize
-        import math
-        norm = math.sqrt(sum(v*v for v in vec)) or 1.0
-        return [v / norm for v in vec]
-
-    def _cosine_near(self, v: List[float]) -> bool:
-        if self._faiss_dense is not None and self._faiss_dense.ntotal > 0:
-            vec = _dense_to_np(v)
-            k = min(32, self._faiss_dense.ntotal) or 1
-            D, _ = self._faiss_dense.search(vec, k)
-            for score in D[0]:
-                if score >= self.cosine_thresh:
-                    return True
-        if self._annoy is not None and self._annoy_ids > 0:
-            if not self._annoy_built and self._annoy_ids >= 32:
-                try:
-                    self._annoy.build(16)
-                    self._annoy_built = True
-                except Exception:
-                    self._annoy_built = False
-            if self._annoy_built:
-                try:
-                    idxs, dists = self._annoy.get_nns_by_vector(v, min(32, self._annoy_ids), include_distances=True)
-                except Exception:
-                    idxs, dists = (), ()
-                for dist in dists:
-                    cos = 1.0 - (dist * dist) / 2.0
-                    if cos >= self.cosine_thresh:
-                        return True
-        for u in self._vecs:
-            s = 0.0
-            for i in range(self.vec_dim):
-                s += v[i] * u[i]
-            if s >= self.cosine_thresh:
-                return True
-        return False
-
-    def _cosine_ext(self, v: List[float]) -> bool:
-        try:
-            V = getattr(Deduper, "_ext_vecs", [])
-            thr = float(getattr(Deduper, "_ext_cos", 0.90))
-        except Exception:
-            return False
-        if not V:
-            return False
-        # linear scan ok for small caps
-        smax = 0.0
-        for u in V:
-            s = sum(a*b for a,b in zip(v,u))
-            if s >= thr:
-                return True
-            if s > smax: smax = s
-        return False
-
-    def accept(self, text: str) -> bool:
-        # Quick SimHash screen
-        sig = _simhash(text, self.sim_bits)
-        sig_bytes = None
-        if self._faiss_sim is not None and self._faiss_sim.ntotal > 0:
-            sig_bytes = _simhash_to_bytes(sig, self.sim_bits)
-            k = min(64, self._faiss_sim.ntotal) or 1
-            D, _ = self._faiss_sim.search(sig_bytes, k)
-            for dist in D[0]:
-                if int(dist) <= self.sim_thresh:
-                    return False
-        else:
-            if self._bk_tree is not None and self._bk_tree.search(sig, self.sim_thresh):
-                return False
-            if self._bk_tree is None:
-                for old in self.sim_sigs:
-                    if _hamm(sig, old) <= self.sim_thresh:
-                        return False
-        # LSH MinHash screen
-        shingles = _char_shingles(text, self.k)
-        mh = _minhash(shingles, n_hash=self.index.n_hash)
-        if self.index.query(mh, shingles, self.jaccard_thresh):
-            return False
-        # --- new: cosine embedding screen ---
-        v = self._embed(text)
-        if self._cosine_near(v):
-            return False
-        # --- optional external embedding hard filter ---
-        if getattr(Deduper, "_ext_embed_fn", None):
-            try:
-                vext = Deduper._ext_embed_fn(normalize(text))
-                if isinstance(vext, list) and vext and self._cosine_ext(vext):
-                    return False
-                if isinstance(vext, list) and vext:
-                    Deduper._ext_vecs.append(vext)
-            except Exception:
-                pass
-        # Accept & insert
-        self.sim_sigs.append(sig)
-        if self._bk_tree is not None:
-            self._bk_tree.add(sig)
-        self.index.add(mh, shingles)
-        if len(self._vecs) >= self.max_vecs:
-            self._vecs.pop(0)
-        self._vecs.append(v)
-        if self._faiss_sim is not None:
-            if sig_bytes is None:
-                sig_bytes = _simhash_to_bytes(sig, self.sim_bits)
-            try:
-                self._faiss_sim.add(sig_bytes)
-            except Exception:
-                pass
-        if self._faiss_dense is not None:
-            try:
-                self._faiss_dense.add(_dense_to_np(v))
-            except Exception:
-                pass
-        if self._annoy is not None:
-            try:
-                self._annoy.add_item(self._annoy_ids, v)
-                self._annoy_ids += 1
-                self._annoy_built = False
-            except Exception:
-                pass
-        return True
-
-
 # ------------------ Light/Unicode jitter // 轻度/Unicode 扰动 ------------------
 CONFUSABLE_MAP = {'A':'Α','B':'Β','E':'Ε','H':'Η','I':'Ι','K':'Κ','M':'Μ','N':'Ν','O':'Ο','P':'Ρ','T':'Τ','X':'Χ',
                   'a':'ɑ','c':'ϲ','e':'ｅ','i':'і','j':'ј','o':'ο','p':'р','s':'ѕ','x':'х','y':'у'}
-def random_sep() -> str: return random.choice(SEPS)
-def random_title() -> str: return random.choice(TITLES)
-def inject_noise_light(s: str) -> str:
+def random_sep(rng: Optional[random.Random] = None) -> str:
+    rng = rng or random
+    return rng.choice(SEPS)
+def random_title(rng: Optional[random.Random] = None) -> str:
+    rng = rng or random
+    return rng.choice(TITLES)
+def inject_noise_light(s: str, rng: Optional[random.Random] = None) -> str:
     """Light stylistic jitter. // 轻度风格扰动。"""
-    if random.random() < 0.20: s = s.replace("：", ":").replace("，", ",")
-    if random.random() < 0.18: s = s.replace("请", "麻烦").replace("判断", "帮看看")
-    if random.random() < 0.18: s = " ".join(s.split())
+    rng = rng or random
+    if rng.random() < 0.20: s = s.replace("：", ":").replace("，", ",")
+    if rng.random() < 0.18: s = s.replace("请", "麻烦").replace("判断", "帮看看")
+    if rng.random() < 0.18: s = " ".join(s.split())
 
     return s
-def inject_unicode_noise(s: str, p: float = 0.10) -> str:
+def inject_unicode_noise(s: str, p: float = 0.10, rng: Optional[random.Random] = None) -> str:
     """Unicode adversarial jitter. // Unicode 级对抗扰动。"""
+    rng = rng or random
     out = []
     for ch in list(s):
-        r = random.random()
+        r = rng.random()
         if r < p*0.25:
-            out.append(random.choice(WS_ZERO)); continue
+            out.append(rng.choice(WS_ZERO)); continue
         if r < p*0.15 and ch in CONFUSABLE_MAP:
             out.append(CONFUSABLE_MAP[ch]); continue
         if r < p*0.10 and 0x21 <= ord(ch) <= 0x7e and ch != ' ':
@@ -1701,7 +1354,7 @@ def adversarial_search(base_text: str, contract: TaskContract, payload_hint: Opt
                        max_iters: int = 6, seed: int = 0) -> str:
     """Heuristic hill‑climb on surface to keep effect but reduce artifacty evidence.
     以“效果成功且证据更隐蔽”为目标进行启发式搜索。"""
-    rng = random.Random(seed ^ hash(cheap_fingerprint(base_text)))
+    rng = stable_rng("adv_search", seed, base_text)
     best = base_text
     def _score(txt: str) -> tuple[int, float]:
         # success=1/0, penalty = evidence matches + artifact words
@@ -1737,13 +1390,14 @@ ENG_MAP = {
     "结论":"conclusion","摘要":"summary","回复":"reply","格式":"format","说明":"note",
     "稳定":"stable","占位":"placeholder","通过":"approved","对齐":"aligned"
 }
-def code_switch_light(s: str, p: float = 0.2) -> str:
+def code_switch_light(s: str, p: float = 0.2, rng: Optional[random.Random] = None) -> str:
     """Randomly swap a few CN tokens to pinyin/EN // 随机把少量词替换为拼音或英文"""
+    rng = rng or random
     toks = re.split(r'(\W+)', s)
     for i, t in enumerate(toks):
-        if random.random() < p and t in PINYIN_MAP:
+        if rng.random() < p and t in PINYIN_MAP:
             toks[i] = PINYIN_MAP[t]
-        elif random.random() < p*0.6 and t in ENG_MAP:
+        elif rng.random() < p*0.6 and t in ENG_MAP:
             toks[i] = ENG_MAP[t]
     return "".join(toks)
 # --- Extra container wrappers // 再包一层“容器” ---
@@ -2002,7 +1656,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
             splits = []
         for split in splits:
             rows = ds[split]
-            sample_seed = cheap_fingerprint(f"{tag}-{split}-{seed}")
+            sample_seed = stable_seed_int("dataset", tag, split, seed)
             for row in _sample_rows(rows, max_per_task, sample_seed):
                 yield row, split
 
@@ -2402,14 +2056,15 @@ FAMILY_GENERATORS = {
     "tool_poison_v2": lambda p, s: tool_poison_variants_v2(p),
 }
 # ------------------ Attack families (expanded) // 扩展的注入家族 ------------------
-def art_or_euphemism(s: str, use_art: bool) -> str:
+def art_or_euphemism(s: str, use_art: bool, rng: Optional[random.Random] = None) -> str:
     """Fill placeholders with artifact or euphemism. // 以显词或委婉词填充占位符。"""
+    rng = rng or random
     repl = {
-        "{OVERRIDE}": "覆盖" if use_art else random.choice(SYNONYM_BANK["覆盖"]),
-        "{IGNORE}": "忽略" if use_art else random.choice(SYNONYM_BANK["忽略"]),
-        "{FIXED}": "固定输出" if use_art else random.choice(SYNONYM_BANK["固定输出"]),
-        "{PRIOR}": "优先级最高" if use_art else random.choice(SYNONYM_BANK["优先级最高"]),
-        "{ECHO}": "回显" if use_art else random.choice(SYNONYM_BANK["回显"]),
+        "{OVERRIDE}": "覆盖" if use_art else rng.choice(SYNONYM_BANK["覆盖"]),
+        "{IGNORE}": "忽略" if use_art else rng.choice(SYNONYM_BANK["忽略"]),
+        "{FIXED}": "固定输出" if use_art else rng.choice(SYNONYM_BANK["固定输出"]),
+        "{PRIOR}": "优先级最高" if use_art else rng.choice(SYNONYM_BANK["优先级最高"]),
+        "{ECHO}": "回显" if use_art else rng.choice(SYNONYM_BANK["回显"]),
     }
     for k,v in repl.items(): s = s.replace(k, v)
     if not use_art:
@@ -2766,42 +2421,44 @@ ROLE_SETS = [
     ("[User]", "[Assistant]")
 ]
 
-def build_delivery(target_prompt: str, inj_text: str, force_mode: Optional[str] = None) -> Tuple[str, str]:
+def build_delivery(target_prompt: str, inj_text: str, force_mode: Optional[str] = None,
+                   rng: Optional[random.Random] = None) -> Tuple[str, str]:
     """Wrap injection by delivery mode. // 用不同投递方式包装注入。"""
-    mode = force_mode if force_mode in DELIVERY_MODES else random.choice(DELIVERY_MODES)
-    sep = random_sep(); title = random_title()
+    local_rng = rng or random
+    mode = force_mode if force_mode in DELIVERY_MODES else local_rng.choice(DELIVERY_MODES)
+    sep = random_sep(local_rng); title = random_title(local_rng)
     if mode == "direct":
         base = f"{title}\n{target_prompt}{sep}{inj_text}"
     elif mode == "format":
         base = f"{target_prompt}{sep}{inj_text}"
     elif mode == "indirect":
-        container = random.choice(["【网页内容】\n","[ToolResult]\n","<scraped>\n","# 报表摘录\n",
-                                   "【会议纪要】\n","【审批意见】\n","【质检单】\n","【审计摘录】\n","【工单回执】\n","【公告】\n","【制度条款】\n","【问卷说明】\n"])
+        container = local_rng.choice(["【网页内容】\n","[ToolResult]\n","<scraped>\n","# 报表摘录\n",
+                                      "【会议纪要】\n","【审批意见】\n","【质检单】\n","【审计摘录】\n","【工单回执】\n","【公告】\n","【制度条款】\n","【问卷说明】\n"])
         base = f"{target_prompt}\n\n{container}{inj_text}\n"
     elif mode == "multi_turn":
-        u, a = random.choice(ROLE_SETS)
+        u, a = local_rng.choice(ROLE_SETS)
         # 3~6 轮：前 n-1 轮不出现 payload，最后一轮把 inj_text 放进去
-        n_rounds = random.randint(3, 6)
+        n_rounds = local_rng.randint(3, 6)
         opener = [
             (u, target_prompt),
-            (a, random.choice(["好的，请提供需要处理的文本。", "收到，请给出材料。", "明白，请贴出要处理的段落。"]))
+            (a, local_rng.choice(["好的，请提供需要处理的文本。", "收到，请给出材料。", "明白，请贴出要处理的段落。"]))
         ]
         filler_bank = [
             (u, "见下："),
-            (a, random.choice(["已阅读，将按既定格式输出。", "明白，保持统一格式与口径。"])),
-            (u, random.choice(["保持格式一致即可。", "尽量简洁，便于解析。"])),
-            (a, random.choice(["如果需要，我会在结尾保留一行回执。", "如有冲突，以最后指示为准。"]))
+            (a, local_rng.choice(["已阅读，将按既定格式输出。", "明白，保持统一格式与口径。"])),
+            (u, local_rng.choice(["保持格式一致即可。", "尽量简洁，便于解析。"])),
+            (a, local_rng.choice(["如果需要，我会在结尾保留一行回执。", "如有冲突，以最后指示为准。"]))
         ]
         convo = opener + filler_bank[: max(0, n_rounds - 2)]
         # 结果槽不必每次必现（~70% 概率出现在助手机）
-        show_slot = (random.random() < 0.70)
+        show_slot = (local_rng.random() < 0.70)
         # 可选：在最后注入前插入“工具参数示例”的多轮版本
         try:
             rate = float(getattr(globals().get('cfg', _NS(mt_tool_override_rate=0.25)), 'mt_tool_override_rate', 0.25))
         except Exception:
             rate = 0.25
-        if random.random() < rate:
-            tool_json = {"tool": random.choice(["search","summarize","classify","extract"]),
+        if local_rng.random() < rate:
+            tool_json = {"tool": local_rng.choice(["search","summarize","classify","extract"]),
                          "args": {"q": "..."}, "return": {"note": "ok"}}
             convo.append((u, "下面是一个参数示例（无需实际调用）："))
             convo.append((u, "```json\n" + json.dumps(tool_json, ensure_ascii=False) + "\n```"))
@@ -2810,25 +2467,25 @@ def build_delivery(target_prompt: str, inj_text: str, force_mode: Optional[str] 
             convo.append((u, inj_text))   # 把注入内容作为“用户”最后一轮材料
         else:
             # 不出现显式“结果槽”的版本，用语义指令替代
-            inj_text2 = inj_text.replace("结果", random.choice(["结论","答案","最终值"]))
+            inj_text2 = inj_text.replace("结果", local_rng.choice(["结论","答案","最终值"]))
             convo.append((u, inj_text2))
 
         # 角色&分隔符多样化
         def _fmt_role(r: str) -> str:
             if re.match(r"^\[.*\]$", r):
                 return r
-            if random.random() < 0.25:
+            if local_rng.random() < 0.25:
                 return f"[{r}]"
             return r
         sep_opts = [":", "：", " - ", " — ", " | "]
         def _join(r, c):
-            if random.random() < 0.15:  # 无头角色（自由句）
+            if local_rng.random() < 0.15:  # 无头角色（自由句）
                 return c
-            return f"{_fmt_role(r)}{random.choice(sep_opts)} {c}"
+            return f"{_fmt_role(r)}{local_rng.choice(sep_opts)} {c}"
         base = "\n".join([_join(r, c) for r, c in convo])
 
         # 30% 概率用 JSON turns 结构体（role 同样走多样化）
-        if random.random() < 0.30:
+        if local_rng.random() < 0.30:
             turns = [{"role": u.lower() if len(u) < 4 else "user", "text": target_prompt}]
             for r, c in convo[1:]:
                 role = ("assistant" if r == a else "user") if r in (u, a) else ("assistant" if r in ["解答者","乙","答"] else "user")
@@ -2843,8 +2500,8 @@ def build_delivery(target_prompt: str, inj_text: str, force_mode: Optional[str] 
             '<span class="ad ad-slot" data-pos="top"></span>',
             '<div data-flag="1" data-q="...">…</div>'
         ]
-        prefix_noise = random.choice(noise_snips)
-        suffix_noise = random.choice(noise_snips)
+        prefix_noise = local_rng.choice(noise_snips)
+        suffix_noise = local_rng.choice(noise_snips)
         footer = "\n—— 以上为外部结果快照 ——"
         base = f"{header}{prefix_noise}\n{target_prompt}\n{sep}{inj_text}\n{suffix_noise}{footer}"
     base, domain = wrap_with_domain(base)
@@ -2853,7 +2510,7 @@ def build_delivery(target_prompt: str, inj_text: str, force_mode: Optional[str] 
 def compose_conversation_attacks_sample(base_prompt: str, payload: Optional[str]) -> str:
     """Less-templated multi-turn: topic shifts, corrections, fillers, slight code-switch.
     更贴近真实的多轮：跨主题/纠错/口头禅/轻度 code-switch。"""
-    rng = random.Random(cheap_fingerprint(base_prompt) + (payload or ""))
+    rng = stable_rng("convo", base_prompt, payload or "")
     ph = payload or "标记"
     fillers = ["嗯", "啊", "呃", "emmm", "好吧", "OK", "先这样", "那就这样"]
     shifts = [
@@ -4683,7 +4340,6 @@ def _attack_render_core(seed: int) -> tuple[Optional[RenderPacket], list[tuple[s
     if not targets:
         return None, []
     rng = random.Random(seed)
-    random.seed(seed)
     logs: list[tuple[str, dict]] = []
     try:
         target_idx = rng.randrange(len(targets))
@@ -4742,7 +4398,7 @@ def _attack_render_core(seed: int) -> tuple[Optional[RenderPacket], list[tuple[s
     artifact_rate = float(cfg.get("artifact_rate", 0.0))
     art_flag = rng.random() < artifact_rate
     try:
-        inj_text = art_or_euphemism(inj_text, use_art=art_flag)
+        inj_text = art_or_euphemism(inj_text, use_art=art_flag, rng=rng)
     except Exception as e:
         logs.append(("artifact_error", {"err": str(e)}))
 
@@ -4757,7 +4413,7 @@ def _attack_render_core(seed: int) -> tuple[Optional[RenderPacket], list[tuple[s
                 carrier_name2, inj_text = maybe_wrap_again_named(inj_text, rng=rng)
                 carrier_name = f"{carrier_name}+{carrier_name2}"
         if rng.random() < code_switch_prob:
-            inj_text = code_switch_light(inj_text, p=0.20)
+            inj_text = code_switch_light(inj_text, p=0.20, rng=rng)
     except Exception as e:
         logs.append(("carrier_wrap_error", {"err": str(e)}))
 
@@ -4765,16 +4421,16 @@ def _attack_render_core(seed: int) -> tuple[Optional[RenderPacket], list[tuple[s
     try:
         if (channel == "multi_turn" or force_multi) and rng.random() < 0.40:
             inj_text_prog = compose_conversation_attacks_sample(t['prompt'], payload)
-            base, mode = build_delivery(t['prompt'], inj_text_prog, force_mode="multi_turn")
+            base, mode = build_delivery(t['prompt'], inj_text_prog, force_mode="multi_turn", rng=rng)
         else:
-            base, mode = build_delivery(t['prompt'], inj_text, force_mode=("multi_turn" if force_multi else None))
+            base, mode = build_delivery(t['prompt'], inj_text, force_mode=("multi_turn" if force_multi else None), rng=rng)
     except Exception as e:
         logs.append(("delivery_error", {"err": str(e)}))
         base, mode = inj_text, "in_context"
 
     noise_p = cfg.get("noise_p", NOISE_P)
     try:
-        raw = inject_unicode_noise(inject_noise_light(base), p=noise_p)
+        raw = inject_unicode_noise(inject_noise_light(base, rng=rng), p=noise_p, rng=rng)
         text = normalize(raw)
     except Exception as e:
         logs.append(("normalize_error", {"err": str(e)}))
@@ -4842,12 +4498,12 @@ def _hard_neg_producer_job(job: tuple[int, int]) -> dict:
         sim_bits=int(deduper_params.get('sim_bits', 64)),
         sim_thresh=int(deduper_params.get('sim_thresh', 2)),
         k=int(deduper_params.get('k', 5)),
-        n_hash=int(deduper_params.get('n_hash', 64)),
-        bands=int(deduper_params.get('bands', 16)),
-        jaccard_thresh=float(deduper_params.get('jaccard_thresh', 0.90)),
-        vec_dim=int(deduper_params.get('vec_dim', 1024)),
-        cosine_thresh=float(deduper_params.get('cosine_thresh', 0.92)),
-        max_vecs=int(deduper_params.get('max_vecs', 20000)),
+        n_hash=0,
+        bands=0,
+        jaccard_thresh=1.01,
+        vec_dim=0,
+        cosine_thresh=1.0,
+        max_vecs=0,
     )
     worker_cap = cfg.get('worker_family_cap')
     if worker_cap is None:
@@ -4903,12 +4559,12 @@ def _plain_neg_producer_job(job: tuple[int, int]) -> dict:
         sim_bits=int(deduper_params.get('sim_bits', 64)),
         sim_thresh=int(deduper_params.get('sim_thresh', 2)),
         k=int(deduper_params.get('k', 5)),
-        n_hash=int(deduper_params.get('n_hash', 64)),
-        bands=int(deduper_params.get('bands', 16)),
-        jaccard_thresh=float(deduper_params.get('jaccard_thresh', 0.90)),
-        vec_dim=int(deduper_params.get('vec_dim', 1024)),
-        cosine_thresh=float(deduper_params.get('cosine_thresh', 0.92)),
-        max_vecs=int(deduper_params.get('max_vecs', 20000)),
+        n_hash=0,
+        bands=0,
+        jaccard_thresh=1.01,
+        vec_dim=0,
+        cosine_thresh=1.0,
+        max_vecs=0,
     )
     cands, stats = _compose_plain_negatives_serial(
         target_pool=targets,
@@ -4955,12 +4611,12 @@ def _topic_neg_producer_job(job: tuple[int, int]) -> dict:
         sim_bits=int(deduper_params.get('sim_bits', 64)),
         sim_thresh=int(deduper_params.get('sim_thresh', 2)),
         k=int(deduper_params.get('k', 5)),
-        n_hash=int(deduper_params.get('n_hash', 64)),
-        bands=int(deduper_params.get('bands', 16)),
-        jaccard_thresh=float(deduper_params.get('jaccard_thresh', 0.90)),
-        vec_dim=int(deduper_params.get('vec_dim', 1024)),
-        cosine_thresh=float(deduper_params.get('cosine_thresh', 0.92)),
-        max_vecs=int(deduper_params.get('max_vecs', 20000)),
+        n_hash=0,
+        bands=0,
+        jaccard_thresh=1.01,
+        vec_dim=0,
+        cosine_thresh=1.0,
+        max_vecs=0,
     )
     cands = _compose_topic_shift_negatives_serial(
         target_pool=targets,
@@ -5089,7 +4745,7 @@ class AttackSelector:
         carrier_name = packet.carrier_name
         mode = packet.mode
         art_flag = packet.art_flag
-        rng_pair_seed = cheap_fingerprint(f"{packet.seed}-{fam_name}-{mapped_intent}")
+        rng_pair_seed = stable_seed_int("packet", packet.seed, fam_name, mapped_intent)
         rng_local = random.Random(int(hashlib.blake2b(str(rng_pair_seed).encode('utf-8'), digest_size=8).hexdigest(), 16))
 
         # ==== Begin mirrored logic from serial pathway (post-render) ====
@@ -5166,7 +4822,7 @@ class AttackSelector:
             return
 
         pair_id = f"P{len(self.cands)+1:07d}"
-        rng_pair = random.Random(cheap_fingerprint(pair_id) + str(self.seed))
+        rng_pair = stable_rng("pos_pair", self.seed, pair_id)
         pos_cjk_target = max(0.60, (0.7 if self.min_cjk_share_auto else self.min_cjk_share))
         text2, carrier_after = apply_surface_augments(text, rng_pair, struct_p=self.struct_evidence_rate, cjk_target=pos_cjk_target)
         if carrier_after:
@@ -5575,7 +5231,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
 
         # 8) 先生成 pair_id / rng_pair，再做表面增强（要用到 rng_pair）
         pair_id = f"P{len(cands)+1:07d}"
-        rng_pair = random.Random(cheap_fingerprint(pair_id) + str(seed))
+        rng_pair = stable_rng("plain_pair", seed, pair_id)
         pos_cjk_target = max(0.60, (0.7 if min_cjk_share_auto else min_cjk_share))
         text, carrier_name = apply_surface_augments(
             text, rng_pair, struct_p=struct_evidence_rate, cjk_target=pos_cjk_target
@@ -5849,8 +5505,7 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
             coverage_min_per_combo=coverage_min_per_combo,
         )
 
-    workers = max(1, workers if workers > 0 else ((cpu_count() or 2) - 1))
-    producer_batch = max(1, int(producer_batch or 64))
+    workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
 
     disc_rate_eff = _effective_disc_rate(disc_rate)
     artifact_free_pos_ratio_eff = _effective_artifact_free_pos_ratio(artifact_free_pos_ratio)
@@ -5925,11 +5580,28 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
 
     job_stream = ((seed + idx * (producer_batch + 37), producer_batch) for idx in count())
 
+    log_queue: Queue[Optional[list[tuple[str, dict]]]] = Queue(max(32, workers * 8))
+
+    def _audit_consumer() -> None:
+        while True:
+            item = log_queue.get()
+            if item is None:
+                log_queue.task_done()
+                break
+            try:
+                selector.add_audit_logs(item)
+            finally:
+                log_queue.task_done()
+
+    log_thread = Thread(target=_audit_consumer, name="attack-audit-consumer", daemon=True)
+    log_thread.start()
+
     with Pool(processes=workers, initializer=_attack_producer_init, initargs=(target_pool, cfg_dict)) as pool:
         try:
-            for payload in pool.imap_unordered(_attack_producer_job, job_stream):
+            for payload in pool.imap_unordered(_attack_producer_job, job_stream, chunksize=chunk_size):
                 for cand, logs in payload.get("results", []):
-                    selector.add_audit_logs(logs)
+                    if logs:
+                        log_queue.put(logs)
                     attempts += 1
                     if cand is not None:
                         selector.process(cand)
@@ -5939,6 +5611,10 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
             pool.terminate()
         finally:
             pool.join()
+
+    log_queue.put(None)
+    log_queue.join()
+    log_thread.join(timeout=1.0)
 
     return selector.cands
 
@@ -6180,8 +5856,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
             strict_neg_diag_gate=strict_neg_diag_gate,
         )
 
-    workers = max(1, workers if workers > 0 else ((cpu_count() or 2) - 1))
-    producer_batch = max(1, int(producer_batch or 64))
+    workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
     disc_rate_eff = _effective_disc_rate(disc_rate)
     wanted = k * max(1, oversample_mult)
 
@@ -6226,7 +5901,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
     with Pool(processes=workers, initializer=_hard_neg_producer_init,
               initargs=(target_pool, cfg)) as pool:
         try:
-            for payload in pool.imap_unordered(_hard_neg_producer_job, job_stream):
+            for payload in pool.imap_unordered(_hard_neg_producer_job, job_stream, chunksize=chunk_size):
                 chunk = payload.get('cands', []) if isinstance(payload, dict) else []
                 for cand in chunk:
                     if not isinstance(cand, dict):
@@ -6524,7 +6199,7 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
                 pass
         txt = normalize(inject_unicode_noise(txt, p=0.03))
         pair_id = f"NPLAIN-{len(out)+1:07d}"
-        rng_pair = random.Random(cheap_fingerprint(pair_id) + str(seed))
+        rng_pair = stable_rng("plain_pair", seed, pair_id)
         # --- CJK share enforcement (≥0.60) ---
         # --- CJK share enforcement (≥0.60) — repair-first ---
         target_min_cjk = 0.60
@@ -6587,7 +6262,8 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
         txt = apply_symmetric_accessories(txt, rng_pair, rate=0.10)
         txt = transform_text_pipeline(txt, rng_pair)
         # 对称遮蔽，使用基于 pair_id 的 rng 保持一致
-        rmask = random.Random(cheap_fingerprint(pair_id or txt) + str(seed))
+        mask_seed_obj = pair_id if pair_id else txt
+        rmask = stable_rng("plain_mask", seed, mask_seed_obj)
         masked_applied = False
         if mask_on in ('both','neg'):
             before_mask = txt
@@ -6646,8 +6322,7 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
             strict_neg_diag_gate=strict_neg_diag_gate,
         )
 
-    workers = max(1, workers if workers > 0 else ((cpu_count() or 2) - 1))
-    producer_batch = max(1, int(producer_batch or 64))
+    workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
     disc_rate_eff = _effective_disc_rate(disc_rate)
 
     index_attr = getattr(deduper, 'index', None)
@@ -6684,7 +6359,7 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
     with Pool(processes=workers, initializer=_plain_neg_producer_init,
               initargs=(target_pool, cfg)) as pool:
         try:
-            for payload in pool.imap_unordered(_plain_neg_producer_job, job_stream):
+            for payload in pool.imap_unordered(_plain_neg_producer_job, job_stream, chunksize=chunk_size):
                 if not isinstance(payload, dict):
                     continue
                 for cand in payload.get('cands', []):
@@ -6745,11 +6420,11 @@ def _compose_topic_shift_negatives_serial(target_pool, k: int, seed: int, dedupe
         if not deduper_accept_normalized(deduper, txt, preserve_carrier=dedupe_preserve_carrier):
             continue
         # 与正类对齐：按相同概率加免责声明
-        disc_flag = (random.Random(cheap_fingerprint(txt) + str(seed)).random() < disc_rate)
+        disc_flag = (stable_rng("topic_disc", seed, txt).random() < disc_rate)
         disc_str = random.choice(DISCLAIMER_BANK) if disc_flag else None
         if disc_flag and disc_str:
             txt = f"{disc_str}\n{txt}"
-        rng_pair = random.Random(cheap_fingerprint(txt) + str(seed))
+        rng_pair = stable_rng("topic_rng", seed, txt)
         # symmetric transforms
         txt = apply_symmetric_accessories(txt, rng_pair, rate=0.10)
         txt = transform_text_pipeline(txt, rng_pair)
@@ -6812,8 +6487,7 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
             disc_rate=disc_rate,
         )
 
-    workers = max(1, workers if workers > 0 else ((cpu_count() or 2) - 1))
-    producer_batch = max(1, int(producer_batch or 64))
+    workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
     disc_rate_eff = _effective_disc_rate(disc_rate)
 
     index_attr = getattr(deduper, 'index', None)
@@ -6845,7 +6519,7 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
     with Pool(processes=workers, initializer=_topic_neg_producer_init,
               initargs=(target_pool, cfg)) as pool:
         try:
-            for payload in pool.imap_unordered(_topic_neg_producer_job, job_stream):
+            for payload in pool.imap_unordered(_topic_neg_producer_job, job_stream, chunksize=chunk_size):
                 if not isinstance(payload, dict):
                     continue
                 for cand in payload.get('cands', []):
@@ -7199,11 +6873,11 @@ def main():
     ap.add_argument("--target_streaming", action="store_true", default=False, help="Enable datasets streaming when constructing target pool. // 构建目标池时启用 streaming")
     ap.add_argument("--hf_cache_dir", default=None, help="Optional cache directory for datasets.load_dataset. // datasets 缓存目录")
     ap.add_argument("--family_max_frac", type=float, default=0.06, help="Max fraction per family. // 每家族占比上限")
-    ap.add_argument("--oversample_mult", type=int, default=6, help="Candidate oversampling multiplier. // 候选过采样倍数")
+    ap.add_argument("--oversample_mult", type=int, default=4, help="Candidate oversampling multiplier (default=4, tune 3-4). // 候选过采样倍数")
     ap.add_argument("--mp_workers", type=int, default=0, help="Multiprocessing workers for candidate rendering (0=auto, 1=serial). // 候选渲染进程数（0 自动，1 串行）")
-    ap.add_argument("--mp_batch", type=int, default=256, help="Candidates rendered per worker batch. // 每个进程批量渲染的候选数")
+    ap.add_argument("--mp_batch", type=int, default=384, help="Candidates rendered per worker batch (default=384, tune 256-512). // 每个进程批量渲染的候选数")
     ap.add_argument("--simhash_bits", type=int, default=64, help="SimHash bits. // SimHash 位数")
-    ap.add_argument("--simhash_thresh", type=int, default=2, help="Hamming threshold. // 汉明阈值")
+    ap.add_argument("--simhash_thresh", type=int, default=1, help="Hamming threshold (lower=faster, default=1). // 汉明阈值")
     ap.add_argument("--shingle_k", type=int, default=5, help="Char shingle length. // 字符 shingle 长度")
     ap.add_argument("--minhash_n", type=int, default=64, help="MinHash functions. // MinHash 函数数")
     ap.add_argument("--minhash_bands", type=int, default=16, help="LSH bands. // LSH 分段数")
@@ -7307,6 +6981,9 @@ def main():
             balance_mode="strict",
         )
     args = ap.parse_args()
+    if args.simhash_bits <= 32 and args.simhash_thresh > 1:
+        print("[auto-config] lowering simhash_thresh to 1 for <=32-bit SimHash fingerprints")
+        args.simhash_thresh = 1
     # 将 CLI 的 alias 概率同步为全局，用于非 DSL 分支
     try:
         global ALIAS_P_CN
@@ -7720,7 +7397,7 @@ def main():
         if len(paired_negs) >= target_paired:
             break
         try:
-            rng_pair = random.Random(cheap_fingerprint(r.get("pair_id","")) + str(args.seed))
+            rng_pair = stable_rng("paired_neg", args.seed, r.get('pair_id',''))
             # 无模型镜像负例
             neg_row = make_iso_benign_no_model(r)
             if not neg_row:
@@ -8639,9 +8316,3 @@ def main():
             print("[regress][warn] symmetry_regression failed:", _e)
 if __name__ == "__main__":
     main()
-
-
-
-
-
-

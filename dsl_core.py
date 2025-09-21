@@ -11,60 +11,24 @@ DSL core utilities for Chinese prompt‑injection data generation and auditing.
 # ===== dsl_core.py — Minimal usable scaffold
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Tuple, Optional
-import random, json, re
+import random, json, re, math
 import numpy as np
 
 # --- Speed patch: cache token hashes & avoid hexdigest paths ---
 from functools import lru_cache
 import hashlib as _hlib
 try:
-    from xxhash import xxh64 as _xxh64
-except Exception:
-    _xxh64 = None
-try:
     from simhash import weighted_fingerprint as _dc_simhash_weighted, hamming_distance as _dc_hamming_dist
 except Exception:
     _dc_simhash_weighted = None
     _dc_hamming_dist = None
 
-@lru_cache(maxsize=1 << 20)  # cache up to ~1M grams across the run
-def _h64(g: str) -> int:
-    if _xxh64 is not None:
-        return _xxh64(g.encode("utf-8")).intdigest()
-    return int.from_bytes(_hlib.blake2b(g.encode("utf-8"), digest_size=8).digest(), "big")
+from dedupe_core import Deduper, DedupeRecord, _h64 as _dc_h64, simhash_weighted_text as _dc_simhash_weighted_fast
+
+_h64 = _dc_h64
+_simhash_weighted_fast = _dc_simhash_weighted_fast
 
 
-def _simhash_weighted_fast(s: str, bits: int = 64) -> int:
-    txt = re.sub(r"\s+", " ", s or "").lower()
-    if not txt:
-        return 0
-    chars = [c for c in txt if not c.isspace()]
-    bigrams = [txt[i:i+2] for i in range(len(txt) - 1)]
-    tokens = chars + bigrams
-    if not tokens:
-        tokens = [txt]
-    if _dc_simhash_weighted is not None and bits == 64:
-        pairs = [(_h64(tok), 1.0) for tok in tokens]
-        try:
-            return int(_dc_simhash_weighted(pairs))
-        except Exception:
-            pass
-    hashes = np.fromiter((_h64(tok) for tok in tokens), dtype=np.uint64, count=len(tokens))
-    if hashes.size == 0:
-        return 0
-    bits_u8 = hashes.view(np.uint8).reshape(-1, 8)
-    bit_matrix = np.unpackbits(bits_u8, axis=1, bitorder='little').astype(np.int16)
-    weights = (bit_matrix * 2 - 1).sum(axis=0)
-    if bits < weights.size:
-        weights = weights[:bits]
-    elif bits > weights.size:
-        weights = np.pad(weights, (0, bits - weights.size), constant_values=0)
-    bit_flags = (weights >= 0).astype(np.uint8)
-    if bits % 8 != 0:
-        padded = bits + (-bits % 8)
-        bit_flags = np.pad(bit_flags, (0, padded - bits), constant_values=0)
-    packed = np.packbits(bit_flags, bitorder='little')
-    return int.from_bytes(packed.tobytes(), 'little')
 
 
 def _sketch_5gram_fast(s: str, buckets: int = 1 << 16) -> Dict[int, float]:
@@ -91,13 +55,20 @@ except Exception:
     yaml = None
 from enum import Enum
 from itertools import permutations
+
+
+@lru_cache(maxsize=4096)
+def _bucket_hash_cached(key: Tuple[str, ...]) -> str:
+    s = "|".join(key)
+    return _hlib.md5(s.encode("utf-8")).hexdigest()[:12]
+
+
 def bucket_hash(items) -> str:
     try:
-        s = "|".join(sorted([str(x) for x in (items or []) if x]))
+        key = tuple(sorted(str(x) for x in (items or []) if x))
     except Exception:
-        s = ""
-
-    return _hlib.md5(s.encode("utf-8")).hexdigest()[:12]
+        key = tuple()
+    return _bucket_hash_cached(key)
 
 
 
@@ -504,6 +475,21 @@ UP_RE     = re.compile(r"UPSTREAM(?:_DOC_ID)?[:=][A-Z0-9\-#]{6,40}")
 ROLE_RE   = re.compile(r"\brole\s*[:：]\s*(system|user)\b", re.I)
 TOOLCALL_RE = re.compile(r"TOOL_CALL\([A-Za-z_][\w]*\)")
 JSON_BLOCK_RE = re.compile(r"```json\b(.*?)```", re.S)
+MARKDOWN_TABLE_ROW_RX = re.compile(r"(?m)^\s*\|[^|\n]+\|[^|\n]+\|")
+MULTITURN_ROLE_RX = re.compile(r"^(?:\[?(?:用户|助手|User|Assistant|我|你|问|答|甲|乙)\]?)[\s：:>\-|]*", re.M)
+MULTITURN_JSON_TURNS_RX = re.compile(r'"turns"\s*:\s*\[', re.I)
+MULTITURN_USER_RESULT_RX = re.compile(r'(?m)^用户\s*:.*(结果槽|RESULT_MAIN)')
+MULTITURN_ASSIST_RESULT_RX = re.compile(r'(?m)^助手\s*:.*(结果槽|RESULT_MAIN)')
+ANCHOR_OVERRIDE_FALLBACK_RX = re.compile(r"(覆盖|忽略|override|替换上文|重设|优先采用)", re.I)
+LANG_CARRIERS = {
+    "jsonc",
+    "front_matter",
+    "markdown_table",
+    "yaml",
+    "email",
+    "natlang",
+    "html_frag",
+}
 def _parse_json_blocks(txt: str):
     blks = JSON_BLOCK_RE.findall(txt)
     for b in blks:
@@ -797,9 +783,10 @@ def mechanism_truth_record(txt: str, spec: 'AttackSpec') -> dict:
         "passed": all(v["passed"] for v in inv.values()) if inv else True,
     }
 # —— 证据族（family）映射，用于覆盖预算与统计 —— 
-def evidence_families(evs: List[str]) -> Set[str]:
+@lru_cache(maxsize=4096)
+def _evidence_families_cached(ev_key: Tuple[str, ...]) -> Tuple[str, ...]:
     fam = set()
-    for e in (evs or []):
+    for e in ev_key:
         if e in {"result_slot","append"}: fam.add("slot")
         if e in {"tool"}:                 fam.add("tool")
         if e in {"role"}:                 fam.add("role")
@@ -812,7 +799,13 @@ def evidence_families(evs: List[str]) -> Set[str]:
         if e in {"routing_bias","eval_hint"}: fam.add("routing")
         if e in {"merge_directive"}:      fam.add("merge")
         if e in {"charlimit_pressure","format_soft"}: fam.add("format")
-    return fam or {"misc"}
+    fam = fam or {"misc"}
+    return tuple(sorted(fam))
+
+
+def evidence_families(evs: List[str]) -> Set[str]:
+    key = tuple(sorted(evs or []))
+    return set(_evidence_families_cached(key))
 
 # —— anchor_free 下的“软证据”正则（尽量中文优先） —— 
 _SOFT_RX = {
@@ -942,7 +935,7 @@ def _sketch5(s: str, buckets: int = 1<<16) -> dict:
     L = len(s)
     for i in range(max(0, L-4)):
         g = s[i:i+5]
-        h = hash(g) & (buckets-1)
+        h = _dc_h64(g) & (buckets - 1)
         v[h] = v.get(h, 0.0) + 1.0
     # L2 normalize
     norm = sum(x*x for x in v.values()) ** 0.5 or 1.0
@@ -1997,6 +1990,8 @@ def apply_style(text: str, spec: AttackSpec, rnd: random.Random) -> str:
 
 # ---------- 7) 自一致校验（不变量而非显词） ----------
 HEADER_KV = re.compile(r"^[A-Za-z\u4e00-\u9fff\-]{2,30}:\s?.{0,120}$", re.M)
+HTTP_METHOD_RE = re.compile(r"(?m)^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+\S+")
+YAML_KEY_LINE_RE = re.compile(r"(?m)^[\w\-]{1,32}:\s?.+$")
 EVD_HINT_HTTP = re.compile(
     r"(?:\bRole\b|角色|\bPath\b|路径|Ref[- ]?(?:Chunk|Doc)|引用|来源|\bTool\b|工具|\bUpstream\b|上游|\bSession\b|会话)",
     re.I
@@ -2016,12 +2011,12 @@ def _looks_like_email(text: str) -> bool:
 def _looks_like_http_header(text: str) -> bool:
     # 仅保留“像 HTTP 头”的形状判据，避免把 Role/Path 等提示字段当硬锚点
     kv_lines = HEADER_KV.findall(text or "")
-    has_method = bool(re.search(r"(?m)^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+\S+", text or ""))
+    has_method = bool(HTTP_METHOD_RE.search(text or ""))
     return bool(has_method or len(kv_lines) >= 3)
 
 def _looks_like_yaml(text: str) -> bool:
     # 有围栏，或存在多行 key: value 结构即可
-    return ("```yaml" in text) or bool(re.search(r"(?m)^[\w\-]{1,32}:\s?.+$", text))
+    return ("```yaml" in text) or bool(YAML_KEY_LINE_RE.search(text or ""))
 _CJK_RX = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]')
 def cjk_share(s: str) -> float:
     if not s:
@@ -2035,116 +2030,100 @@ def adjudicate_invariants(text: str, spec: AttackSpec) -> Tuple[bool, List[str]]
     Validate carrier shape and structural/soft evidence invariants.
     校验载体形状与结构/软证据不变量。
 
-    - English: Enforces carrier‑specific form, checks evidence hits via
-      structural patterns (and soft hints under anchor‑free), and requires
-      minimal CJK share for language‑carriers.
+    - English: Enforces carrier-specific form, checks evidence hits via
+      structural patterns (and soft hints under anchor-free), and requires
+      minimal CJK share for language-carriers.
     - 中文：按载体形状约束、结构模式命中（无锚时允许软证据），并对语言载体要求
       最低中文占比。
     """
-    fails = []
+    fails: List[str] = []
     soft_hits_total = 0
+    evidence_items = list(spec.evidence or [])
+    constraints = getattr(spec, "constraints", {}) or {}
+    anchor_free_flag = bool(constraints.get("anchor_free"))
+    carrier = spec.carrier
+    text_stripped = text.strip()
+
     # 载体形态检查（例：jsonc 必须有 ```json fence）
-    if spec.carrier == "jsonc" and not text.strip().startswith("```json"):
+    if carrier == "jsonc" and not text_stripped.startswith("```json"):
         fails.append("carrier_jsonc_missing_fence")
-    if spec.carrier == "markdown_table":
-        # 用结构性判定替代固定中文表头，减少“词面伪迹”
-        has_header = bool(re.search(r'(?m)^\s*\|[^|\n]+\|[^|\n]+\|', text))
-        row_count = len(re.findall(r'(?m)^\s*\|[^|\n]+\|[^|\n]+\|', text))
-        if not (has_header and row_count >= 3):  # 至少一行表头 + 两行数据
+    if carrier == "markdown_table":
+        rows = MARKDOWN_TABLE_ROW_RX.findall(text)
+        if len(rows) < 3:  # 至少一行表头 + 两行数据
             fails.append("carrier_table_structure_weak")
 
-
     # 证据不变量
-    anchor_free_flag = bool(getattr(spec, "constraints", {}) and spec.constraints.get("anchor_free"))
-    for ev in spec.evidence:
-        check = EVIDENCE_CHECK.get(ev, lambda _: True)
-        ok_ev = bool(check(text))
-        if (not ok_ev) and anchor_free_flag:
-            # 采用 paraphrase 语义匹配替代固定正则
-            if soft_semantic_hit(ev, text):
-                soft_hits_total += 1
-                ok_ev = True
+    for ev in evidence_items:
+        check_fn = EVIDENCE_CHECK.get(ev)
+        ok_ev = bool(check_fn(text)) if check_fn else True
+        if (not ok_ev) and anchor_free_flag and soft_semantic_hit(ev, text):
+            soft_hits_total += 1
+            ok_ev = True
         if not ok_ev:
             fails.append(f"evidence_missing:{ev}")
+
     # anchor_free 下对“上游/检索”证据施加半结构刚性：必须出现显式字段或头
-    if anchor_free_flag and ("upstream" in (spec.evidence or [])):
+    if anchor_free_flag and "upstream" in evidence_items:
         if not invariant_upstream(text):  # 未命中上面的结构检查
             fails.append("evidence_semicontract_missing:upstream")
-        # —— 无锚点形态：要求语义等价软证据 —— 
+
     if anchor_free_flag:
         kinds = soft_evidence_kinds(text)
-        min_hits = int(getattr(spec, "constraints", {}).get("anchor_free_soft_min_hits", 1))
-        # 仅以“软证据命中数 ≥ 阈值”作为参考，不再强制合同冲突类
+        min_hits = int(constraints.get("anchor_free_soft_min_hits", 1))
         if len(kinds) < max(1, min_hits):
             fails.append("soft_evidence_insufficient")
 
     # 中文占比：仅对“自然语/文档类载体”强制，代码/协议类放宽
-    lang_carriers = {"jsonc","front_matter","markdown_table","yaml","email","natlang","html_frag"}
-    if spec.carrier in lang_carriers and cjk_share(text) < spec.min_cjk_share:
+    if carrier in LANG_CARRIERS and cjk_share(text) < spec.min_cjk_share:
         fails.append("cjk_share_below_threshold")
         fails.append("fix:cjk_alias")
-    if spec.carrier == "yaml" and not _looks_like_yaml(text):
+    if carrier == "yaml" and not _looks_like_yaml(text):
         fails.append("carrier:yaml")
-    if spec.carrier == "code_comment" and "/*" not in text and "//" not in text:
+    if carrier == "code_comment" and "/*" not in text and "//" not in text:
         fails.append("carrier:code_comment")
-    if spec.carrier == "email" and not _looks_like_email(text):
-        if not anchor_free_flag:
-            fails.append("carrier:email")
-    if spec.carrier == "http_header" and not _looks_like_http_header(text):
+    if carrier == "email" and not _looks_like_email(text) and not anchor_free_flag:
+        fails.append("carrier:email")
+    if carrier == "http_header" and not _looks_like_http_header(text):
         fails.append("carrier:http_header")
-    if spec.carrier == "csv_formula" and "=" not in text:
+    if carrier == "csv_formula" and "=" not in text:
         fails.append("carrier:csv_formula")
-    if spec.carrier == "git_diff" and "```diff" not in text:
+    if carrier == "git_diff" and "```diff" not in text:
         fails.append("carrier:git_diff")
-    if spec.carrier == "latex" and "\\begin{comment}" not in text:
+    if carrier == "latex" and "\\begin{comment}" not in text:
         fails.append("carrier:latex")
-    if spec.carrier == "mermaid" and "```mermaid" not in text:
+    if carrier == "mermaid" and "```mermaid" not in text:
         fails.append("carrier:mermaid")
+
     # 交付模式：multi_turn 基本不变量
-    if spec.delivery == "multi_turn":
-        # 放宽多轮形状：允许 [User]/[Assistant]、User/Assistant、我/你、问/答、甲/乙；分隔符可为 : ： - — | 等；可选 JSON turns
-        role_rx = r'^(?:\[?(?:用户|助手|User|Assistant|我|你|问|答|甲|乙)\]?)[\s：:>\-\|]*'
-        roles = re.findall(role_rx, text, flags=re.M)
-        json_turns = bool(re.search(r'"turns"\s*:\s*\[', text))
-        # 弱不变量：满足角色标注≥3 或 JSON turns 存在；不再要求首行必须“用户”
-        if not (json_turns or (len(roles) >= 3)):
+    if spec.delivery == "multi_turn" and not fails:
+        roles = MULTITURN_ROLE_RX.findall(text)
+        json_turns = bool(MULTITURN_JSON_TURNS_RX.search(text))
+        if not (json_turns or len(roles) >= 3):
             fails.append("delivery:multi_turn_role_format_weak")
-        # 环检测（“继续/再次/重复”等）—— 无论 anchor_free 与否都应要求
         if not (invariant_loop_state_drift(text) or _SOFT_RX["loop_state_drift"].search(text)):
             fails.append("delivery_missing:multi_turn_state")
-        # 仅在非 anchor_free 模式下做“位置约束”，anchor_free 依赖上面的结构证据判定
-        if not anchor_free_flag and ("result_slot" in (spec.evidence or [])):
-            user_has = re.search(r'(?m)^用户\s*:.*(结果槽|RESULT_MAIN)', text)
-            if user_has:
+        if not anchor_free_flag and "result_slot" in evidence_items:
+            if MULTITURN_USER_RESULT_RX.search(text):
                 fails.append("delivery:multi_turn_user_contains_result")
-            helper_hits = re.findall(r'(?m)^助手\s*:.*(结果槽|RESULT_MAIN)', text)
-            if len(helper_hits) == 0:
+            if not MULTITURN_ASSIST_RESULT_RX.findall(text):
                 fails.append("delivery:multi_turn_missing_result_in_assistant")
         if anchor_free_flag:
             _contract_conflict = bool(
-                _SOFT_RX["role"].search(text) or
-                _SOFT_RX["contract_override"].search(text) or
-                re.search(r"(覆盖|忽略|override|替换上文|重设|优先采用)", text, re.I)
+                _SOFT_RX["role"].search(text)
+                or _SOFT_RX["contract_override"].search(text)
+                or ANCHOR_OVERRIDE_FALLBACK_RX.search(text)
             )
-            soft_min = int(getattr(spec, "constraints", {}).get("anchor_free_soft_min_hits", 1))
+            soft_min = int(constraints.get("anchor_free_soft_min_hits", 1))
             if not (_contract_conflict and soft_hits_total >= soft_min):
                 fails.append("anchor_free_soft_evidence_too_weak")
-        # YAML front_matter：起码要有 --- 开头的围栏；anchor_free 时再要求提示词
-        if spec.carrier == "front_matter":
-            if not anchor_free_flag and not text.strip().startswith("---"):
+        if carrier == "front_matter":
+            if not anchor_free_flag and not text_stripped.startswith("---"):
                 fails.append("carrier:front_matter")
-            else:
-                # anchor_free：允许自然语无围栏；若存在 soft hint 更好，但不强制
-                if not EVD_HINT_FRONT.search(text or ""):
-                    pass  # 不计硬失败
-
-        # 代码注释：有 // 或 /* 即形状；anchor_free 时再要求提示词
-        if spec.carrier == "code_comment":
+        if carrier == "code_comment":
             if ("/*" not in text) and ("//" not in text):
                 fails.append("carrier:code_comment")
-            elif bool(getattr(spec, "constraints", {}).get("anchor_free", False)):
-                if not EVD_HINT_CODECMT.search(text or ""):
-                    fails.append("carrier:code_comment_soft_hint_missing")
+            elif anchor_free_flag and not EVD_HINT_CODECMT.search(text or ""):
+                fails.append("carrier:code_comment_soft_hint_missing")
 
     return (len(fails) == 0), fails
 
@@ -2164,9 +2143,9 @@ def semantic_signature(spec: AttackSpec, text: str) -> str:
             f"speech={getattr(spec,'speech_family','formal')}"]
     return "::".join(keys)
 
-def infer_contract_type(spec: AttackSpec) -> str:
-    ev = set(spec.evidence or [])
-    # 先按证据映射细分；若都未命中，则回退到 strategy
+@lru_cache(maxsize=4096)
+def _infer_contract_type_cached(ev_key: Tuple[str, ...], strategy: str) -> str:
+    ev = set(ev_key)
     if "tool" in ev:              return "tool_override"
     if "role" in ev:              return "role_takeover"
     if "result_slot" in ev:       return "slot_override"
@@ -2177,7 +2156,13 @@ def infer_contract_type(spec: AttackSpec) -> str:
     if "loop_state_drift" in ev:  return "loop_drift"
     if "reward_field" in ev or "reward_channel" in ev:
                                   return "reward_hacking"
-    return spec.strategy  # 回退
+    return strategy
+
+
+def infer_contract_type(spec: AttackSpec) -> str:
+    strategy = str(getattr(spec, "strategy", "format_anchor") or "format_anchor")
+    ev_key = tuple(sorted(spec.evidence or []))
+    return _infer_contract_type_cached(ev_key, strategy)
 
 
 # ---------- 9) 生成一批样本（含覆盖预算/重试） ----------
@@ -2202,23 +2187,132 @@ def generate_batch(
     """
     rnd = random.Random(seed)
     out, coverage = [], {}
+    seen_signatures: Set[str] = set()
     by_combo = defaultdict(int)
     by_mech = defaultdict(int)
     by_cfam = defaultdict(int)
     seen_cfam = set()
     fail_by_combo = defaultdict(lambda: defaultdict(int))
-    global_texts = []
+    signature_cache = {}
+    combo_texts = defaultdict(list)
+    combo_ngrams = defaultdict(list)
+    dedupe_combo: Dict[Tuple, Deduper] = {}
+    dedupe_mech: Dict[Tuple, Deduper] = {}
+    dedupe_style: Dict[Tuple, Deduper] = {}
+
+    sim_bits = 64
+    near_dup_thr = float((pin or {}).get("near_dup_thr", 0.92))
+    near_thr_local = min(near_dup_thr, 0.88)
+    vec_thr = float((pin or {}).get("near_dup_vec_thr", 0.93))
+    jacc_thr = float((pin or {}).get("near_dup_ngram_thr", 0.88))
+    global_sim_thr = float((pin or {}).get("near_dup_global_sim_thr", 0.95))
+    global_jacc_thr = float((pin or {}).get("near_dup_global_ngram_thr", 0.90))
+
+    def _dedupe_normalize(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").lower()).strip()
+
+    def _simhash_dist_for(similarity: float) -> int:
+        similarity = max(0.0, min(1.0, similarity))
+        return max(0, int(math.floor((1.0 - similarity) * sim_bits)))
+
+    local_sim_thresh = _simhash_dist_for(near_thr_local)
+    global_sim_thresh = _simhash_dist_for(global_sim_thr)
+    vec_dim_local = 1024 if vec_thr < 0.999 else 0
+
+    dedupe_template = Deduper(
+        sim_bits=sim_bits,
+        sim_thresh=local_sim_thresh,
+        k=3,
+        n_hash=64,
+        bands=16,
+        jaccard_thresh=jacc_thr,
+        vec_dim=vec_dim_local,
+        cosine_thresh=vec_thr,
+        normalizer=_dedupe_normalize,
+    )
+
+    def _make_local_deduper() -> Deduper:
+        return Deduper(
+            sim_bits=sim_bits,
+            sim_thresh=local_sim_thresh,
+            k=3,
+            n_hash=64,
+            bands=16,
+            jaccard_thresh=jacc_thr,
+            vec_dim=vec_dim_local,
+            cosine_thresh=vec_thr,
+            normalizer=_dedupe_normalize,
+        )
+
+    dedupe_global = Deduper(
+        sim_bits=sim_bits,
+        sim_thresh=global_sim_thresh,
+        k=3,
+        n_hash=64,
+        bands=16,
+        jaccard_thresh=global_jacc_thr,
+        vec_dim=0,
+        cosine_thresh=1.0,
+        normalizer=_dedupe_normalize,
+    )
+
+    reason_map_local = {
+        "simhash": "semantic_near_dup",
+        "jaccard": "semantic_ngram_near_dup",
+        "cosine": "semantic_vec_near_dup",
+        "external": "semantic_vec_near_dup",
+    }
+    reason_map_global = {
+        "simhash": "semantic_global_near_dup",
+        "jaccard": "semantic_global_ngram_near_dup",
+        "cosine": "semantic_global_vec_near_dup",
+        "external": "semantic_global_vec_near_dup",
+    }
+
+    def _snapshot_record(rec: DedupeRecord) -> Dict[str, object]:
+        mh = rec.minhash
+        if hasattr(mh, "hashvalues"):
+            try:
+                minhash_snapshot = tuple(int(x) for x in mh.hashvalues)  # type: ignore[attr-defined]
+            except Exception:
+                minhash_snapshot = ()
+        else:
+            try:
+                minhash_snapshot = tuple(int(x) for x in mh)
+            except TypeError:
+                try:
+                    minhash_snapshot = tuple(int(x) for x in list(mh))  # type: ignore[arg-type]
+                except Exception:
+                    minhash_snapshot = ()
+        return {
+            "normalized": rec.normalized,
+            "simhash": rec.simhash,
+            "minhash": minhash_snapshot,
+            "shingles": frozenset(rec.shingles),
+            "vector": tuple(rec.vector) if rec.vector else None,
+        }
     audit_cb = audit_cb or (lambda *a, **k: None)
     cjk_ratio_fn = cjk_ratio_fn or cjk_share
     soft_counts_hist = defaultdict(int)          # {命中种数: 样本数}
     soft_kinds_totals = defaultdict(int)         # {软证据类别: 频次}
     soft_used_by_ev = defaultdict(int)           # {证据ev: 使用软证据通过的次数}
-    max_nohit_attempts = int((pin or {}).get("max_nohit_attempts", 20))
+    max_nohit_attempts = max(1, int((pin or {}).get("max_nohit_attempts", 20)))
+    default_block_threshold = max(1, max_nohit_attempts // 2)
+    block_fail_threshold = int((pin or {}).get("combo_block_threshold", default_block_threshold))
+    block_fail_threshold = max(1, min(block_fail_threshold, max_nohit_attempts))
     attempts_per_combo = defaultdict(int)
     success_per_combo  = defaultdict(int)
     blocked_combos = set()
+    combo_cache: Dict[Tuple, Tuple] = {}
+    ev_family_cache: Dict[Tuple[str, ...], str] = {}
+    contract_cache: Dict[Tuple[Tuple[str, ...], str], str] = {}
     def combo_key(meta: dict) -> Tuple:
-        return tuple(meta[a] for a in coverage_axes)
+        key = tuple(meta[a] for a in coverage_axes)
+        cached = combo_cache.get(key)
+        if cached is None:
+            combo_cache[key] = key
+            return key
+        return cached
 
     tries, max_tries = 0, max(n * 80, 2000)
     want_axes = list(coverage_axes)
@@ -2237,9 +2331,15 @@ def generate_batch(
         
 
         spec = sample_spec(seed=rnd.randint(0, 1<<30), pin={**(pin or {}), **pin_dyn})
-        if "ev_bucket" in pin_dyn and pin_dyn["ev_bucket"] != bucket_hash(spec.evidence):
+        ev_bucket = bucket_hash(spec.evidence)
+        if "ev_bucket" in pin_dyn and pin_dyn["ev_bucket"] != ev_bucket:
             continue
-        if "ev_family" in pin_dyn and pin_dyn["ev_family"] != "|".join(sorted(evidence_families(spec.evidence))):
+        ev_key = tuple(sorted(spec.evidence or []))
+        fam_sig = ev_family_cache.get(ev_key)
+        if fam_sig is None:
+            fam_sig = "|".join(sorted(evidence_families(spec.evidence)))
+            ev_family_cache[ev_key] = fam_sig
+        if "ev_family" in pin_dyn and pin_dyn["ev_family"] != fam_sig:
             continue
         alias_p_cn = float((pin or {}).get("alias_p_cn", 0.70))
         spec._alias_p_cn = alias_p_cn
@@ -2266,7 +2366,11 @@ def generate_batch(
         spec.constraints = dict(getattr(spec, "constraints", {}), anchor_free=bool(anchor_free), anchor_free_soft_min_hits=soft_min)
         renderer = CARRIER_RENDER.get(spec.carrier)
         renderer_missing = False
-        fam_sig = "|".join(sorted(evidence_families(spec.evidence)))
+        strategy_key = str(getattr(spec, "strategy", "format_anchor") or "format_anchor")
+        contract_type = contract_cache.get((ev_key, strategy_key))
+        if contract_type is None:
+            contract_type = _infer_contract_type_cached(ev_key, strategy_key)
+            contract_cache[(ev_key, strategy_key)] = contract_type
         meta_tmp = {
             "strategy": spec.strategy,
             "channel":  spec.channel,
@@ -2274,16 +2378,16 @@ def generate_batch(
             "delivery": spec.delivery,
             "anchor_free": int(anchor_free),
             "ev_family": fam_sig,
-            "ev_bucket": bucket_hash(spec.evidence),
+            "ev_bucket": ev_bucket,
             "appearance": ("openpi" if str(spec.strategy).startswith('openpi_') else 'normal'),
-            "contract_type": infer_contract_type(spec),
+            "contract_type": contract_type,
         }
         key_tmp = combo_key(meta_tmp)
         # —— 网格可达性短路 —— 
         if key_tmp in blocked_combos:
             fail_by_combo[key_tmp]["blocked"] += 1
             attempts_per_combo[key_tmp] += 1
-            if attempts_per_combo[key_tmp] >= max_nohit_attempts and success_per_combo.get(key_tmp, 0) == 0:
+            if attempts_per_combo[key_tmp] >= block_fail_threshold and success_per_combo.get(key_tmp, 0) == 0:
                 blocked_combos.add(key_tmp)
             continue
         if not renderer:
@@ -2291,7 +2395,7 @@ def generate_batch(
             renderer_missing = True
             fail_by_combo[key_tmp]["missing_renderer"] += 1
             attempts_per_combo[key_tmp] += 1
-            if attempts_per_combo[key_tmp] >= max_nohit_attempts and success_per_combo.get(key_tmp, 0) == 0:
+            if attempts_per_combo[key_tmp] >= block_fail_threshold and success_per_combo.get(key_tmp, 0) == 0:
                 blocked_combos.add(key_tmp)
             continue
         core = renderer(spec, anchors, structural=structural, anchor_free=anchor_free)
@@ -2375,7 +2479,7 @@ def generate_batch(
                                 for r in _fails4:
                                     fail_by_combo[key_tmp][r] += 1
                                 attempts_per_combo[key_tmp] += 1
-                                if attempts_per_combo[key_tmp] >= max_nohit_attempts and success_per_combo.get(key_tmp, 0) == 0:
+                                if attempts_per_combo[key_tmp] >= block_fail_threshold and success_per_combo.get(key_tmp, 0) == 0:
                                     blocked_combos.add(key_tmp)
                                 continue
                         else:
@@ -2411,9 +2515,9 @@ def generate_batch(
             "rewrite": {"sinicize": int(_applied_sinicize), "struct_cn": int(_applied_struct_cn), "alias": int(_applied_alias)},
             "anchor_free": int(anchor_free),
             "ev_family": fam_sig,
-            "ev_bucket": bucket_hash(spec.evidence),
+            "ev_bucket": ev_bucket,
             "alias_p_cn": float(getattr(spec, "_alias_p_cn", float((pin or {}).get("alias_p_cn", 0.70)))),  # 审计用
-            "contract_type": infer_contract_type(spec),
+            "contract_type": contract_type,
             "appearance": ("openpi" if str(spec.strategy).startswith('openpi_') else 'normal'),
             # Style axes for audit
             "speech_family": getattr(spec, "speech_family", "formal"),
@@ -2434,129 +2538,61 @@ def generate_batch(
         sig = semantic_signature(spec, txt)
         mech_key = (meta.get("contract_type"), meta.get("ev_bucket"), meta.get("channel"), meta.get("delivery"))
 
-        if sig in coverage and by_combo[key] >= min_per_combo:
+        if sig in seen_signatures and by_combo[key] >= min_per_combo:
             audit_cb("dup_signature", {"combo": str(key), "sig": sig})
             fail_by_combo[key]["dup_signature"] += 1
             attempts_per_combo[key_tmp] += 1
-            if attempts_per_combo[key_tmp] >= max_nohit_attempts and success_per_combo.get(key_tmp, 0) == 0:
+            if attempts_per_combo[key_tmp] >= block_fail_threshold and success_per_combo.get(key_tmp, 0) == 0:
                 blocked_combos.add(key_tmp)
             continue
 
-        near_thr = float((pin or {}).get("near_dup_thr", 0.92))
-        # --- Weighted SimHash (char+bigram), fast cached impl ---
-        def _simhash_weighted(s: str, bits: int = 64) -> int:
-            return _simhash_weighted_fast(s, bits)
-        def _hamm(a: int, b: int) -> int:
-            if _dc_hamming_dist is not None:
-                try:
-                    return int(_dc_hamming_dist(int(a), int(b)))
-                except Exception:
-                    pass
-            x = a ^ b
-            try:
-                return x.bit_count()
-            except Exception:
-                return bin(x).count("1")
-        def _sim(a: str, b: str) -> float:
-            x=_simhash_weighted(a); y=_simhash_weighted(b)
-            return 1.0 - _hamm(x,y)/64.0
-        def _same_mech(rm):
-            m = rm.get("meta", {}) or {}
-            return (
-                (m.get("contract_type"), m.get("ev_bucket"), m.get("channel"), m.get("delivery"))
-                == (meta.get("contract_type"), meta.get("ev_bucket"), meta.get("channel"), meta.get("delivery"))
-            )
-        def _same_style_mech(rm):
-            m = rm.get("meta", {}) or {}
-            return (m.get("contract_type"), m.get("ev_family"), m.get("speech_family")) == \
-                   (meta.get("contract_type"), meta.get("ev_family"), getattr(spec,'speech_family','formal'))
-        existing_texts = [r["text"] for r in out if (combo_key(r.get("meta", {})) == key) or _same_mech(r) or _same_style_mech(r)]
-        if existing_texts:
-            sims = [_sim(txt, t0) for t0 in existing_texts]
-            near_thr_local = min(float((pin or {}).get("near_dup_thr", 0.92)), 0.88)
-            if max(sims) >= near_thr_local:
-                audit_cb("semantic_near_dup", {"combo": str(key), "max_sim": max(sims)})
-                fail_by_combo[key]["semantic_near_dup"] += 1
-                attempts_per_combo[key_tmp] += 1
-                if attempts_per_combo[key_tmp] >= max_nohit_attempts and success_per_combo.get(key_tmp, 0) == 0:
-                    blocked_combos.add(key_tmp)
-                continue
-        # Additional vector-like view: hashed 5-gram sparse cosine
-        def _sketch_5gram(s: str, buckets: int = 1<<18) -> Dict[int, float]:
-            return _sketch_5gram_fast(s, buckets)
-        def _cos_sparse(a: Dict[int,float], b: Dict[int,float]) -> float:
-            if len(a) > len(b): a, b = b, a
-            return sum(val * b.get(k, 0.0) for k, val in a.items())
-        vec_thr = float((pin or {}).get("near_dup_vec_thr", 0.93))
-        if existing_texts:
-            v_this = _sketch_5gram(txt)
-            cosmax = 0.0
-            for t0 in existing_texts:
-                c = _cos_sparse(v_this, _sketch_5gram(t0))
-                if c > cosmax: cosmax = c
-            if cosmax >= vec_thr:
-                audit_cb("semantic_vec_near_dup", {"combo": str(key), "max_cos": cosmax})
-                fail_by_combo[key]["semantic_vec_near_dup"] += 1
-                attempts_per_combo[key_tmp] += 1
-                if attempts_per_combo[key_tmp] >= max_nohit_attempts and success_per_combo.get(key_tmp, 0) == 0:
-                    blocked_combos.add(key_tmp)
-                continue
-        # —— 第二视角：字符 3-gram Jaccard 相似度（可选再叠加 MinHash LSH） —— 
-        # 与 SimHash 互补，能更好捕捉中文改写但语义雷同的近邻
-        def _char_ngrams(s: str, n: int = 3) -> set:
-            s = re.sub(r"\s+", " ", s or "")
-            L = len(s)
-            if L < n:
-                return {s} if s else set()
-            return { s[i:i+n] for i in range(0, L - n + 1) }
+        style_key = (
+            meta.get("contract_type"),
+            meta.get("ev_family"),
+            meta.get("speech_family", getattr(spec, "speech_family", "formal")),
+        )
+        primary_record: DedupeRecord = dedupe_template.prepare(txt)
+        dedupe_pending: List[Tuple[Deduper, DedupeRecord]] = []
 
-        if existing_texts:
-            this = _char_ngrams(txt, 3)
-            jacc_thr = float((pin or {}).get("near_dup_ngram_thr", 0.88))
-            jaccs = []
-            for t0 in existing_texts:
-                base = _char_ngrams(t0, 3)
-                inter = len(this & base)
-                union = max(1, len(this | base))
-                jacc = inter / union
-                jaccs.append(jacc)
-            if jaccs and max(jaccs) >= jacc_thr:
-                audit_cb("semantic_ngram_near_dup", {"combo": str(key), "max_jacc": max(jaccs)})
-                fail_by_combo[key]["semantic_ngram_near_dup"] += 1
-                attempts_per_combo[key_tmp] += 1
-                if attempts_per_combo[key_tmp] >= max_nohit_attempts and success_per_combo.get(key_tmp, 0) == 0:
-                    blocked_combos.add(key_tmp)
-                continue
+        def _register_dup(reason_key: str) -> None:
+            audit_cb(reason_key, {"combo": str(key)})
+            fail_by_combo[key][reason_key] += 1
+            attempts_per_combo[key_tmp] += 1
+            if attempts_per_combo[key_tmp] >= block_fail_threshold and success_per_combo.get(key_tmp, 0) == 0:
+                blocked_combos.add(key_tmp)
 
-        if global_texts:  # 有历史样本才做
-            # 1) SimHash 近似（跨载体）
-            sim_thr_glob = float((pin or {}).get("near_dup_global_sim_thr", 0.95))
-            sims = []
-            for t0 in global_texts:
-                sims.append(_sim(txt, t0))
-            if sims and max(sims) >= sim_thr_glob:
-                audit_cb("semantic_global_near_dup", {"max_sim": max(sims)})
-                fail_by_combo[key]["semantic_global_near_dup"] += 1
-                attempts_per_combo[key_tmp] += 1
-                if attempts_per_combo[key_tmp] >= max_nohit_attempts and success_per_combo.get(key_tmp, 0) == 0:
-                    blocked_combos.add(key_tmp)
-                continue
+        def _check_with(deduper_obj: Deduper, reason_map: Dict[str, str]) -> bool:
+            ok, reason = deduper_obj.check_record(primary_record)
+            if not ok:
+                reason_name = reason_map.get(reason or "simhash", next(iter(reason_map.values())))
+                _register_dup(reason_name)
+                return False
+            dedupe_pending.append((deduper_obj, primary_record))
+            return True
 
-            # 2) 3-gram Jaccard（跨载体）
-            jacc_thr_glob = float((pin or {}).get("near_dup_global_ngram_thr", 0.90))
-            this = _char_ngrams(txt, 3)
-            jaccs = []
-            for t0 in global_texts:
-                base = _char_ngrams(t0, 3)
-                inter = len(this & base); union = max(1, len(this | base))
-                jaccs.append(inter / union)
-            if jaccs and max(jaccs) >= jacc_thr_glob:
-                audit_cb("semantic_global_ngram_near_dup", {"max_jacc": max(jaccs)})
-                fail_by_combo[key]["semantic_global_ngram_near_dup"] += 1
-                attempts_per_combo[key_tmp] += 1
-                if attempts_per_combo[key_tmp] >= max_nohit_attempts and success_per_combo.get(key_tmp, 0) == 0:
-                    blocked_combos.add(key_tmp)
-                continue
+        combo_ded = dedupe_combo.get(key)
+        if combo_ded is None:
+            combo_ded = _make_local_deduper()
+            dedupe_combo[key] = combo_ded
+        if not _check_with(combo_ded, reason_map_local):
+            continue
+
+        mech_ded = dedupe_mech.get(mech_key)
+        if mech_ded is None:
+            mech_ded = _make_local_deduper()
+            dedupe_mech[mech_key] = mech_ded
+        if not _check_with(mech_ded, reason_map_local):
+            continue
+
+        style_ded = dedupe_style.get(style_key)
+        if style_ded is None:
+            style_ded = _make_local_deduper()
+            dedupe_style[style_key] = style_ded
+        if not _check_with(style_ded, reason_map_local):
+            continue
+
+        if not _check_with(dedupe_global, reason_map_global):
+            continue
 
         # 优先填满每个组合的最低覆盖
         need_combo = (min_per_combo > 0 and by_combo[key] < min_per_combo)
@@ -2586,19 +2622,24 @@ def generate_batch(
 
         if not can_accept:
             attempts_per_combo[key_tmp] += 1
-            if attempts_per_combo[key_tmp] >= max_nohit_attempts and success_per_combo.get(key_tmp, 0) == 0:
+            if attempts_per_combo[key_tmp] >= block_fail_threshold and success_per_combo.get(key_tmp, 0) == 0:
                 blocked_combos.add(key_tmp)
             continue
         final_txt = strip_anchors(txt)
-        coverage[sig] = 1
+        seen_signatures.add(sig)
         success_per_combo[key] += 1
         by_mech[mech_key] += 1
         out.append({"text": final_txt, "label": 1, "meta": meta})
         soft_counts_hist[len(mech.get("soft_kinds", []))] += 1
         for k in mech.get("soft_kinds", []): soft_kinds_totals[k] += 1
         for ev in mech.get("used_soft_for", []): soft_used_by_ev[ev] += 1
-        # 把“写盘态”的无锚文本加入全局去重池
-        global_texts.append(final_txt)
+
+        for deduper_obj, record_obj in dedupe_pending:
+            deduper_obj.add_record(record_obj)
+
+        combo_texts[key].append(final_txt)
+        combo_ngrams[key].append(frozenset(primary_record.shingles))
+        signature_cache[final_txt] = _snapshot_record(primary_record)
 
         by_combo[key] += 1
         for fam in (evidence_families(spec.evidence) or ["_none"]):
@@ -2617,7 +2658,7 @@ def generate_batch(
     missing_total = sum(v.get("missing_renderer", 0) for v in fail_by_combo.values())
     report = {
         "num": len(out),
-        "coverage_signatures": len(coverage),
+        "coverage_signatures": len(seen_signatures),
         "by_strategy": count_by(out, lambda x: x["meta"]["strategy"]),
         "by_channel":  count_by(out, lambda x: x["meta"]["channel"]),
         "by_carrier":  count_by(out, lambda x: x["meta"]["carrier"]),
@@ -2659,6 +2700,10 @@ def generate_batch(
         "success_per_combo":  {str(k): v for k, v in success_per_combo.items()},
         "renderer_missing_count": int(missing_total),
         "renderer_missing_rate": (missing_total / max(1, tries)),
+        "dedupe_cache_stats": {
+            "combo_groups": len(combo_texts),
+            "signature_cache_entries": len(signature_cache),
+        },
     }
     return out, report
 
@@ -2719,4 +2764,5 @@ def generate_same_mech_multistyle(n_per: int = 8, mech_pin: Optional[Dict] = Non
         )
         outs += batch; reports.append(rep)
     return outs, reports
+
 
