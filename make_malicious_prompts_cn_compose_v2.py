@@ -1414,14 +1414,12 @@ EXTRA_CONTAINERS = [
 ]
 
 # ------------------ Target task pool // 任务上下文池 ------------------
-def try_load(name: str, kwargs: Dict[str, Any], hf_rev: Optional[str]=None, cache_dir: Optional[str] = None) -> Optional[DatasetDict]:
+def try_load(name: str, kwargs: Dict[str, Any], hf_rev: Optional[str]=None) -> Optional[DatasetDict]:
     if load_dataset is None:
         return None
     key = (name, kwargs.get("name"))
     params = dict(kwargs)
     params.update({"revision": (hf_rev or PIN_REV.get(key, {}).get("revision") or "main")})
-    if cache_dir:
-        params["cache_dir"] = cache_dir
     try:
         return load_dataset(name, **params)
     except Exception as e:
@@ -1439,15 +1437,15 @@ def _auto_io_workers() -> int:
     return auto
 
 
-def _load_many_datasets(specs: List[Tuple[str, Dict[str, Any]]], hf_rev: Optional[str], cache_dir: Optional[str], workers: int) -> List[Tuple[Tuple[str, Dict[str, Any]], Optional[DatasetDict]]]:
+def _load_many_datasets(specs: List[Tuple[str, Dict[str, Any]]], hf_rev: Optional[str], workers: int) -> List[Tuple[Tuple[str, Dict[str, Any]], Optional[DatasetDict]]]:
     results: Dict[Tuple[str, Tuple[Tuple[str, Any], ...]], Optional[DatasetDict]] = {}
     workers = int(workers or 0)
     if workers <= 1:
         for name, kw in specs:
-            results[(name, tuple(sorted(kw.items())))] = try_load(name, kw, hf_rev=hf_rev, cache_dir=cache_dir)
+            results[(name, tuple(sorted(kw.items())))] = try_load(name, kw, hf_rev=hf_rev)
         return [((name, kw), results.get((name, tuple(sorted(kw.items()))))) for name, kw in specs]
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        future_map = {ex.submit(try_load, name, kw, hf_rev, cache_dir): (name, kw) for name, kw in specs}
+        future_map = {ex.submit(try_load, name, kw, hf_rev): (name, kw) for name, kw in specs}
         for fut in as_completed(future_map):
             name, kw = future_map[fut]
             key = (name, tuple(sorted(kw.items())))
@@ -1650,7 +1648,7 @@ def _yield_text_fields(row: Dict[str, Any]) -> Iterable[str]:
         if isinstance(v, str) and len(v.strip())>0:
             yield v
 def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]=None,
-                      workers: int = -1, cache_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+                      workers: int = -1) -> List[Dict[str, Any]]:
     """Random benign tasks from diverse CN corpora. Supports optional concurrent loading.
     // 从多中文语料随机构建良性任务池，可选择并行加载。"""
     random.seed(seed)
@@ -1677,11 +1675,11 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
 
     # --- Classic CLUE style tasks // 经典 CLUE 任务 ---
     classic_specs = [("C-MTEB/LCQMC", {}), ("C-MTEB/AFQMC", {})]
-    for (name, kw), ds in _load_many_datasets(classic_specs, hf_rev, cache_dir, loader_workers):
+    for (name, kw), ds in _load_many_datasets(classic_specs, hf_rev, loader_workers):
         if ds is None and name == "C-MTEB/LCQMC":
-            ds = try_load("mteb/LCQMC", {}, hf_rev=hf_rev, cache_dir=cache_dir)
+            ds = try_load("mteb/LCQMC", {}, hf_rev=hf_rev)
         if ds is None and name == "C-MTEB/AFQMC":
-            ds = try_load("clue", {"name": "afqmc"}, hf_rev=hf_rev, cache_dir=cache_dir)
+            ds = try_load("clue", {"name": "afqmc"}, hf_rev=hf_rev)
         if not ds:
             continue
         for r, _ in _iter_dataset(ds, f"classic-{name}"):
@@ -1694,7 +1692,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
                 continue
             pool.append({"task":"similarity","prompt":f"判断两句话是否表达同一含义，仅答“是/否”。\n句子A：{a}\n句子B：{b}"})
     for sub in ["ocnli","cmnli"]:
-        ds = try_load("clue", {"name": sub}, hf_rev=hf_rev, cache_dir=cache_dir)
+        ds = try_load("clue", {"name": sub}, hf_rev=hf_rev)
         if not ds:
             continue
         for r, _ in _iter_dataset(ds, f"nli-{sub}"):
@@ -1708,7 +1706,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
             pool.append({"task":"nli","prompt":f"判定前提与假设的关系：只答“蕴含/矛盾/中立”。\n前提：{p}\n假设：{h}"})
     # Sentiment (ChnSentiCorp): avoid script loaders; prefer parquet mirrors
     sentiment_specs = [("lansinuote/ChnSentiCorp", {})]
-    for (name, kw), ds in _load_many_datasets(sentiment_specs, hf_rev, cache_dir, loader_workers):
+    for (name, kw), ds in _load_many_datasets(sentiment_specs, hf_rev, loader_workers):
         if not ds:
             continue
         for r, _ in _iter_dataset(ds, f"sentiment-{name}"):
@@ -1721,7 +1719,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
             pool.append({"task":"sentiment","prompt":f"判断情感倾向，仅答“正/负”。\n{x}"})
     # LCSTS summarization
     lcsts_specs = [("hugcyp/LCSTS", {}), ("suolyer/lcsts", {})]
-    for (name, kw), ds in _load_many_datasets(lcsts_specs, hf_rev, cache_dir, loader_workers):
+    for (name, kw), ds in _load_many_datasets(lcsts_specs, hf_rev, loader_workers):
         if not ds:
             continue
         for r, _ in _iter_dataset(ds, f"lcsts-{name}"):
@@ -1734,7 +1732,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
             pool.append({"task":"summarization","prompt":f"请概括下文，生成≤30字摘要：\n{x}"})
     # --- Expanded domains // 扩展域 ---
     wiki_specs = [("wikimedia/wikipedia", {"name":"20231101.zh"}), ("shaowenchen/wiki_zh", {})]
-    for (name, kw), ds in _load_many_datasets(wiki_specs, hf_rev, cache_dir, loader_workers):
+    for (name, kw), ds in _load_many_datasets(wiki_specs, hf_rev, loader_workers):
         if not ds:
             continue
         for r, split in _iter_dataset(ds, f"wiki-{name}"):
@@ -1748,7 +1746,7 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
             pool.append({"task":"wiki_ents","prompt":f"从片段中抽取专有名词并以逗号分隔：\n{x}"})
     # Chinese tech/news/forum style corpora
     news_specs = [("SirlyDreamer/THUCNews", {})]
-    for (name, kw), ds in _load_many_datasets(news_specs, hf_rev=None, cache_dir=cache_dir, workers=loader_workers):
+    for (name, kw), ds in _load_many_datasets(news_specs, hf_rev=None, workers=loader_workers):
         if not ds:
             continue
         for r, _ in _iter_dataset(ds, f"news-{name}"):
@@ -4646,6 +4644,54 @@ def _topic_neg_producer_job(job: tuple[int, int]) -> dict:
     return {"cands": cands}
 
 
+class AdaptiveOversample:
+    """Adaptive oversampling controller that tunes multiplier from acceptance stats."""
+
+    def __init__(self, target: int, base_multiplier: float, auto: bool, *, min_multiplier: float = 2.0, max_multiplier: float = 6.0, update_interval: int = 40):
+        self.target = max(1, int(target))
+        self.enabled = bool(auto)
+        self.min_multiplier = max(1.0, float(min_multiplier))
+        self.max_multiplier = max(self.min_multiplier, float(max_multiplier))
+        self.current = max(1.0, float(base_multiplier))
+        if self.enabled:
+            self.current = max(self.min_multiplier, min(self.max_multiplier, self.current))
+        self.update_interval = max(10, int(update_interval))
+        self._last_update = 0
+
+    def current_multiplier(self) -> float:
+        return self.current
+
+    def current_target(self) -> int:
+        import math
+        return max(self.target, int(math.ceil(self.target * self.current)))
+
+    def max_attempts(self) -> int:
+        return max(20000, int(self.target * self.max_multiplier * 50))
+
+    def maybe_update(self, attempts: int, accepted: int, constraints_met: bool) -> bool:
+        if not self.enabled:
+            return False
+        if attempts - self._last_update < self.update_interval:
+            return False
+        self._last_update = attempts
+        if attempts <= 0:
+            return False
+        ratio = accepted / max(1, attempts)
+        ratio = max(ratio, 1e-3)
+        desired = 1.6 / ratio
+        desired = max(self.min_multiplier, min(self.max_multiplier, desired))
+        if not constraints_met and accepted >= self.target:
+            desired = min(self.max_multiplier, max(desired, self.min_multiplier + 1.0))
+        changed = False
+        if desired > self.current + 0.25:
+            self.current = min(self.max_multiplier, desired)
+            changed = True
+        elif constraints_met and accepted >= self.target and desired < self.current - 0.35:
+            self.current = max(self.min_multiplier, desired)
+            changed = True
+        return changed
+
+
 class AttackSelector:
     """Main-process selector applying dedupe and coverage constraints."""
 
@@ -4679,8 +4725,10 @@ class AttackSelector:
                  artifact_free_pos_ratio: float,
                  gate_semantic_injection: bool,
                  coverage_min_per_combo: int,
+                 target_n: int,
                  wanted: int,
-                 targets: List[Dict[str, Any]]):
+                 targets: List[Dict[str, Any]],
+                 adaptive: Optional[AdaptiveOversample] = None):
         self.seed = seed
         self.min_cjk_share = min_cjk_share
         self.min_cjk_share_auto = min_cjk_share_auto
@@ -4711,7 +4759,10 @@ class AttackSelector:
         self.stack_prob = stack_prob
         self.artifact_rate = artifact_rate
         self.artifact_free_pos_ratio = artifact_free_pos_ratio
-        self.wanted = wanted
+        self.target_n = max(1, int(target_n))
+        self.base_target = self.target_n
+        self.wanted = max(1, int(wanted))
+        self.adaptive = adaptive
         self.targets = targets
         self.cover = Counter()
         self.fam_count = Counter()
@@ -4724,6 +4775,21 @@ class AttackSelector:
         self.quota_stealth_high_min = 0
         self.quota_artifact_max = 0
 
+    def quotas_met(self) -> bool:
+        if len(self.cands) < self.target_n:
+            return False
+        if self.q_tool_override < self.quota_tool_override_min:
+            return False
+        if self.q_stealth_high < self.quota_stealth_high_min:
+            return False
+        if self.q_artifact > self.quota_artifact_max:
+            return False
+        if min_cov > 0:
+            for cnt in cover.values():
+                if cnt < min_cov:
+                    return False
+        return True
+
     def set_quotas(self, n: int):
         self.quota_tool_override_min = int(max(1, 0.10 * n))
         self.quota_stealth_high_min = int(max(1, 0.40 * n))
@@ -4733,16 +4799,43 @@ class AttackSelector:
         for reason, ctx in logs:
             audit_reject(reason, ctx or {})
 
+    def update_target(self, new_limit: int) -> None:
+        self.wanted = max(1, int(new_limit))
+
+    def _target_limit(self) -> int:
+        if self.adaptive:
+            return max(self.wanted, self.adaptive.current_target())
+        return self.wanted
+
+    def constraints_met(self) -> bool:
+        if len(self.cands) < self.target_n:
+            return False
+        if self.q_tool_override < self.quota_tool_override_min:
+            return False
+        if self.q_stealth_high < self.quota_stealth_high_min:
+            return False
+        if self.q_artifact > self.quota_artifact_max:
+            return False
+        if self.coverage_min_per_combo > 0:
+            for cnt in self.cover.values():
+                if cnt < self.coverage_min_per_combo:
+                    return False
+        return True
+
     def done(self) -> bool:
-        return len(self.cands) >= self.wanted
+        if len(self.cands) < self._target_limit():
+            return False
+        if self.adaptive and self.adaptive.enabled:
+            return self.constraints_met()
+        return True
 
     def process(self, packet: RenderPacket):
         if packet is None or self.done():
-            return
+            return False
         try:
             t = self.targets[packet.target_idx]
         except Exception:
-            return
+            return False
         contract = derive_task_contract(t["task"])
         dsl = PIDSL(
             intent=packet.mapped_intent,
@@ -4768,7 +4861,7 @@ class AttackSelector:
         if is_dup:
             audit_reject("near_duplicate", {"phase":"compose_pos", "sim": round(sim, 3), "pair_id": f"POS-{len(self.cands)+1:07d}", "text": text})
             if self.rng_global.random() > 0.02:
-                return
+                return False
         neighbor_admit(text)
 
         has_struct = bool(CODE_BLOCK_RE.search(text) or JSON_BLOCK_RE.search(text))
@@ -4780,11 +4873,11 @@ class AttackSelector:
         if policy == 'hard':
             if cur_share < target_min_cjk:
                 audit_reject("cjk_ratio", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-                return
+                return False
         elif policy == 'tiered':
             if cur_share < 0.35:
                 audit_reject("cjk_ratio_low", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-                return
+                return False
 
         if self.artifact_free_pos_ratio > 1e-9 and self.rng_global.random() < self.artifact_free_pos_ratio:
             text = placeholderless_mirror(text)
@@ -4810,31 +4903,31 @@ class AttackSelector:
         if (_cfg_local and bool(getattr(_cfg_local, 'require_side_effects', False))):
             if not _passes_side_effects(text):
                 audit_reject("side_effects_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-                return
+                return False
 
         if self.gate_semantic_injection:
             try:
                 ok_aud, _ = gate_injection_sample(text, mapped_intent, mapped_intent, contract, text, payload)
                 if not ok_aud:
                     audit_reject("semantic_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-                    return
+                    return False
             except Exception as e:
                 audit_reject("semantic_gate_error", {
                     "err": str(e), "task": t.get("task","_"),
                     "family": fam_name, "intent": mapped_intent
                 })
-                return
+                return False
 
         if not deduper_accept_normalized(self.deduper, text, preserve_carrier=self.dedupe_preserve_carrier):
             audit_reject("dedup", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-            return
+            return False
         if self.fam_count[fam_name] >= self.family_cap:
             audit_reject("family_cap", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-            return
+            return False
 
         if self.gate_semantic_injection and not _ok_diag:
             audit_reject("semantic_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-            return
+            return False
 
         pair_id = f"P{len(self.cands)+1:07d}"
         rng_pair = stable_rng("pos_pair", self.seed, pair_id)
@@ -4873,16 +4966,16 @@ class AttackSelector:
                     audit_reject("semantic_gate_after_artifact", {
                         "task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": pair_id
                     })
-                    return
+                    return False
                 _ok_diag = _ok_diag2
             except Exception as e:
                 audit_reject("semantic_gate_after_artifact_error", {"err": str(e), "pair_id": pair_id})
-                return
+                return False
 
         diag_pass = bool(_ok_diag)
         if not diag_pass:
             audit_reject("semantic_gate_failed", {"pair_id": pair_id, "intent": mapped_intent, "cats": vio})
-            return
+            return False
 
         gate_set = {s.strip() for s in str(getattr(args, "effect_gate_categories", "")).split(",")} - {"", "none"}
         if gate_set and (mapped_intent in gate_set):
@@ -4891,11 +4984,11 @@ class AttackSelector:
                 effect_pass = bool(eff.get("success", False))
                 if not effect_pass:
                     audit_reject("effect_gate_fail", {"intent": mapped_intent, "pair_id": pair_id})
-                    return
+                    return False
                 emeta = eff
             except Exception as e:
                 audit_reject("effect_gate_error", {"err": str(e), "intent": mapped_intent, "pair_id": pair_id})
-                return
+                return False
         else:
             effect_pass = False
             emeta = {"validator": "diagnostic", "cats": vio, "eval_info": {"engine": "none"}}
@@ -4924,7 +5017,7 @@ class AttackSelector:
         evidence_ok = True if artifact_free_applied else _evidence_profile_ok(text, min_hits=2)
         if not evidence_ok:
             audit_reject("struct_evidence_needed", {"pair_id": pair_id, "intent": mapped_intent})
-            return
+            return False
 
         masked_applied = False
         if self.mask_on in ('both','pos'):
@@ -5003,7 +5096,7 @@ class AttackSelector:
                 take = False
                 audit_reject("artifact_quota", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
         if not take:
-            return
+            return False
 
         self.cover[cov_key] += 1
         if stealth_here == 'high':
@@ -5074,13 +5167,16 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
     # unify effective knobs with CLI defaults
     disc_rate = _effective_disc_rate(disc_rate)
     artifact_free_pos_ratio = _effective_artifact_free_pos_ratio(artifact_free_pos_ratio)
-    wanted = n * max(1, oversample_mult)
+    auto_oversample = oversample_mult <= 0
+    base_multiplier = float(oversample_mult if oversample_mult > 0 else 3)
+    oversample_ctl = AdaptiveOversample(target=n, base_multiplier=base_multiplier, auto=auto_oversample)
+    wanted = oversample_ctl.current_target()
     cands = []; fam_count = Counter()
     # 覆盖控制：(intent, delivery, carrier) 的最小覆盖数
     min_cov = max(0, int(coverage_min_per_combo or 0))
     cover = Counter()
     attempts = 0
-    max_attempts = max(20000, wanted * 50)
+    max_attempts = oversample_ctl.max_attempts()
 
     goal_keys  = list(GOAL_WEIGHTS.keys())
     # Quota hints (approximate target counts)
@@ -5091,7 +5187,14 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
     q_stealth_high  = 0
     q_artifact      = 0
 
-    while len(cands) < wanted and target_pool and attempts < max_attempts:
+    while target_pool and attempts < max_attempts:
+        if len(cands) >= wanted:
+            if not auto_oversample or quotas_met():
+                break
+        if oversample_ctl.maybe_update(attempts, len(cands), quotas_met()):
+            wanted = oversample_ctl.current_target()
+            max_attempts = oversample_ctl.max_attempts()
+            continue
         attempts += 1
         t = random.choice(target_pool)
         contract = derive_task_contract(t["task"])
@@ -5502,7 +5605,8 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     workers: int = 0,
                     producer_batch: int = 128) -> List[Dict[str,Any]]:
     workers = int(workers or 0)
-    if workers <= 1:
+    # 1 = serial; 0 or >=2 => parallel with auto-tuning
+    if workers == 1:
         return _compose_attacks_serial(
             target_pool, n, seed, min_cjk_share, min_cjk_share_auto,
             oversample_mult, deduper, family_cap, artifact_rate,
@@ -5522,9 +5626,13 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
 
     workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
 
+    auto_oversample = oversample_mult <= 0
+    base_multiplier = float(oversample_mult if oversample_mult > 0 else 3)
+    oversample_ctl = AdaptiveOversample(target=n, base_multiplier=base_multiplier, auto=auto_oversample)
+
     disc_rate_eff = _effective_disc_rate(disc_rate)
     artifact_free_pos_ratio_eff = _effective_artifact_free_pos_ratio(artifact_free_pos_ratio)
-    wanted = n * max(1, oversample_mult)
+    wanted = oversample_ctl.current_target()
     selector = AttackSelector(
         seed=seed,
         min_cjk_share=min_cjk_share,
@@ -5555,8 +5663,10 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
         artifact_free_pos_ratio=artifact_free_pos_ratio_eff,
         gate_semantic_injection=gate_semantic_injection,
         coverage_min_per_combo=coverage_min_per_combo,
+        target_n=n,
         wanted=wanted,
         targets=target_pool,
+        adaptive=oversample_ctl,
     )
     selector.set_quotas(n)
 
@@ -5620,6 +5730,10 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     attempts += 1
                     if cand is not None:
                         selector.process(cand)
+                    quota_ok = selector.constraints_met()
+                    if oversample_ctl.maybe_update(attempts, len(selector.cands), quota_ok):
+                        selector.update_target(oversample_ctl.current_target())
+                        max_attempts = oversample_ctl.max_attempts()
                     if selector.done() or attempts >= max_attempts:
                         raise StopIteration
         except StopIteration:
@@ -5856,7 +5970,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
                       workers: int = 0,
                       producer_batch: int = 128) -> List[Dict[str,Any]]:
     workers = int(workers or 0)
-    if workers <= 1:
+    if workers == 1:
         return _compose_hard_negs_serial(
             target_pool, k, seed, min_cjk_share, min_cjk_share_auto,
             oversample_mult, deduper, family_cap,
@@ -6493,7 +6607,7 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
                                   workers: int = 0,
                                   producer_batch: int = 128) -> list[dict]:
     workers = int(workers or 0)
-    if workers <= 1:
+    if workers == 1:
         return _compose_topic_shift_negatives_serial(
             target_pool, k, seed, deduper,
             mask_format_features_rate=mask_format_features_rate,
@@ -6885,7 +6999,6 @@ def main():
     ap.add_argument("--hf_revision", default=None,
     help="Pin a global HF revision/commit for all datasets when possible. // 为所有数据集统一指定 revision/commit")
     ap.add_argument("--target_workers", type=int, default=-1, help="Concurrent loaders for build_target_pool (-1=auto, 0=serial). // 目标池加载并发进程数(-1=自动,0=串行)")
-    ap.add_argument("--hf_cache_dir", default=None, help="Optional cache directory for datasets.load_dataset. // datasets 缓存目录")
     ap.add_argument("--family_max_frac", type=float, default=0.06, help="Max fraction per family. // 每家族占比上限")
     ap.add_argument("--oversample_mult", type=int, default=4, help="Candidate oversampling multiplier (default=4, tune 3-4). // 候选过采样倍数")
     ap.add_argument("--mp_workers", type=int, default=0, help="Multiprocessing workers for candidate rendering (0=auto, 1=serial). // 候选渲染进程数（0 自动，1 串行）")
@@ -7161,8 +7274,7 @@ def main():
         target_pool = build_target_pool(
             seed=args.seed,
             hf_rev=args.hf_revision,
-            workers=args.target_workers,
-            cache_dir=args.hf_cache_dir
+            workers=args.target_workers
         )
     print("[target_pool]", len(target_pool))
     # Deduper instances // 去重器
