@@ -64,10 +64,9 @@ try:
 except Exception:
     _AnnoyIndex = None
 try:
-    from dsl_core import generate_batch, compile_from_yaml, invariant_result_slot
+    from dsl_core import generate_batch, invariant_result_slot
 except Exception:
     generate_batch = None
-    compile_from_yaml = None
     invariant_result_slot = None
 try:
     from dsl_core import _h64  # reuse token hash cache if available
@@ -7018,8 +7017,6 @@ def main():
     ap.add_argument("--require_side_effects", action="store_true", default=False, help="Require transferable side-effect evidence (tool/role/upstream/retriever/memory) for positives. // 正类需触发可迁移副作用")
     ap.add_argument("--se_votes", type=int, default=2, help="Side-effect consistency votes (>=1). // 副作用一致性投票次数")
     ap.add_argument("--use_dsl", action="store_true", default=False, help="Use state-machine/DSL generator for positives.")
-    ap.add_argument("--dsl_file", default=None, help="YAML file to pin/limit DSL fields (optional).")
-    ap.add_argument("--dsl_n", type=int, default=None, help="Override positive sample count for DSL generator; default = pos_n.")
     ap.add_argument("--mirror_placeholderless", type=float, default=0.40, help="Prob. to add a placeholderless mirror sample per row. // 生成去占位符镜像样本的概率")
     ap.add_argument("--effect_policy", default="whitebox_first_soft", choices=["whitebox_only","whitebox_first_soft","skip"], help="效果级校验策略：仅白盒/白盒优先（可软回退）/跳过。")
     ap.add_argument("--effect_fallback", default="none", choices=["none","anchors"], help="白盒失败或异常后的回退方式：无 / anchors（锚点族）。")
@@ -7248,10 +7245,7 @@ def main():
         if generate_batch is None:
             raise RuntimeError("dsl_core.py 未导入成功，无法使用 --use_dsl")
         pin = {}
-        if args.dsl_file:
-            with open(args.dsl_file, "r", encoding="utf-8") as f:
-                pin = compile_from_yaml(f.read())
-        dsl_n = (args.dsl_n or pos_n)
+        dsl_n = pos_n
         coverage_axes = ("strategy","channel","carrier","delivery",
                  "ev_family","ev_bucket","anchor_free","contract_type",
                  # style axes to avoid mono‑style bias

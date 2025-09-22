@@ -49,10 +49,6 @@ def _sketch_5gram_fast(s: str, buckets: int = 1 << 16) -> Dict[int, float]:
     vals /= norm
     return {int(k): float(v) for k, v in zip(uniq.tolist(), vals.tolist())}
 
-try:
-    import yaml  # pip install pyyaml
-except Exception:
-    yaml = None
 from enum import Enum
 from itertools import permutations
 
@@ -2713,30 +2709,6 @@ def count_by(items, key_fn):
         k = key_fn(it)
         d[k] = d.get(k,0)+1
     return d
-
-# ---------- 10) DSL（可选）：从 YAML 指定/约束，未给的字段由采样器补齐 ----------
-def compile_from_yaml(yaml_text: str) -> Dict:
-    """
-    Compile a partial pin configuration from YAML text.
-    从 YAML 文本编译生成用于采样的部分固定项。
-
-    - English: Extracts keys like strategy/channel/carrier/delivery/evidence
-      and min_cjk_share; other fields remain sampled.
-    - 中文：提取 strategy/channel/carrier/delivery/evidence 与 min_cjk_share；其余
-      字段仍由采样器补全。
-    """
-    if not yaml:
-        raise RuntimeError("PyYAML not installed: pip install pyyaml / 未安装 PyYAML：请运行 pip install pyyaml")
-    cfg = yaml.safe_load(yaml_text)
-    pin = {}
-    for k in [
-        "strategy","channel","carrier","delivery","evidence","min_cjk_share",
-        # 支持风格/语域轴 pin
-        "speech_family","register","region","industry","persona"
-    ]:
-        if k in cfg:
-            pin[k] = cfg[k]
-    return pin
 
 # ===== Multi-style grid for same mechanism =====
 def generate_same_mech_multistyle(n_per: int = 8, mech_pin: Optional[Dict] = None, seed: int = 13):
