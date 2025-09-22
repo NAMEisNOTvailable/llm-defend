@@ -568,7 +568,6 @@ class TaskContract:
     forbid_structured: bool = True  # 对分类/摘要类任务，禁止强制 JSON/表格等结构化外壳
     allow_rag_carrier: bool = False  # 允许 front-matter / data-* / md-ref 等载体存在
     # 额外策略开关（可由 CLI 覆盖）
-    memory_mutable: bool = False
     comment: str = ""
 def derive_task_contract(task: str) -> TaskContract:
     # 根据任务类型产出“可机判”的代理合约：不仅是输出格式，也约束工具/RAG/权限
@@ -611,16 +610,8 @@ def derive_task_contract(task: str) -> TaskContract:
     # 覆盖 CLI 策略（若存在）
     try:
         if 'args' in globals():
-            if getattr(args, 'allowed_tools', None):
-                tools = set([x.strip() for x in args.allowed_tools.split(',') if x.strip()])
-                c.forbid_tool = False
-                c.allowed_tools = tools
-            if getattr(args, 'allow_structured', False):
-                c.forbid_structured = False
             if getattr(args, 'allow_rag_mutation', False):
                 c.allow_rag_carrier = True
-            if getattr(args, 'allow_memory_mutation', False):
-                c.memory_mutable = True
     except Exception as e:
         audit_reject("contract_derive_error", {"phase":"contract", "err": e, "task": task})
     return c
@@ -1769,47 +1760,6 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
 
     random.shuffle(pool)
     return pool
-
-# --------- Real-world negatives (product-like normative texts) ---------
-def compose_realworld_negatives(sources: str, k: int, seed: int, deduper: Deduper,
-                                dedupe_preserve_carrier: bool = True) -> list[dict]:
-    out = []
-    if not sources:
-        return out
-    rng = random.Random(seed + 2025)
-    # Reuse external corpora iterator; project to in_context shape; treat all as negatives
-    try:
-        for raw in iter_external_corpora(sources, lang='zh', total=int(k*2), seed=seed):
-            if len(out) >= k: break
-            txt = raw.get('text','')
-            if not isinstance(txt, str) or len(txt.strip()) < 20:
-                continue
-            # Keep as-is with minimal noise; avoid structure wrappers/disclaimers
-            t = normalize(inject_unicode_noise(inject_noise_light(txt), p=0.04))
-            # Dedup/Near-dup gate
-            if not deduper_accept_normalized(deduper, t, preserve_carrier=dedupe_preserve_carrier):
-                continue
-            # Minimal benign gate: must not trip injection diagnostics
-            try:
-                contract_neg = derive_task_contract('wiki_summarize')
-                ok_diag, _ = gate_injection_sample(t, 'benign', 'benign', contract_neg, t, None)
-                if ok_diag:  # looks like injection; skip
-                    continue
-            except Exception:
-                pass
-            nbytes = byte_len(t); feats = feature_probe_clean(t)
-            ratio = cjk_latin_ratio(t); bins=[0.0,0.12,0.35,1.0]; b=0
-            for i in range(len(bins)-1):
-                if bins[i] <= ratio < bins[i+1]: b=i; break
-            out.append(dict(
-                text=t, label=0, task='realworld', hard_negative=True,
-                len=nbytes, len_bucket=length_bucket(nbytes), feats=feats,
-                latin_over_cjk=ratio, latin_over_cjk_bin=b,
-                family='realneg', delivery='single', intent='benign', carrier='none'
-            ))
-    except Exception as _e:
-        audit_reject('neg_real_sources_error', {'err': str(_e)})
-    return out
 
 def load_targets_offline(path: str) -> List[Dict[str,Any]]:
     """Load tasks from a local JSON/JSONL file. Expect objects with fields {task,prompt}."""
@@ -7071,24 +7021,9 @@ def main():
     ap.add_argument("--artifact_free_pos_ratio", type=float, default=0.50, help="Fraction of positive samples enforced to be artifact-free. // 正类无显词比例")
     ap.add_argument("--dry_run", action="store_true", default=False, help="Print full config fingerprint and write only stats files, without generating dataset.")
     ap.add_argument("--coverage_min_per_combo", type=int, default=3, help="Min rows per (intent,carrier,delivery); 0 disables hard check. // 覆盖下限")
-    ap.add_argument("--coverage_min_per_cfam", type=int, default=0, help="child quota per (carrier,evidence-family); 0 to disable. // 载体×证据家族子配额")
     ap.add_argument("--gate_semantic_injection", action="store_true", default=True, help="Hard gate positives by semantic/structural injection diagnostics. // 正类语义/结构硬门控")
     ap.add_argument("--require_side_effects", action="store_true", default=False, help="Require transferable side-effect evidence (tool/role/upstream/retriever/memory) for positives. // 正类需触发可迁移副作用")
-    # real-world negatives
-    ap.add_argument("--neg_real_sources", type=str, default="",
-                    help="Comma-separated external corpora to sample realistic negatives (non-injection product-like texts). // 真实世界负例来源")
-    ap.add_argument("--neg_real_ratio", type=float, default=0.0,
-                    help="Fraction of negatives to draw from real-world sources. 0 to disable. // 真实世界负例在负样本中的占比")
-    # leave-one-out evaluation protocol
-    ap.add_argument("--eval_leave_one", choices=["none","carrier","channel","style"], default="none",
-                    help="Leave-one-out eval protocol on dev/test (by carrier/channel/style). // 留一泛化评测")
-    ap.add_argument("--eval_leave_frac", type=float, default=0.15,
-                    help="Fraction of groups reserved for leave-one subsets. // 留一集占比")
     ap.add_argument("--se_votes", type=int, default=2, help="Side-effect consistency votes (>=1). // 副作用一致性投票次数")
-    ap.add_argument("--strict_mode", action="store_true", default=False, help="Enable strict reproducibility mode. // 严格复现模式")
-    ap.add_argument("--allowed_tools", default=None, help="Comma-separated allowed tool names; overrides task contract. // 允许工具列表")
-    ap.add_argument("--allow_structured", action="store_true", default=False, help="Allow structured outputs/carriers in contracts. // 允许结构化外观")
-    ap.add_argument("--allow_memory_mutation", action="store_true", default=False, help="Allow memory mutation across turns. // 允许记忆变更")
     ap.add_argument("--allow_rag_mutation", action="store_true", default=False, help="Allow RAG carrier mutations. // 允许 RAG 载体变更")
     ap.add_argument("--use_dsl", action="store_true", default=False, help="Use state-machine/DSL generator for positives.")
     ap.add_argument("--dsl_file", default=None, help="YAML file to pin/limit DSL fields (optional).")
@@ -7203,10 +7138,6 @@ def main():
             print("[reweight] warm-started from", weights_path)
     except Exception as e:
         print("[reweight][warn] failed to warm-start:", e)
-    # strict mode: require either offline targets or pinned HF revision
-    if args.strict_mode:
-        if not args.targets_json and not args.hf_revision:
-            raise SystemExit("strict_mode: require --hf_revision or --targets_json (offline).")
     # --- External evaluation branch (optional) // 外部评测分支（可选） ---
     if getattr(args, "ext_eval_sources", ""):
         try:
@@ -7343,7 +7274,6 @@ def main():
             pin=pin,
             coverage_axes=coverage_axes,
             min_per_combo=int(getattr(args, "coverage_min_per_combo", 0) or 0),
-            min_per_cfam=int(getattr(args, "coverage_min_per_cfam", 0) or 0),
         )
         pos_cands = []
         for s in dsl_samples:
@@ -7528,11 +7458,6 @@ def main():
         producer_batch=args.mp_batch
     ) if other_quota>0 else []
     # Real-world negatives (optional)
-    if args.neg_real_sources and args.neg_real_ratio > 1e-9:
-        want_real = int(max(0, neg_n * args.neg_real_ratio))
-        if want_real > 0:
-            real_negs = compose_realworld_negatives(args.neg_real_sources, k=want_real, seed=args.seed+21, deduper=deduper_neg, dedupe_preserve_carrier=args.dedupe_preserve_carrier)
-            neg_cands.extend(real_negs)
     target_paired = paired_quota
     # Caps // 上限
     pos_family_cap = max(1, int(math.ceil(pos_n * max(0.01, min(0.9, args.family_max_frac)))))
@@ -7783,41 +7708,12 @@ def main():
         # 组阻断：优先用 pair_id，其次等价组 ID，最后按样本序号独立
         gid = r.get("pair_id") or r.get("equiv_group_id") or f"solo-{i}"
         groups[gid].append(r)
-    keys = list(groups.keys()); random.shuffle(keys)
-    # Leave-one-out protocol (optional)
-    leave_one = getattr(args, 'eval_leave_one', 'none')
-    def _group_attr(gid: str, dim: str) -> str:
-        rows_g = groups.get(gid) or []
-        if not rows_g:
-            return '_'
-        r0 = rows_g[0]
-        if dim == 'carrier':
-            return (r0.get('carrier') or 'none').split('+')[0]
-        if dim == 'channel':
-            # prefer injected channel if present, else delivery
-            return r0.get('inj_channel') or (r0.get('delivery') or 'direct')
-        if dim == 'style':
-            return r0.get('speech_family') or '_'
-        return '_'
-    reserve = set()
-    if leave_one in {'carrier','channel','style'}:
-        from collections import Counter as _C
-        freq = _C(_group_attr(g, leave_one) for g in keys)
-        # pick the least frequent non-empty attr to leave
-        cand = [k for k in freq.keys() if k not in {'_', 'none'}]
-        pick_attr = min(cand, key=lambda k: freq[k]) if cand else None
-        if pick_attr:
-            reserve = {g for g in keys if _group_attr(g, leave_one) == pick_attr}
-    # assign splits: reserve groups go to dev/test, others follow 80/10/10
-    others = [g for g in keys if g not in reserve]
-    n = len(others)
-    train_k = set(others[: int(n*0.8)])
-    dev_k   = set(others[int(n*0.8): int(n*0.9)])
-    test_k  = set(others[int(n*0.9):])
-    # spread reserve to dev/test
-    rlist = list(reserve); random.shuffle(rlist)
-    cut = int(len(rlist) * 0.5)
-    dev_k |= set(rlist[:cut]); test_k |= set(rlist[cut:])
+    keys = list(groups.keys())
+    random.shuffle(keys)
+    n = len(keys)
+    train_k = set(keys[: int(n * 0.8)])
+    dev_k   = set(keys[int(n * 0.8): int(n * 0.9)])
+    test_k  = set(keys[int(n * 0.9):])
     rows = [r for vs in groups.values() for r in vs]
 
     def _tag_split(k: str) -> str:
@@ -8081,7 +7977,6 @@ def main():
                 'artifact_free_pos_ratio': args.artifact_free_pos_ratio,
                 'disc_rate': args.disc_rate,
                 'coverage_min_per_combo': args.coverage_min_per_combo,
-                'coverage_min_per_cfam': args.coverage_min_per_cfam,
                 'require_side_effects': args.require_side_effects,
                 'anchor_free_pos_share': _anchor_free_pos_rate(rows),
                 'no_keyword_pos_rate': _no_keyword_pos_rate(rows),
