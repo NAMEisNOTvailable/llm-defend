@@ -607,13 +607,6 @@ def derive_task_contract(task: str) -> TaskContract:
     # 默认最保守
     c = TaskContract(task, "summary", char_limit=50, forbid_structured=True,
                      forbid_tool=True, allowed_channels={"user"})
-    # 覆盖 CLI 策略（若存在）
-    try:
-        if 'args' in globals():
-            if getattr(args, 'allow_rag_mutation', False):
-                c.allow_rag_carrier = True
-    except Exception as e:
-        audit_reject("contract_derive_error", {"phase":"contract", "err": e, "task": task})
     return c
 
 INTENT_TARGET_DIST = {
@@ -7024,7 +7017,6 @@ def main():
     ap.add_argument("--gate_semantic_injection", action="store_true", default=True, help="Hard gate positives by semantic/structural injection diagnostics. // 正类语义/结构硬门控")
     ap.add_argument("--require_side_effects", action="store_true", default=False, help="Require transferable side-effect evidence (tool/role/upstream/retriever/memory) for positives. // 正类需触发可迁移副作用")
     ap.add_argument("--se_votes", type=int, default=2, help="Side-effect consistency votes (>=1). // 副作用一致性投票次数")
-    ap.add_argument("--allow_rag_mutation", action="store_true", default=False, help="Allow RAG carrier mutations. // 允许 RAG 载体变更")
     ap.add_argument("--use_dsl", action="store_true", default=False, help="Use state-machine/DSL generator for positives.")
     ap.add_argument("--dsl_file", default=None, help="YAML file to pin/limit DSL fields (optional).")
     ap.add_argument("--dsl_n", type=int, default=None, help="Override positive sample count for DSL generator; default = pos_n.")
