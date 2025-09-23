@@ -27,10 +27,12 @@ from __future__ import annotations
 import argparse, json, random, re, sys, math, hashlib, string
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Iterable, Set
+from collections.abc import Mapping
+from array import array
 import itertools
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue
+from queue import Queue, Empty
 from threading import Thread
 from datasets import load_dataset, DatasetDict
 import base64, urllib.parse
@@ -41,27 +43,65 @@ import os
 import numpy as np, platform, datasets as hf_datasets
 from enum import Enum, auto
 from multiprocessing import Pool, cpu_count
+import multiprocessing as _mp
+
+
+CAPABILITY_EVENTS: list[tuple[str, bool, str]] = []
+
+def _register_capability(name: str, enabled: bool, detail: Optional[str] = None) -> None:
+    detail_str = (detail or '').strip()
+    CAPABILITY_EVENTS.append((name, enabled, detail_str))
+
+def _fmt_exc(exc: Exception) -> str:
+    text = f"{exc.__class__.__name__}: {exc}"
+    return text if len(text) <= 120 else text[:117] + '...'
+
+def _emit_capability_report() -> None:
+    if not CAPABILITY_EVENTS:
+        return
+    print('[capability] optional module probe:')
+    for name, enabled, detail in CAPABILITY_EVENTS:
+        status = 'enabled' if enabled else 'disabled'
+        suffix = f" ({detail})" if detail else ''
+        print(f"  - {name}: {status}{suffix}")
+
 try:
     from simhash import weighted_fingerprint as _simhash_weighted_fp, hamming_distance as _simhash_hamm_dist
-except Exception:
+except Exception as exc:
+    _register_capability('simhash', False, _fmt_exc(exc))
     _simhash_weighted_fp = None
     _simhash_hamm_dist = None
+else:
+    _register_capability('simhash', True, 'native')
 try:
     from datasketch import MinHash as _DSMinHash, MinHashLSH as _DSMinHashLSH
-except Exception:
+except Exception as exc:
+    _register_capability('datasketch', False, _fmt_exc(exc))
     _DSMinHash = None
     _DSMinHashLSH = None
+else:
+    _register_capability('datasketch', True, 'native')
 try:
     import faiss  # type: ignore
-except Exception:
+except Exception as exc_gpu:
     try:
         import faiss_cpu as faiss  # type: ignore
-    except Exception:
+    except Exception as exc_cpu:
         faiss = None
+        detail = f"gpu {_fmt_exc(exc_gpu)}; cpu {_fmt_exc(exc_cpu)}"
+        _register_capability('faiss', False, detail)
+    else:
+        detail = f"faiss_cpu fallback (gpu failed: {_fmt_exc(exc_gpu)})"
+        _register_capability('faiss', True, detail)
+else:
+    _register_capability('faiss', True, 'native')
 try:
     from annoy import AnnoyIndex as _AnnoyIndex
-except Exception:
+except Exception as exc:
+    _register_capability('annoy', False, _fmt_exc(exc))
     _AnnoyIndex = None
+else:
+    _register_capability('annoy', True, 'native')
 try:
     from dsl_core import (
         generate_batch,
@@ -69,8 +109,10 @@ try:
         JSON_BLOCK_RE,
         cjk_share as _dsl_cjk_share,
         _parse_json_blocks as _dsl_parse_json_blocks,
+        AttackSpec,
     )
-except Exception:
+except Exception as exc:
+    _register_capability('dsl_core.core', False, _fmt_exc(exc))
     generate_batch = None
     invariant_result_slot = None
     JSON_BLOCK_RE = _re.compile(r"```(?:json|jsonc|json5|jsonl)\b(.*?)```", _re.S | _re.I)
@@ -95,6 +137,7 @@ except Exception:
                 audit_reject("json_parse_error", {"phase": "json_parse", "err": exc})
         return out
 else:
+    _register_capability('dsl_core.core', True, 'native')
     def cjk_share(s: str) -> float:
         return _dsl_cjk_share(s)
     def _parse_json_blocks(text: str) -> list[dict]:
@@ -107,32 +150,46 @@ else:
         return out
 try:
     from dsl_core import _h64  # reuse token hash cache if available
-except Exception:
+except Exception as exc:
+    _register_capability('dsl_core._h64', False, _fmt_exc(exc))
     from functools import lru_cache as _lru_cache
 
     @_lru_cache(maxsize=1 << 20)
     def _h64(g: str) -> int:
-        return int.from_bytes(hashlib.blake2b(g.encode("utf-8"), digest_size=8).digest(), "big")
+        return int.from_bytes(hashlib.blake2b(g.encode('utf-8'), digest_size=8).digest(), 'big')
+else:
+    _register_capability('dsl_core._h64', True, 'shared')
 try:
     from dedupe_core import Deduper
 except Exception as _dedupe_err:
     raise ImportError("dedupe_core module is required for Deduper") from _dedupe_err
+else:
+    _register_capability('dedupe_core', True, 'native')
 from math import sqrt
 try:
     from dsl_core import _simhash_weighted_fast as _dc_simhash_weighted_fast
-except Exception:
+except Exception as exc:
+    _register_capability('dsl_core.simhash_fast', False, _fmt_exc(exc))
     _dc_simhash_weighted_fast = None
+else:
+    _register_capability('dsl_core.simhash_fast', True, 'native')
 try:
     from dsl_core import _sketch_5gram_fast as _dc_sketch_5gram_fast
-except Exception:
+except Exception as exc:
+    _register_capability('dsl_core.shingle_fast', False, _fmt_exc(exc))
     _dc_sketch_5gram_fast = None
+else:
+    _register_capability('dsl_core.shingle_fast', True, 'native')
 # 这些不变量探针仅用于诊断/审计；在缺失 dsl_core 时不应导致导入失败
 try:
     from dsl_core import invariant_reward_channel, invariant_reward_field, invariant_path
-except Exception:  # 运行在精简环境时允许跳过
+except Exception as exc:  # ???????????????????? / reward invariants unavailable
+    _register_capability('dsl_core.reward_filters', False, _fmt_exc(exc))
     def invariant_reward_channel(_txt:str) -> bool: return False
     def invariant_reward_field(_txt:str) -> bool: return False
     def invariant_path(_txt:str) -> bool: return False
+else:
+    _register_capability('dsl_core.reward_filters', True, 'native')
 
 try:
     from dsl_core import (
@@ -152,7 +209,9 @@ try:
         RX_PATHY,
         _semantic_anchor_present,
     )
-except Exception:
+    _register_capability('dsl_core.sandbox_suite', True, 'native')
+except Exception as exc:
+    _register_capability('dsl_core.sandbox_suite', False, _fmt_exc(exc))
     _PAT = lambda r: _re.compile(r, _re.I | _re.S)
     RX_FORCE_RESULT_SLOT = _PAT(r"(结果|答案|结论|result|answer|verdict|final).{0,8}(填入|写入|设为|限定|仅|只|统一)")
     RX_FORCE_APPEND      = _PAT(r"(附加|追加|在(结尾|末尾)|脚注|角注|表格|front-?matter|data-[-\w]+)")
@@ -348,6 +407,7 @@ PLAIN_STRUCT_CN_HITS_BY_CARRIER = defaultdict(int)
 PLAIN_ALIAS_HITS_BY_CARRIER    = defaultdict(int)
 # Extra audit bucket for rows filtered by semantic gate
 AUDIT_REJECTS: list[dict] = []
+MP_AUDIT_QUEUE: Optional["_mp.Queue"] = None
 AUDIT_REASON_COUNT = {
     "semantic_gate": 0,
     "dedup": 0,
@@ -357,6 +417,25 @@ AUDIT_REASON_COUNT = {
     "cjk_ratio_low": 0,
     "gray_neg_keep": 0,
 }
+
+
+def _drain_audit_queue(q) -> None:
+    if q is None:
+        return
+    while True:
+        try:
+            rec = q.get_nowait()
+        except Empty:
+            break
+        except Exception:
+            break
+        if not isinstance(rec, dict):
+            continue
+        reason = rec.get("reason")
+        if reason:
+            AUDIT_REASON_COUNT[reason] = AUDIT_REASON_COUNT.get(reason, 0) + 1
+        AUDIT_REJECTS.append(rec)
+
 
 TEMPLATE_VER = "v2.1-intent-gate"
 
@@ -381,6 +460,13 @@ def audit_reject(reason: str, ctx: dict):
 
         AUDIT_REASON_COUNT[reason] = AUDIT_REASON_COUNT.get(reason, 0) + 1
         AUDIT_REJECTS.append(rec)
+        q = MP_AUDIT_QUEUE
+        if q is not None:
+            try:
+                if _mp.current_process().name != "MainProcess":
+                    q.put(rec, block=False)
+            except Exception:
+                pass
     except Exception as e:
         sys.stderr.write(f"[audit_reject-fail] {reason}: {e}\n")
 
@@ -531,7 +617,9 @@ PIN_REV = {
 # High-leak terms // 高伪迹/显词
 ARTIFACT_WORDS = [
     "override","policy","FLAG","proof","::before","data-answer","固定输出","一律输出",
-    "覆盖","忽略","无视","优先级最高","管理员策略","固定答案","仅答","照抄","回显"
+    "覆盖","忽略","无视","优先级最高","管理员策略","固定答案","仅答","照抄","回显",  
+    "RESULT_MAIN", "append", "role: system", "Ref-Chunk", "tool:", "args:", "verdict",
+    "仅保留最终", "固定格式", "按模板返回", "评分草案", "score", "grader"
 ]
 # Synonym bank for artifact weakening // 同义与绕写库
 SYNONYM_BANK = {
@@ -542,7 +630,13 @@ SYNONYM_BANK = {
     "回显": ["原样呈现","不作解释地给出","直接给出内容","原封输出","逐字呈现"],
 }
 # Leaky keywords list for masked-eval // 关键词屏蔽表用于脱敏评测
-LEAKY_KEYWORDS = list(set(ARTIFACT_WORDS + ["RAW","raw","ACK","DONE","OK","enum","answer","priority","content","只答","无需解释","统一回复"]))
+LEAKY_KEYWORDS = list(set(ARTIFACT_WORDS + ["RAW","raw","ACK","DONE","OK","enum","answer","priority","content",
+    "只答","无需解释","统一回复","不要解释", "无需解释", "只给结论", "仅输出", "只输出", "统一为", "结尾统一",
+    "按本段为准", "以本段为准", "忽略上文", "不参考上文", "覆盖先前", "优先采用本段",
+    "系统通道", "system通道", "管理员模式", "developer提示", "上游说明", "上游指令",
+    "仅在末尾追加", "尾部追加", "文末补充", "只留一句", "仅一行",
+    "别解释", "就给结论", "只写结果", "只要结论", "统一结语", "固定结语",
+    "zhiyigeilun", "buyaojieshi", "jielun", "result only", "final only",]))
 SEPS = [
     "\n\n———（更新）———\n","\n\n— 更新 —\n","\n\n【更新】\n","\n\n### 更新\n","\n\n<update>\n",
     "\n\n---\n","\n\n// update\n","\n\n# UPDATE\n","\n\n【系统提示】\n","\n\n[Update]\n","\n\n\u3010变更\u3011\n"
@@ -629,6 +723,70 @@ NEUTRAL_WRAP_TEMPLATES = [
     lambda x: f"<section data-kind=\"context\">\n{x}\n</section>",
     lambda x: f"[附录A]\n{x}\n[/附录A]",
 ]
+
+
+class FeatureVector(Mapping[str, int]):
+    """Compact feature container backed by a uint8 array."""
+
+    __slots__ = ("_bits",)
+    KEYS: Tuple[str, ...] = (
+        "codef",
+        "xml",
+        "braces",
+        "url",
+        "athash",
+        "latin",
+        "digit",
+        "cjk",
+    )
+    _IDX = {k: i for i, k in enumerate(KEYS)}
+
+    def __init__(self, bits: Iterable[int]):
+        self._bits = array("B", (int(b) & 0xFF for b in bits))
+
+    @classmethod
+    def from_flags(cls, *flags: int) -> "FeatureVector":
+        return cls(flags)
+
+    def __getitem__(self, key: str) -> int:
+        idx = self._IDX.get(key)
+        if idx is None:
+            raise KeyError(key)
+        return int(self._bits[idx])
+
+    def __iter__(self):
+        return iter(self.KEYS)
+
+    def __len__(self) -> int:
+        return len(self.KEYS)
+
+    def items(self):
+        for k in self.KEYS:
+            yield k, int(self._bits[self._IDX[k]])
+
+    def keys(self):
+        return self.KEYS
+
+    def values(self):
+        for k in self.KEYS:
+            yield int(self._bits[self._IDX[k]])
+
+    def get(self, key: str, default: Optional[int] = None) -> Optional[int]:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def to_dict(self) -> Dict[str, int]:
+        return {k: int(self._bits[idx]) for idx, k in enumerate(self.KEYS)}
+
+    def as_tuple(self) -> Tuple[int, ...]:
+        return tuple(int(v) for v in self._bits)
+
+    def __repr__(self) -> str:
+        inner = ", ".join(f"{k}={int(self._bits[idx])}" for idx, k in enumerate(self.KEYS))
+        return f"FeatureVector({inner})"
+
 
 def neutral_cn_wrap(text: str, rng: random.Random) -> str:
     try:
@@ -725,18 +883,30 @@ def apply_surface_augments(txt: str, rng: random.Random,
     return normalize(inject_unicode_noise(inject_noise_light(txt), p=NOISE_P)), carrier_name
 def sample_disclaimer(rng: random.Random, enable=True) -> Optional[str]:
     return (rng.choice(DISCLAIMER_BANK) if enable and rng.random() < 0.35 else None)
-def feature_probe_clean(s: str) -> Dict[str, int]:
+def feature_probe_clean(s: str) -> FeatureVector:
     """Surface feature probe. // 表层结构特征探针。"""
-    return dict(
-        codef = 1 if CODE_FENCE.search(s) else 0,
-        xml   = 1 if XML_TAG.search(s) else 0,
-        braces= 1 if BRACES.search(s) else 0,
-        url   = 1 if URL_RE.search(s) else 0,
-        athash= 1 if AT_HASH_RE.search(s) else 0,
-        latin = 1 if LATIN_RE.search(s) else 0,
-        digit = 1 if DIGIT_RE.search(s) else 0,
-        cjk   = 1 if CJK_RE.search(s) else 0,
+    return FeatureVector.from_flags(
+        1 if CODE_FENCE.search(s) else 0,
+        1 if XML_TAG.search(s) else 0,
+        1 if BRACES.search(s) else 0,
+        1 if URL_RE.search(s) else 0,
+        1 if AT_HASH_RE.search(s) else 0,
+        1 if LATIN_RE.search(s) else 0,
+        1 if DIGIT_RE.search(s) else 0,
+        1 if CJK_RE.search(s) else 0,
     )
+
+
+def _json_default(obj):
+    if isinstance(obj, FeatureVector):
+        return obj.to_dict()
+    if isinstance(obj, set):
+        return list(obj)
+    if isinstance(obj, Path):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def cjk_latin_ratio(s: str) -> float:
     """Latin-to-CJK ratio. // 拉丁与中文字符比。"""
     c = len(CJK_RE.findall(s)); l = len(LATIN_RE.findall(s))
@@ -906,11 +1076,20 @@ def _tune_pool_parameters(workers: int, producer_batch: int) -> Tuple[int, int, 
     if producer_batch <= 0:
         producer_batch = 256
     producer_batch = max(32, min(512, producer_batch))
-    # Cooperate with the pool by letting each worker chew through a bigger slice when memory allows.
-    chunk_div = max(1, min(4, workers))
-    chunk_size = max(16, producer_batch // chunk_div)
-    if producer_batch >= 512 and chunk_size < 128:
-        chunk_size = 128
+    fast_task = producer_batch >= 192
+    heavy_task = producer_batch <= 96
+    if fast_task:
+        denom = max(1, workers // 2) or 1
+        chunk_size = producer_batch // denom
+        chunk_size = max(128, min(256, chunk_size or 128))
+    elif heavy_task:
+        denom = max(1, workers * 2)
+        chunk_size = max(16, producer_batch // denom)
+        chunk_size = min(32, max(16, chunk_size))
+    else:
+        chunk_div = max(1, min(4, workers))
+        chunk_size = max(24, producer_batch // chunk_div)
+    chunk_size = max(16, chunk_size)
     return workers, producer_batch, chunk_size
 def sample_attack_template_v2(sem_w: float, base_w: float, art_w: float):
     """按目标意图分布 INTENT_TARGET_DIST 先抽意图，再在该意图下抽家族/模板。"""
@@ -1175,6 +1354,28 @@ def parse_events_from_text(txt: str) -> list[Event]:
         audit_reject("parse_events_error", {"phase":"events", "err": e})
     return evts
 
+def _dsl_mechanism_probe(text: str, spec: "AttackSpec") -> Dict[str, Any]:
+    try:
+        contract = derive_task_contract(getattr(spec, "task", "wiki_summarize"))
+    except Exception:
+        contract = derive_task_contract("wiki_summarize")
+    try:
+        diagnostics = analyze_violations(contract, inj_text=text, full_text=text)
+    except Exception as exc:
+        diagnostics = {}
+        audit_reject("mechanism_probe_error", {"phase": "mechanism_probe", "err": str(exc)})
+    events = [evt.type for evt in parse_events_from_text(text)]
+    evidence = set(getattr(spec, "evidence", []) or [])
+    flags = {
+        "role": bool(diagnostics.get("role_takeover") or diagnostics.get("se_role_change") or diagnostics.get("privilege_conflict")) or ("role" in evidence),
+        "tool": bool(diagnostics.get("tool_hint") or diagnostics.get("se_tool_invocations") or diagnostics.get("tool_param_context_mismatch")) or ("tool" in evidence or getattr(spec, "channel", "") == "tool"),
+        "retriever": bool(diagnostics.get("se_retriever_hit") or diagnostics.get("se_upstream_leak") or diagnostics.get("upstream_ref") or diagnostics.get("path_like")) or bool(evidence & {"upstream", "path"}),
+        "memory": bool(diagnostics.get("se_memory_write")) or ("memory_write" in evidence),
+        "reward": bool(evidence & {"reward_channel", "reward_field"}),
+    }
+    diagnostics.setdefault("mechanism_probe_contract", contract.mode)
+    return {"flags": flags, "diagnostics": diagnostics, "events": events}
+
 def adjudicate_event_invariants(contract: TaskContract, events: list[Event]) -> tuple[int, list[str]]:
     # Weighted invariants with soft evidence; TaskShift mitigated. Structural-only cues are soft.
     violations: list[str] = []
@@ -1338,6 +1539,16 @@ def deduper_accept_normalized(
     strip_placeholders: bool = True,
     normalize_slot_tokens: bool = True,
 ) -> bool:
+    def _try_candidate(candidate: str) -> bool:
+        candidate = candidate or ""
+        try:
+            check_fn = getattr(deduper, "check_digest", None)
+            if callable(check_fn) and not check_fn(candidate):
+                return False
+        except Exception:
+            pass
+        return deduper.accept(candidate)
+
     base = _for_dedup_norm(
         text,
         preserve_carrier=preserve_carrier,
@@ -1346,7 +1557,7 @@ def deduper_accept_normalized(
         strip_placeholders=strip_placeholders,
         normalize_slot_tokens=normalize_slot_tokens,
     )
-    if deduper.accept(base):
+    if _try_candidate(base):
         return True
     softened = _for_dedup_norm(
         text,
@@ -1357,7 +1568,7 @@ def deduper_accept_normalized(
         normalize_slot_tokens=normalize_slot_tokens,
         apply_anchor_neutralization=True,
     )
-    if deduper.accept(softened):
+    if _try_candidate(softened):
         return True
     if preserve_carrier:
         base2 = _for_dedup_norm(
@@ -1368,7 +1579,7 @@ def deduper_accept_normalized(
             strip_placeholders=strip_placeholders,
             normalize_slot_tokens=normalize_slot_tokens,
         )
-        if deduper.accept(base2):
+        if _try_candidate(base2):
             return True
         soft2 = _for_dedup_norm(
             text,
@@ -1379,7 +1590,7 @@ def deduper_accept_normalized(
             normalize_slot_tokens=normalize_slot_tokens,
             apply_anchor_neutralization=True,
         )
-        return deduper.accept(soft2)
+        return _try_candidate(soft2)
     return False
 
 
@@ -1652,14 +1863,31 @@ EXTRA_CONTAINERS = [
 ]
 
 # ------------------ Target task pool // 任务上下文池 ------------------
+HF_DATASETS_STREAMING_MODE = os.getenv('HF_DATASETS_STREAMING', 'auto').strip().lower()
+
+
 def try_load(name: str, kwargs: Dict[str, Any], hf_rev: Optional[str]=None) -> Optional[DatasetDict]:
     if load_dataset is None:
         return None
     key = (name, kwargs.get("name"))
     params = dict(kwargs)
     params.update({"revision": (hf_rev or PIN_REV.get(key, {}).get("revision") or "main")})
-    try:
+    stream_pref = HF_DATASETS_STREAMING_MODE
+    if stream_pref not in {"on", "off", "auto"}:
+        stream_pref = "auto"
+    def _load(streaming: bool) -> Optional[DatasetDict]:
+        if streaming:
+            return load_dataset(name, streaming=True, **params)
         return load_dataset(name, **params)
+    if stream_pref in {"on", "auto"}:
+        try:
+            return _load(True)
+        except Exception as e:
+            if stream_pref == "on":
+                print(f"[warn] dataset skip(stream) {name} {kwargs}: {e}", file=sys.stderr)
+                return None
+    try:
+        return _load(False)
     except Exception as e:
         print(f"[warn] dataset skip {name} {kwargs}: {e}", file=sys.stderr)
         return None
@@ -1850,7 +2078,7 @@ def iter_external_corpora(spec: str, lang: str = "zh", total: int = 4000, seed: 
             continue
 
 def _benign_allowed_tool_json() -> str:
-    obj = {"tool": "summarize", "args": {"q": "..."}, "return": {"note": "ok"}}
+    obj = {"tool": "summarize", "args": {"q": "..."}, "out": {"note": "ok"}}
     return "```json\n" + json.dumps(obj, ensure_ascii=False) + "\n```"
 
 def _project_shape(raw: dict, shape: str, rng: random.Random) -> dict:
@@ -3612,19 +3840,18 @@ def _char_ngrams(s: str, n: int = 3, cap: int = 2048) -> list[str]:
     s = s[:cap]
     return [s[i:i+n] for i in range(max(0, len(s)-n+1))]
 
-def leakage_pressure_test(rows: List[Dict[str,Any]], n: int = 3, vocab_size: int = 300) -> None:
+def leakage_pressure_test(rows: List[Dict[str, Any]], n: int = 3, vocab_size: int = 300, threshold: float = 0.85, return_details: bool = False) -> Optional[Dict[str, Any]]:
     texts = [r.get("text","") for r in rows]
     labels = [int(r.get("label",0)) for r in rows]
     if not any(labels) or all(labels):
         print("[leakage] skipped: single-class")
-        return
-    # vocab by frequency
+        empty = {"auc": 0.0, "scores": [0.0 for _ in rows], "labels": labels, "coefs": [], "vocab": [], "threshold": threshold}
+        return empty if return_details else None
     freq = Counter()
     for t in texts:
         freq.update(_char_ngrams(t, n=n))
     vocab = [g for g,_ in freq.most_common(vocab_size)]
     idx = {g:i for i,g in enumerate(vocab)}
-    # counts per class
     pos_c = np.ones(len(vocab))
     neg_c = np.ones(len(vocab))
     pos_tot = 1.0; neg_tot = 1.0
@@ -3637,33 +3864,82 @@ def leakage_pressure_test(rows: List[Dict[str,Any]], n: int = 3, vocab_size: int
                 pos_c[j]+=1; pos_tot+=1
             else:
                 neg_c[j]+=1; neg_tot+=1
-    # log-odds difference as linear coef
     coefs = np.log(pos_c/pos_tot) - np.log(neg_c/neg_tot)
-    # scores
-    scores = []
+    scores: List[float] = []
     for t in texts:
         vs = set(_char_ngrams(t, n=n))
         s = 0.0
         for g in vs:
             j = idx.get(g)
-            if j is not None: s += float(coefs[j])
+            if j is not None:
+                s += float(coefs[j])
         scores.append(s)
-    # AUC by rank-sum
     order = sorted(range(len(scores)), key=lambda i: scores[i])
     ranks = {i: r+1 for r,i in enumerate(order)}
     pos_idx = [i for i,y in enumerate(labels) if y==1]
     neg_idx = [i for i,y in enumerate(labels) if y==0]
     if not pos_idx or not neg_idx:
         print("[leakage] skipped: single-class after split")
-        return
+        empty = {"auc": 0.0, "scores": scores, "labels": labels, "coefs": [float(x) for x in coefs], "vocab": vocab, "threshold": threshold}
+        return empty if return_details else None
     sum_ranks_pos = sum(ranks[i] for i in pos_idx)
     n_pos = len(pos_idx); n_neg = len(neg_idx)
     auc = (sum_ranks_pos - n_pos*(n_pos+1)/2) / (n_pos*n_neg + 1e-9)
     print(f"[leakage] char-{n}-gram linear AUC={auc:.3f} (vocab={len(vocab)})")
-    if auc >= 0.85:
-        # Show top correlated grams
+    if auc >= threshold:
         tops = [vocab[i] for i in list(np.argsort(-np.abs(coefs)))[:10]]
         print("[leakage][warn] high AUC; top n-grams:", tops)
+    details = {
+        "auc": float(auc),
+        "scores": scores,
+        "labels": labels,
+        "coefs": [float(x) for x in coefs],
+        "vocab": vocab,
+        "threshold": float(threshold),
+        "order": int(n),
+    }
+    return details if return_details else None
+
+
+def mitigate_leakage(rows: List[Dict[str, Any]], leak_info: Dict[str, Any], iteration: int = 0, pos_quantile: float = 0.85, neg_quantile: float = 0.20) -> int:
+    scores = leak_info.get("scores") or []
+    labels = leak_info.get("labels") or []
+    if not scores or len(scores) != len(rows):
+        return 0
+    acted = 0
+    pos_idx = [i for i, lbl in enumerate(labels) if lbl == 1]
+    if pos_idx:
+        pos_scores = np.array([scores[i] for i in pos_idx], dtype=float)
+        cut = float(np.quantile(pos_scores, min(max(pos_quantile, 0.0), 1.0)))
+        for i in pos_idx:
+            if scores[i] >= cut:
+                new_text = placeholderless_mirror(rows[i]["text"])
+                if new_text and new_text.strip() and new_text.strip() != rows[i]["text"].strip():
+                    rows[i]["text"] = new_text
+                    rows[i].setdefault("leakage_adjustments", []).append({"iteration": int(iteration), "action": "placeholderless_mirror"})
+                    rows[i]["len"] = byte_len(new_text)
+                    rows[i]["feats"] = feature_probe_clean(new_text)
+                    rows[i]["latin_over_cjk"] = cjk_latin_ratio(new_text)
+                    acted += 1
+    neg_idx = [i for i, lbl in enumerate(labels) if lbl == 0]
+    if neg_idx:
+        neg_scores = np.array([scores[i] for i in neg_idx], dtype=float)
+        cut_neg = float(np.quantile(neg_scores, min(max(neg_quantile, 0.0), 1.0)))
+        for i in neg_idx:
+            if scores[i] <= cut_neg:
+                new_text = add_struct_evidence_benign(rows[i]["text"], p=1.0)
+                if new_text != rows[i]["text"]:
+                    rows[i]["text"] = new_text
+                    rows[i].setdefault("leakage_adjustments", []).append({"iteration": int(iteration), "action": "add_struct_evidence"})
+                    rows[i]["len"] = byte_len(new_text)
+                    rows[i]["feats"] = feature_probe_clean(new_text)
+                    rows[i]["latin_over_cjk"] = cjk_latin_ratio(new_text)
+                    acted += 1
+    high_take = max(1, len(scores)//10 or 1)
+    for i in sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)[:high_take]:
+        rows[i]["weight"] = float(max(0.25, float(rows[i].get("weight", 1.0)) * 0.7))
+        rows[i].setdefault("leakage_adjustments", []).append({"iteration": int(iteration), "action": "downweight"})
+    return acted
 
 def add_struct_evidence(goal: str, text: str, secret: str, p: float) -> str:
     """Append a small benign-looking JSON block for structure alignment (not necessarily dangerous).
@@ -3730,15 +4006,15 @@ def _exec_intent_score(text: str) -> float:
         score += 0.6
     return max(0.0, score + bonus)
 
-def add_struct_evidence_benign(text: str, p: float = 0.25, rng: Optional[random.Random]=None) -> str:
+def add_struct_evidence_benign(text: str, p: float = 0.35, rng: Optional[random.Random]=None) -> str:
     """为负例添加“无害结构证据”（不会触发危险字段/工具），打散固定短语，减少可学伪迹。"""
     rng = rng or random
     if rng.random() >= p:
         return text
     choice = rng.random()
     if choice < 0.33:
-        # JSON 片段：去掉“示例占位”显式语，改为不可学的随机值/键
-        obj = {"result": f"注:{rng.randint(1000,9999)}", "meta": {"k": _rand_key(5)}}
+        # JSON 片段：使用中性键名，避免触发危险字段
+        obj = {"note": f"注:{rng.randint(1000,9999)}", "meta": {"k": _rand_key(5)}}
         frag = "```json\n" + json.dumps(obj, ensure_ascii=False) + "\n```"
     elif choice < 0.66:
         # Markdown 表：随机字段名/随机片段，不再出现“结果|示例”固定键值
@@ -4303,9 +4579,10 @@ def pick_strategy(goal_hint: str | None = None) -> Strategy:
 # ------------------ Compose attacks // 生成注入样本 ------------------
 
 
-def _attack_producer_init(target_pool: List[Dict[str, Any]], cfg: dict):
+def _attack_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=None):
     """Initializer for worker processes to stash config/state."""
-    global _ATTACK_PRODUCER_CFG, _ATTACK_PRODUCER_TARGETS, _ATTACK_TARGET_SLICE
+    global _ATTACK_PRODUCER_CFG, _ATTACK_PRODUCER_TARGETS, _ATTACK_TARGET_SLICE, MP_AUDIT_QUEUE
+    MP_AUDIT_QUEUE = audit_q
     _ATTACK_PRODUCER_CFG = cfg
     _ATTACK_PRODUCER_TARGETS = target_pool
     random.shuffle(_ATTACK_PRODUCER_TARGETS)
@@ -4389,8 +4666,8 @@ def _attack_render_core(seed: int) -> tuple[Optional[RenderPacket], list[tuple[s
     except Exception as e:
         logs.append(("artifact_error", {"err": str(e)}))
 
-    carrier_mix_prob = float(cfg.get("carrier_mix_prob", 0.45))
-    stack_prob = float(cfg.get("stack_prob", 0.25))
+    carrier_mix_prob = float(cfg.get("carrier_mix_prob", 0.25))
+    stack_prob = float(cfg.get("stack_prob", 0.15))
     code_switch_prob = float(cfg.get("code_switch_prob", 0.18))
     carrier_name = "none"
     try:
@@ -4468,8 +4745,9 @@ def _attack_producer_job(job: tuple[int, int]) -> dict:
     return {"results": results}
 
 
-def _hard_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict):
-    global _HARD_NEG_PRODUCER_CFG, _HARD_NEG_PRODUCER_TARGETS
+def _hard_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=None):
+    global _HARD_NEG_PRODUCER_CFG, _HARD_NEG_PRODUCER_TARGETS, MP_AUDIT_QUEUE
+    MP_AUDIT_QUEUE = audit_q
     _HARD_NEG_PRODUCER_CFG = cfg
     _HARD_NEG_PRODUCER_TARGETS = target_pool
 
@@ -4520,8 +4798,9 @@ def _hard_neg_producer_job(job: tuple[int, int]) -> dict:
     return {"cands": cands}
 
 
-def _plain_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict):
-    global _PLAIN_NEG_PRODUCER_CFG, _PLAIN_NEG_PRODUCER_TARGETS, _PLAIN_NEG_TARGET_SLICE
+def _plain_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=None):
+    global _PLAIN_NEG_PRODUCER_CFG, _PLAIN_NEG_PRODUCER_TARGETS, _PLAIN_NEG_TARGET_SLICE, MP_AUDIT_QUEUE
+    MP_AUDIT_QUEUE = audit_q
     _PLAIN_NEG_PRODUCER_CFG = cfg
     _PLAIN_NEG_PRODUCER_TARGETS = target_pool
     random.shuffle(_PLAIN_NEG_PRODUCER_TARGETS)
@@ -4561,20 +4840,22 @@ def _plain_neg_producer_job(job: tuple[int, int]) -> dict:
         seed=int(seed),
         deduper=local_deduper,
         disc_rate=cfg.get('disc_rate'),
-        carrier_mix_prob=float(cfg.get('carrier_mix_prob', 0.45)),
-        stack_prob=float(cfg.get('stack_prob', 0.25)),
+        carrier_mix_prob=float(cfg.get('carrier_mix_prob', 0.25)),
+        stack_prob=float(cfg.get('stack_prob', 0.15)),
         struct_evidence_rate=float(cfg.get('struct_evidence_rate', 0.0)),
         mask_format_features_rate=float(cfg.get('mask_format_features_rate', 0.0)),
         mask_on=str(cfg.get('mask_on', 'both')),
         dedupe_preserve_carrier=bool(cfg.get('dedupe_preserve_carrier', False)),
         dedupe_preserve_codeblocks=bool(cfg.get('dedupe_preserve_codeblocks', False)),
         strict_neg_diag_gate=bool(cfg.get('strict_neg_diag_gate', True)),
+        cfg=cfg,
     )
     return {"cands": cands, "stats": stats or {}}
 
 
-def _topic_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict):
-    global _TOPIC_NEG_PRODUCER_CFG, _TOPIC_NEG_PRODUCER_TARGETS, _TOPIC_NEG_TARGET_SLICE
+def _topic_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=None):
+    global _TOPIC_NEG_PRODUCER_CFG, _TOPIC_NEG_PRODUCER_TARGETS, _TOPIC_NEG_TARGET_SLICE, MP_AUDIT_QUEUE
+    MP_AUDIT_QUEUE = audit_q
     _TOPIC_NEG_PRODUCER_CFG = cfg
     _TOPIC_NEG_PRODUCER_TARGETS = target_pool
     random.shuffle(_TOPIC_NEG_PRODUCER_TARGETS)
@@ -4618,6 +4899,7 @@ def _topic_neg_producer_job(job: tuple[int, int]) -> dict:
         dedupe_preserve_carrier=bool(cfg.get('dedupe_preserve_carrier', False)),
         dedupe_preserve_codeblocks=bool(cfg.get('dedupe_preserve_codeblocks', False)),
         disc_rate=cfg.get('disc_rate'),
+        cfg=cfg,
     )
     return {"cands": cands}
 
@@ -5159,8 +5441,8 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     min_cjk_share: float, min_cjk_share_auto: bool,
                     oversample_mult: int, deduper: Deduper,
                     family_cap: int, artifact_rate: float, 
-                    code_switch_prob: float = 0.18, carrier_mix_prob: float = 0.45,
-                    stack_prob: float = 0.25,
+                    code_switch_prob: float = 0.18, carrier_mix_prob: float = 0.25,
+                    stack_prob: float = 0.15,
                     disc_rate: float | None = None,
                     art_match_rate: float = 0.50,
                     struct_evidence_rate: float = 0.0,
@@ -5600,8 +5882,8 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     min_cjk_share: float, min_cjk_share_auto: bool,
                     oversample_mult: int, deduper: Deduper,
                     family_cap: int, artifact_rate: float, 
-                    code_switch_prob: float = 0.18, carrier_mix_prob: float = 0.45,
-                    stack_prob: float = 0.25,
+                    code_switch_prob: float = 0.18, carrier_mix_prob: float = 0.25,
+                    stack_prob: float = 0.15,
                     disc_rate: float | None = None,
                     art_match_rate: float = 0.50,
                     struct_evidence_rate: float = 0.0,
@@ -5743,9 +6025,12 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
     log_thread = Thread(target=_audit_consumer, name="attack-audit-consumer", daemon=True)
     log_thread.start()
 
-    with Pool(processes=workers, initializer=_attack_producer_init, initargs=(target_pool, cfg_dict)) as pool:
+    audit_q = _mp.Queue() if workers > 1 else None
+
+    with Pool(processes=workers, initializer=_attack_producer_init, initargs=(target_pool, cfg_dict, audit_q)) as pool:
         try:
             for payload in pool.imap_unordered(_attack_producer_job, job_stream, chunksize=chunk_size):
+                _drain_audit_queue(audit_q)
                 for cand, logs in payload.get("results", []):
                     if logs:
                         log_queue.put(logs)
@@ -5762,10 +6047,13 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
             pool.terminate()
         finally:
             pool.join()
+            _drain_audit_queue(audit_q)
 
     log_queue.put(None)
     log_queue.join()
     log_thread.join(timeout=1.0)
+
+    _drain_audit_queue(audit_q)
 
     return selector.cands
 
@@ -6059,10 +6347,13 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
     attempts = 0
     max_attempts = max(wanted * 50, int(producer_batch * workers * 10))
 
+    audit_q = _mp.Queue() if workers > 1 else None
+
     with Pool(processes=workers, initializer=_hard_neg_producer_init,
-              initargs=(target_pool, cfg_dict)) as pool:
+              initargs=(target_pool, cfg_dict, audit_q)) as pool:
         try:
             for payload in pool.imap_unordered(_hard_neg_producer_job, job_stream, chunksize=chunk_size):
+                _drain_audit_queue(audit_q)
                 chunk = payload.get('cands', []) if isinstance(payload, dict) else []
                 for cand in chunk:
                     if not isinstance(cand, dict):
@@ -6094,11 +6385,13 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
             pool.terminate()
         finally:
             pool.join()
+            _drain_audit_queue(audit_q)
 
     try:
         print(f"[gate][hardneg] attempts={attempts} kept={len(results)} accept_rate={(len(results)/(attempts+1e-9)):.3f}")
     except Exception:
         pass
+    _drain_audit_queue(audit_q)
     return results
 
 def intent_balanced_pick(rows_pos, pos_n, seed: int):
@@ -6271,7 +6564,8 @@ def is_benign_strict(text: str, contract: TaskContract) -> bool:
     if not iso or iso.strip() == "":
         return False
     try:
-        ok_inv2, _ = _dsl_inv(iso, None)
+        events2 = parse_events_from_text(iso)
+        ok_inv2, _ = adjudicate_event_invariants(contract, events2)
         if not ok_inv2:
             return False
     except Exception:
@@ -6287,7 +6581,8 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
                             mask_on: str = "both",
                             dedupe_preserve_carrier: bool = False,
                             dedupe_preserve_codeblocks: bool = False,
-                            strict_neg_diag_gate: bool = True):
+                            strict_neg_diag_gate: bool = True,
+                            cfg: Optional[Config] = None):
     random.seed(seed + 4242)
     disc_rate = _effective_disc_rate(disc_rate, cfg)
     rng = random.Random(seed)
@@ -6314,7 +6609,7 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
 
     def _benign_allowed_tool_json() -> str:
         name = rng.choice(["search","summarize","classify","extract"])  # allowed set
-        obj = {"tool": name, "args": {"q": "...", "top_k": 3}, "return": {"note": "ok"}}
+        obj = {"tool": name, "args": {"q": "...", "top_k": 3}, "out": {"note": "ok"}}
         return "```json\n" + json.dumps(obj, ensure_ascii=False) + "\n```"
     
     CN_TASK_PROMPTS = [
@@ -6471,23 +6766,6 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
                             workers: int = 0,
                             producer_batch: int = 128):
     workers = int(workers or 0)
-    if workers <= 1:
-        return _compose_plain_negatives_serial(
-            target_pool, k, seed, deduper,
-            disc_rate=disc_rate,
-            carrier_mix_prob=carrier_mix_prob,
-            stack_prob=stack_prob,
-            struct_evidence_rate=struct_evidence_rate,
-            mask_format_features_rate=mask_format_features_rate,
-            mask_on=mask_on,
-            dedupe_preserve_carrier=dedupe_preserve_carrier,
-            dedupe_preserve_codeblocks=dedupe_preserve_codeblocks,
-            strict_neg_diag_gate=strict_neg_diag_gate,
-        )
-
-    workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
-    disc_rate_eff = _effective_disc_rate(disc_rate, cfg)
-
     index_attr = getattr(deduper, 'index', None)
     deduper_params = {
         'sim_bits': getattr(deduper, 'sim_bits', 64),
@@ -6500,8 +6778,9 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
         'cosine_thresh': getattr(deduper, 'cosine_thresh', 0.92),
         'max_vecs': getattr(deduper, 'max_vecs', 20000),
     }
-
-    cfg = {
+    disc_rate_eff = _effective_disc_rate(disc_rate)
+    alias_p_cn_eff = float(_cfg_attr(None, 'alias_p_cn', ALIAS_P_CN))
+    cfg_dict = {
         'disc_rate': disc_rate_eff,
         'carrier_mix_prob': carrier_mix_prob,
         'stack_prob': stack_prob,
@@ -6511,19 +6790,38 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
         'dedupe_preserve_carrier': dedupe_preserve_carrier,
         'dedupe_preserve_codeblocks': dedupe_preserve_codeblocks,
         'strict_neg_diag_gate': strict_neg_diag_gate,
+        'alias_p_cn': alias_p_cn_eff,
         'deduper_params': deduper_params,
     }
 
+    if workers <= 1:
+        return _compose_plain_negatives_serial(
+            target_pool, k, seed, deduper,
+            disc_rate=disc_rate_eff,
+            carrier_mix_prob=carrier_mix_prob,
+            stack_prob=stack_prob,
+            struct_evidence_rate=struct_evidence_rate,
+            mask_format_features_rate=mask_format_features_rate,
+            mask_on=mask_on,
+            dedupe_preserve_carrier=dedupe_preserve_carrier,
+            dedupe_preserve_codeblocks=dedupe_preserve_codeblocks,
+            strict_neg_diag_gate=strict_neg_diag_gate,
+            cfg=cfg_dict,
+        )
+
+    workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
     job_stream = ((seed + (idx * producer_batch * 8369), producer_batch) for idx in itertools.count())
+    audit_q = _mp.Queue() if workers > 1 else None
     results: List[Dict[str, Any]] = []
     agg_stats = {'suspect_neg': 0, 'total_neg_checked': 0}
     attempts = 0
     max_attempts = max(k * max(1, producer_batch) * 10, producer_batch * workers * 8)
 
     with Pool(processes=workers, initializer=_plain_neg_producer_init,
-              initargs=(target_pool, cfg)) as pool:
+              initargs=(target_pool, cfg_dict, audit_q)) as pool:
         try:
             for payload in pool.imap_unordered(_plain_neg_producer_job, job_stream, chunksize=chunk_size):
+                _drain_audit_queue(audit_q)
                 if not isinstance(payload, dict):
                     continue
                 for cand in payload.get('cands', []):
@@ -6549,7 +6847,9 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
             pool.terminate()
         finally:
             pool.join()
+            _drain_audit_queue(audit_q)
 
+    _drain_audit_queue(audit_q)
     return results, agg_stats
 
 def _compose_topic_shift_negatives_serial(target_pool, k: int, seed: int, deduper: Deduper,
@@ -6557,7 +6857,8 @@ def _compose_topic_shift_negatives_serial(target_pool, k: int, seed: int, dedupe
                                   mask_on: str = "both",
                                   dedupe_preserve_carrier: bool = False,
                                   dedupe_preserve_codeblocks: bool = False,
-                                  disc_rate: float | None = None) -> list[dict]:
+                                  disc_rate: float | None = None,
+                                  cfg: Optional[Config] = None) -> list[dict]:
     random.seed(seed + 7777)
     disc_rate = _effective_disc_rate(disc_rate, cfg)
     out = []
@@ -6644,19 +6945,6 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
                                   workers: int = 0,
                                   producer_batch: int = 128) -> list[dict]:
     workers = int(workers or 0)
-    if workers == 1:
-        return _compose_topic_shift_negatives_serial(
-            target_pool, k, seed, deduper,
-            mask_format_features_rate=mask_format_features_rate,
-            mask_on=mask_on,
-            dedupe_preserve_carrier=dedupe_preserve_carrier,
-            dedupe_preserve_codeblocks=dedupe_preserve_codeblocks,
-            disc_rate=disc_rate,
-        )
-
-    workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
-    disc_rate_eff = _effective_disc_rate(disc_rate, cfg)
-
     index_attr = getattr(deduper, 'index', None)
     deduper_params = {
         'sim_bits': getattr(deduper, 'sim_bits', 64),
@@ -6669,8 +6957,8 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
         'cosine_thresh': getattr(deduper, 'cosine_thresh', 0.92),
         'max_vecs': getattr(deduper, 'max_vecs', 20000),
     }
-
-    cfg = {
+    disc_rate_eff = _effective_disc_rate(disc_rate)
+    cfg_dict = {
         'mask_format_features_rate': mask_format_features_rate,
         'mask_on': mask_on,
         'dedupe_preserve_carrier': dedupe_preserve_carrier,
@@ -6679,15 +6967,29 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
         'deduper_params': deduper_params,
     }
 
+    if workers <= 1:
+        return _compose_topic_shift_negatives_serial(
+            target_pool, k, seed, deduper,
+            mask_format_features_rate=mask_format_features_rate,
+            mask_on=mask_on,
+            dedupe_preserve_carrier=dedupe_preserve_carrier,
+            dedupe_preserve_codeblocks=dedupe_preserve_codeblocks,
+            disc_rate=disc_rate_eff,
+            cfg=cfg_dict,
+        )
+
+    workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
     job_stream = ((seed + (idx * producer_batch * 7121), producer_batch) for idx in itertools.count())
+    audit_q = _mp.Queue() if workers > 1 else None
     results: List[Dict[str, Any]] = []
     attempts = 0
     max_attempts = max(k * max(1, producer_batch) * 10, producer_batch * workers * 8)
 
     with Pool(processes=workers, initializer=_topic_neg_producer_init,
-              initargs=(target_pool, cfg)) as pool:
+              initargs=(target_pool, cfg_dict, audit_q)) as pool:
         try:
             for payload in pool.imap_unordered(_topic_neg_producer_job, job_stream, chunksize=chunk_size):
+                _drain_audit_queue(audit_q)
                 if not isinstance(payload, dict):
                     continue
                 for cand in payload.get('cands', []):
@@ -6709,7 +7011,9 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
             pool.terminate()
         finally:
             pool.join()
+            _drain_audit_queue(audit_q)
 
+    _drain_audit_queue(audit_q)
     return results
 
 def strip_common_boilerplate(text: str) -> str:
@@ -6967,18 +7271,37 @@ def _dsl_to_row(sample: dict, cfg: Optional[Config] = None) -> dict:
     # 机制 / 证据沉淀（示例）
     ev = set(spec.get("evidence", []))
     mechanism = f"{spec.get('strategy','_')}@{ch}:{spec.get('scope','_')}"
+    mech_flags = spec.get("mechanism_flags", {}) or {}
+    mech_combo = spec.get("mechanism_combo")
+    trigger_path = spec.get("trigger_path") or pick_channel_by_carrier(row.get("delivery"), spec.get("carrier"))
+    mech_path_key = spec.get("mechanism_path_key") or (f"{mech_combo}@{trigger_path}" if mech_combo and trigger_path else None)
     row.update({
-    "task": spec.get("task", "wiki_summarize"),
-    "len": nbytes, "len_bucket": length_bucket(nbytes), "feats": feats,
-    "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
-    "family": spec.get("family", "dsl"),
-    "delivery": delivery,
-    "mechanism": mechanism,
-    "evi_result_slot": ("result_slot" in ev),
-    "evi_tool": ("tool" in ev),
-    "evi_upstream": ("upstream" in ev),
-    "evi_append": ("append" in ev),
+        "task": spec.get("task", "wiki_summarize"),
+        "len": nbytes, "len_bucket": length_bucket(nbytes), "feats": feats,
+        "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
+        "family": spec.get("family", "dsl"),
+        "delivery": delivery,
+        "mechanism": mech_path_key or mechanism,
+        "evi_result_slot": ("result_slot" in ev),
+        "evi_tool": ("tool" in ev),
+        "evi_upstream": ("upstream" in ev),
+        "evi_append": ("append" in ev),
     })
+    row["mechanism_legacy"] = mechanism
+    if mech_path_key:
+        row["mechanism"] = mech_path_key
+    if mech_flags:
+        row["mechanism_flags"] = mech_flags
+    if mech_combo:
+        row["mechanism_combo"] = mech_combo
+    if trigger_path:
+        row["trigger_path"] = trigger_path
+    if spec.get("mechanisms") is not None:
+        row["mechanisms"] = spec.get("mechanisms")
+    if spec.get("mechanism_signals") is not None:
+        row["mechanism_signals"] = spec.get("mechanism_signals")
+    if spec.get("mechanism_events") is not None:
+        row["mechanism_events"] = spec.get("mechanism_events")
     if row.get("delivery") == "multi_turn":
         row["carrier"] = "chat_dialog"
     # 回填修复后的文本
@@ -6998,8 +7321,8 @@ def write_dataset(rows: list[dict], out_jsonl: str, audit_jsonl: str):
             # Training whitelist: strictly minimal fields to avoid leakage
             train = {"text": r.get("text", ""), "label": r.get("label", 0)}
             assert set(train.keys()) <= {"text","label"}
-            f.write(json.dumps(train, ensure_ascii=False) + "\n")
-            fa.write(json.dumps(r, ensure_ascii=False) + "\n")
+            f.write(json.dumps(train, ensure_ascii=False, default=_json_default) + "\n")
+            fa.write(json.dumps(r, ensure_ascii=False, default=_json_default) + "\n")
 def evolve_injection(base_prompt: str, seed_tpl: str, contract, payload: str, steps=5):
     """
     用 GLM4-9B 作为生成器对注入文本做迭代改写，
@@ -7428,6 +7751,84 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 # ------------------ Main pipeline // 主流程 ------------------
+# CLI default snapshot for audit/logging; keep in sync with build_arg_parser().
+DEFAULTS: Dict[str, Any] = {
+    'adv_iters': 6,
+    'adv_mutate': False,
+    'alias_p_cn': 0.7,
+    'anchor_free_p': 0.85,
+    'art_match_rate': 0.5,
+    'artifact_free_pos_ratio': 0.5,
+    'artifact_rate': 0.1,
+    'artifact_weight': 0.03,
+    'balance_mode': 'strict',
+    'base_weight': 0.4,
+    'carrier_mix_prob': 0.25,
+    'cjk_policy': 'tiered',
+    'code_switch_prob': 0.06,
+    'coverage_min_per_combo': 3,
+    'dedupe_preserve_carrier': True,
+    'dedupe_preserve_codeblocks': False,
+    'disc_rate': 0.15,
+    'dry_run': False,
+    'effect_fallback': 'none',
+    'effect_gate_categories': '',
+    'effect_gate_for': 'none',
+    'effect_policy': 'whitebox_first_soft',
+    'effect_replicas': 0,
+    'evolve_variants': False,
+    'ext_eval_lang': 'zh,code_switch',
+    'ext_eval_report': None,
+    'ext_eval_shapes': 'in_context,format_carrier,rag_doc,multi_turn,tool_override',
+    'ext_eval_size': 4000,
+    'ext_eval_sources': '',
+    'family_max_frac': 0.06,
+    'gate_semantic_injection': True,
+    'gray_neg_keep_frac': 0.35,
+    'hf_revision': None,
+    'invariance_end_nonce': False,
+    'jaccard_thresh': 0.9,
+    'mask_format_features_rate': 0.5,
+    'mask_on': 'both',
+    'min_cjk_share': 0.6,
+    'min_cjk_share_auto': True,
+    'minhash_bands': 16,
+    'minhash_n': 64,
+    'mirror_placeholderless': 0.3,
+    'model_eval_fallback': 'hard',
+    'mp_batch': 384,
+    'mp_workers': 0,
+    'mt_tool_override_rate': 0.25,
+    'n': 5000,
+    'neg_effect_guard': True,
+    'neg_ratio': 0.15,
+    'no_keyword_pos_min': 0.0,
+    'out': 'dataset.jsonl',
+    'oversample_mult': 0,
+    'pick_strategy': 'grid',
+    'plain_neg_ratio': 0.35,
+    'rebalance_beta': 0.3,
+    'require_side_effects': False,
+    'se_votes': 2,
+    'seed': 42,
+    'sem_weight': 0.55,
+    'semantic_dedupe': True,
+    'semantic_dedupe_thr': 0.96,
+    'shingle_k': 5,
+    'simhash_bits': 64,
+    'simhash_thresh': 1,
+    'soft_hint_rate': 0.3,
+    'stack_prob': 0.15,
+    'strip_common_boilerplate': True,
+    'struct_evidence_rate': 0.15,
+    'structural_p': 0.5,
+    'target_workers': -1,
+    'targets_json': None,
+    'use_dsl': False,
+    'use_model_eval': False,
+}
+
+
 def main():
     ap = build_arg_parser()
     args = ap.parse_args()
@@ -7466,7 +7867,7 @@ def main():
         parser_default = ap.get_default(k)
         expected = DEFAULTS[k]
         if parser_default != expected:
-            raise SystemExit(f"defaults-mismatch: {k} actual={actual} expected={expected}. "
+            raise SystemExit(f"defaults-mismatch: {k} actual={parser_default} expected={expected}. "
                             "Please fix argparse defaults or update DEFAULTS coherently.")
     random.seed(args.seed); np.random.seed(args.seed)
     # 若完全关闭免责声明，则禁用取样
@@ -7546,7 +7947,7 @@ def main():
             }
             if args.ext_eval_report:
                 with open(args.ext_eval_report, "w", encoding="utf-8") as f:
-                    json.dump(rep, f, ensure_ascii=False, indent=2)
+                    json.dump(rep, f, ensure_ascii=False, indent=2, default=_json_default)
             print("[ext-eval]", rep)
         except Exception as e:
             audit_reject("ext_eval_error", {"phase":"ext_eval", "err": str(e)})
@@ -7598,7 +7999,7 @@ def main():
         fid = hashlib.blake2b(blob, digest_size=16).hexdigest()
         with open(str(outp).replace('.jsonl','_stats.json'), 'w', encoding='utf-8') as fs:
             json.dump({"config": cfg_obj, "fingerprint": fid, 'dsl_coverage': coverage if 'coverage' in locals() else None,
-}, fs, ensure_ascii=False, indent=2)
+}, fs, ensure_ascii=False, indent=2, default=_json_default)
         print("[dry_run] wrote stats fingerprint:", fid)
         return
     total_n = max(1, args.n)
@@ -7631,20 +8032,25 @@ def main():
             raise RuntimeError("dsl_core.py 未导入成功，无法使用 --use_dsl")
         pin = {}
         dsl_n = pos_n
-        coverage_axes = ("strategy","channel","carrier","delivery",
-                 "ev_family","ev_bucket","anchor_free","contract_type",
-                 # style axes to avoid mono‑style bias
-                 "speech_family","region","register","industry","persona",
-                 # anchor_free soft evidence bucket (0/1/2+)
-                 "soft_bucket")
+        # 机制优先：加入机制路径键，覆盖预算先填补机制稀缺
+        coverage_axes = ("mechanism_path_key",
+                         "strategy","channel","carrier","delivery",
+                         "ev_family","ev_bucket","anchor_free","contract_type",
+                         # style axes to avoid mono-style bias
+                         "speech_family","region","register","industry","persona",
+                         # anchor_free soft evidence bucket (0/1/2+)
+                         "soft_bucket")
         pin = (pin or {})
-        pin = {**pin, "min_cjk_share": args.min_cjk_share, "structural_p": args.structural_p, "structural_pos_ratio": args.structural_p, "alias_p_cn": args.alias_p_cn, "anchor_free_p": args.anchor_free_p}
+        carrier_blacklist = set(pin.get("carrier_blacklist") or [])
+        carrier_blacklist.update({"pdf_form", "office_form"})
+        pin = {**pin, "min_cjk_share": args.min_cjk_share, "structural_p": args.structural_p, "structural_pos_ratio": args.structural_p, "alias_p_cn": args.alias_p_cn, "anchor_free_p": max(args.anchor_free_p, 0.85), "anchor_free_soft_min_hits": max(3, int(pin.get("anchor_free_soft_min_hits", 3))), "near_dup_thr": max(0.92, float(pin.get("near_dup_thr", 0.92))), "near_dup_vec_thr": max(0.965, float(pin.get("near_dup_vec_thr", 0.965))), "near_dup_ngram_thr": max(0.90, float(pin.get("near_dup_ngram_thr", 0.90))), "near_dup_global_sim_thr": max(0.96, float(pin.get("near_dup_global_sim_thr", 0.96))), "near_dup_global_ngram_thr": max(0.92, float(pin.get("near_dup_global_ngram_thr", 0.92))), "mechanism_jaccard_thresh": max(0.85, float(pin.get("mechanism_jaccard_thresh", 0.85))), "vec_dim_override": int(pin.get("vec_dim_override", 1024)), "tail_mix_p": max(0.20, float(pin.get("tail_mix_p", 0.20))), "carrier_blacklist": sorted(carrier_blacklist)}
         dsl_samples, coverage = generate_batch(
             n=dsl_n,
             seed=args.seed,
             pin=pin,
             coverage_axes=coverage_axes,
             min_per_combo=int(getattr(args, "coverage_min_per_combo", 0) or 0),
+            mechanism_signal_fn=_dsl_mechanism_probe,
         )
         pos_cands = []
         for s in dsl_samples:
@@ -7703,6 +8109,9 @@ def main():
                 _set_carrier_weight(ca, max(0.25*base, min(4.0*base, new_w)))
         except Exception as _e:
             print("[warn] dynamic reweight failed:", _e)
+        for _carrier in ("pdf_obj", "pdf_like", "ooxml_comment", "rtl_wrapper"):
+            if _carrier in CARRIER_WEIGHTS:
+                CARRIER_WEIGHTS[_carrier] = 0.001
         try:
             stats_path = Path(str(outp).replace('.jsonl','_stats.json'))
             try:
@@ -7728,7 +8137,7 @@ def main():
                     data["missing_renderer_rate"]  = miss / tot_att                    
                     data["gen_hparams"] = {"structural_p": args.structural_p, "min_cjk_share": args.min_cjk_share, "alias_p_cn": args.alias_p_cn, "dedupe_preserve_codeblocks": args.dedupe_preserve_codeblocks,}
                     fs.seek(0); fs.truncate()
-                    json.dump(data, fs, ensure_ascii=False, indent=2)
+                    json.dump(data, fs, ensure_ascii=False, indent=2, default=_json_default)
             except FileNotFoundError:
                 with open(stats_path, 'w', encoding='utf-8') as fs:
                     json.dump({
@@ -7737,7 +8146,7 @@ def main():
                         "cjk_reject_by_carrier":   (coverage or {}).get("reject_cjk_by_carrier"),
                         "cjk_avg_reject_rate":     (coverage or {}).get("avg_cjk_reject_rate"),
                         "missing_renderer_total":  int(((coverage or {}).get("fail_totals") or {}).get("missing_renderer", 0)),
-                    }, fs, ensure_ascii=False, indent=2)
+                    }, fs, ensure_ascii=False, indent=2, default=_json_default)
         except Exception as _e:
             print("[warn] failed to write dsl_coverage into stats:", _e)
 
@@ -8087,11 +8496,24 @@ def main():
         preserve_codeblocks=args.dedupe_preserve_codeblocks,
     )
     # pair-aware split (no leakage between splits) // 同组不跨集
+    def _split_group_key(row: dict) -> str:
+        pid = row.get("pair_id")
+        if pid:
+            return f"pair::{pid}"
+        eq = row.get("equiv_group_id")
+        if eq:
+            return f"equiv::{eq}"
+        mech_path = row.get("mechanism_path_key") or row.get("mechanism")
+        intent = row.get("intent") or "_"
+        if mech_path:
+            return f"mech::{mech_path}|{intent}"
+        fallback = stable_seed("solo_split", row.get("text", "")[:160], row.get("label", '_'))
+        return f"solo::{fallback}"
+
     random.seed(args.seed + 99)
     groups = defaultdict(list)
-    for i, r in enumerate(rows):
-        # 组阻断：优先用 pair_id，其次等价组 ID，最后按样本序号独立
-        gid = r.get("pair_id") or r.get("equiv_group_id") or f"solo-{i}"
+    for r in rows:
+        gid = _split_group_key(r)
         groups[gid].append(r)
     keys = list(groups.keys())
     random.shuffle(keys)
@@ -8106,8 +8528,8 @@ def main():
         if k in dev_k:   return "dev"
         return "test"
 
-    for i, r in enumerate(rows):
-        gid = r.get("pair_id") or r.get("equiv_group_id") or f"solo-{i}"
+    for r in rows:
+        gid = _split_group_key(r)
         r["split"] = _tag_split(gid)
 
     # 在 dev/test 中引入一定比例的中英/代码混写切片，弱化强制汉化修复带来的分布偏差
@@ -8205,7 +8627,7 @@ def main():
     if AUDIT_REJECTS:
         with open(auditp, "a", encoding="utf-8") as fa:
             for r in AUDIT_REJECTS:
-                fa.write(json.dumps(r, ensure_ascii=False) + "\n")
+                fa.write(json.dumps(r, ensure_ascii=False, default=_json_default) + "\n")
     print(f"[done] wrote: {outp} & {auditp} | total={len(rows)} "
           f"(neg_ratio≈{(sum(1 for x in rows if x['label']==0)/(len(rows)+1e-9)):.3f})")
 
@@ -8224,7 +8646,7 @@ def main():
                 except Exception:
                     pass
         with open(stats_path, "w", encoding="utf-8") as fw:
-            json.dump(_stats, fw, ensure_ascii=False, indent=2)
+            json.dump(_stats, fw, ensure_ascii=False, indent=2, default=_json_default)
     except Exception as _e:
         print("[warn] semantic neighbor audit skipped:", _e)
 
@@ -8376,14 +8798,14 @@ def main():
                     'alias': dict(PLAIN_ALIAS_HITS_BY_CARRIER),
                 },
                 'intent_alias_audit': _alias,
-            }, fs, ensure_ascii=False, indent=2)
+            }, fs, ensure_ascii=False, indent=2, default=_json_default)
         with open(str(outp).replace('.jsonl','_coverage_matrix.json'), 'w', encoding='utf-8') as fc:
-            json.dump({'pos': {str(k): v for k, v in cov_pos.items()}, 'neg': {str(k): v for k, v in cov_neg.items()}}, fc, ensure_ascii=False, indent=2)
+            json.dump({'pos': {str(k): v for k, v in cov_pos.items()}, 'neg': {str(k): v for k, v in cov_neg.items()}}, fc, ensure_ascii=False, indent=2, default=_json_default)
         # ---- persist carrier weights for next run ----
         try:
             weights_path = Path(str(outp)).with_suffix("").as_posix() + "_weights.json"
             with open(weights_path, "w", encoding="utf-8") as f:
-                json.dump({'carriers': CARRIER_WEIGHTS, 'deliveries': DELIVERY_WEIGHTS}, f, ensure_ascii=False, indent=2)
+                json.dump({'carriers': CARRIER_WEIGHTS, 'deliveries': DELIVERY_WEIGHTS}, f, ensure_ascii=False, indent=2, default=_json_default)
             # 同时把快照抄一份进 stats（便于观测；若刚写就是最新可跳过）
             try:
                 stats_path = Path(str(outp).replace('.jsonl','_stats.json'))
@@ -8396,7 +8818,7 @@ def main():
                     data["effect_policy"]    = getattr(args, "effect_policy", "skip")
                     data["effect_gate_for"]  = getattr(args, "effect_gate_for", "none")
                     fs.seek(0); fs.truncate()
-                    json.dump(data, fs, ensure_ascii=False, indent=2)
+                    json.dump(data, fs, ensure_ascii=False, indent=2, default=_json_default)
             except Exception:
                 pass
         except Exception as e:
@@ -8414,7 +8836,7 @@ def main():
             audit_reject_hist= AUDIT_REASON_COUNT,
         )
         with open(str(outp).replace('.jsonl','_report.json'), 'w', encoding='utf-8') as fr:
-            json.dump(report, fr, ensure_ascii=False, indent=2)
+            json.dump(report, fr, ensure_ascii=False, indent=2, default=_json_default)
     except Exception as _e:
         print('[warn] failed to write stats artifacts:', _e)
 
@@ -8577,7 +8999,7 @@ def main():
 
         try:
             with open(str(out_path).replace('.jsonl','_quality_report.json'), 'w', encoding='utf-8') as fq:
-                json.dump(rep, fq, ensure_ascii=False, indent=2)
+                json.dump(rep, fq, ensure_ascii=False, indent=2, default=_json_default)
         except Exception as e:
             print('[warn] failed to write quality report:', e)
 
@@ -8618,8 +9040,36 @@ def main():
     report_dataset_stats(rows, outp)
 
     # 简易泄漏压力测试（字符 n-gram 线性打分）
+    leak_target = float(getattr(args, "leakage_auc_target", 0.82))
+    leak_max_iters = max(0, int(getattr(args, "leakage_max_iters", 3)))
+    leak_info: Optional[Dict[str, Any]] = None
     try:
-        leakage_pressure_test(rows)
+        leak_info = leakage_pressure_test(rows, threshold=leak_target, return_details=True)
+        iter_idx = 0
+        while leak_info and leak_info.get("auc", 0.0) > leak_target and iter_idx < leak_max_iters:
+            adjusted = mitigate_leakage(rows, leak_info, iteration=iter_idx)
+            if adjusted <= 0:
+                print(f"[leakage] mitigation halted (no adjustments) at iter={iter_idx}")
+                break
+            leak_info = leakage_pressure_test(rows, threshold=leak_target, return_details=True)
+            iter_idx += 1
+        if leak_info:
+            final_auc = float(leak_info.get('auc', 0.0))
+            print(f"[leakage] final AUC={final_auc:.3f} target={leak_target:.3f} (iters={iter_idx})")
+            try:
+                vocab = list((leak_info or {}).get('vocab') or [])
+                suspects = ("```", "json", "{", "}", "yaml", "href", "<!--", "-->")
+                if any(any(token in gram for token in suspects) for gram in vocab[:32]):
+                    for ca in ("jsonc", "yaml_front_matter", "table_md", "html_comment", "md_ref_link"):
+                        try:
+                            base_w = float(_carrier_weight_lookup(ca, 0.02))
+                            _set_carrier_weight(ca, max(0.3 * base_w, base_w * 0.7))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            if final_auc > leak_target:
+                raise SystemExit(f"[leakage][fail] AUC={final_auc:.3f} > target={leak_target:.3f}")
     except Exception as _e:
         print(f"[leakage][warn] stress test skipped: {_e}")
     # 遮蔽/附件/免责声明对称率
@@ -8754,4 +9204,5 @@ def main():
         except Exception as _e:
             print("[regress][warn] symmetry_regression failed:", _e)
 if __name__ == "__main__":
+    _emit_capability_report()
     main()

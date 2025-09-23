@@ -100,6 +100,8 @@ class DedupeRecord:
     minhash: object  # datasketch MinHash or tuple fallback
     vector: Optional[List[float]]
     external_vector: Optional[List[float]] = None
+    exact_hash: int = 0
+    exact_len: int = 0
 
 
 def _default_normalize(text: str) -> str:
@@ -111,6 +113,18 @@ def _default_normalize(text: str) -> str:
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def _md5_u128(text: str) -> int:
+    try:
+        data = text.encode("utf-8")
+    except Exception:
+        data = str(text or "").encode("utf-8")
+    try:
+        digest = hashlib.md5(data, usedforsecurity=False).digest()
+    except TypeError:
+        digest = hashlib.md5(data).digest()
+    return int.from_bytes(digest, "big")
 
 
 @lru_cache(maxsize=1 << 20)
@@ -405,6 +419,7 @@ class Deduper:
         self.max_vecs = int(max_vecs)
         self._normalizer = normalizer or _default_normalize
         self.sim_sigs: List[int] = []
+        self._exact_hashes: Set[Tuple[int, int]] = set()
         self._bk_tree = None
         self._faiss_sim = None
         if faiss is not None and self.sim_bits % 8 == 0:
@@ -429,6 +444,13 @@ class Deduper:
             except Exception:
                 self._annoy = None
         self._vecs_mat: Optional[np.ndarray] = None
+        self._vecs_cursor: int = 0
+        self._vecs_filled: int = 0
+        if self.vec_dim > 0 and self.max_vecs > 0:
+            try:
+                self._vecs_mat = np.zeros((self.max_vecs, self.vec_dim), dtype=np.float32)
+            except Exception:
+                self._vecs_mat = None
         if not hasattr(Deduper, "_ext_embed_fn"):
             Deduper._ext_embed_fn = None
             Deduper._ext_vecs = []
@@ -438,6 +460,18 @@ class Deduper:
     def set_external_embedder(cls, fn, cos_thresh: float = 0.90):
         cls._ext_embed_fn = fn
         cls._ext_cos = float(cos_thresh) if cos_thresh else 0.90
+
+    def check_digest(self, text: str) -> bool:
+        """Fast exact-duplicate check on normalized text."""
+        try:
+            norm = self._normalizer(text)
+        except Exception:
+            norm = text or ""
+        try:
+            fingerprint = (len(norm), _md5_u128(norm))
+        except Exception:
+            return True
+        return fingerprint not in self._exact_hashes
 
     def _embed(self, normalized: str) -> Optional[List[float]]:
         if self.vec_dim <= 0:
@@ -475,6 +509,8 @@ class Deduper:
         shingles = _char_shingles(normalized, self.k)
         minhash = _minhash(shingles, self.n_hash)
         vector = self._embed(normalized)
+        exact_len = len(normalized)
+        exact_hash = _md5_u128(normalized)
         return DedupeRecord(
             raw_text=text,
             normalized=normalized,
@@ -483,6 +519,8 @@ class Deduper:
             shingles=shingles,
             minhash=minhash,
             vector=vector,
+            exact_hash=exact_hash,
+            exact_len=exact_len,
         )
 
     def _cosine_near(self, vec: Optional[List[float]]) -> bool:
@@ -512,12 +550,14 @@ class Deduper:
                     if cos >= self.cosine_thresh:
                         return True
         mat = self._vecs_mat
-        if mat is not None and mat.size > 0:
+        count = getattr(self, "_vecs_filled", 0)
+        if mat is not None and mat.size > 0 and count > 0:
             query = np.asarray(vec, dtype=np.float32)
+            active = mat if count >= mat.shape[0] else mat[:count, :]
             try:
-                scores = mat @ query
+                scores = active @ query
             except Exception:
-                scores = np.dot(mat, query)
+                scores = np.dot(active, query)
             if np.any(scores >= self.cosine_thresh):
                 return True
         return False
@@ -539,6 +579,10 @@ class Deduper:
         return False
 
     def check_record(self, record: DedupeRecord) -> Tuple[bool, Optional[str]]:
+        fingerprint = (record.exact_len, record.exact_hash)
+        if fingerprint in self._exact_hashes:
+            return False, "exact"
+
         if self._faiss_sim is not None and self._faiss_sim.ntotal > 0 and record.sig_bytes is not None:
             k = min(64, self._faiss_sim.ntotal) or 1
             D, _ = self._faiss_sim.search(record.sig_bytes, k)
@@ -571,19 +615,35 @@ class Deduper:
         return True, None
 
     def add_record(self, record: DedupeRecord) -> None:
+        self._exact_hashes.add((record.exact_len, record.exact_hash))
         self.sim_sigs.append(record.simhash)
         if self._bk_tree is not None:
             self._bk_tree.add(record.simhash)
         self.index.add(record.minhash, record.shingles)
         if self.vec_dim > 0 and record.vector is not None:
-            vec_arr = np.asarray(record.vector, dtype=np.float32).reshape(1, -1)
-            if self._vecs_mat is None:
-                self._vecs_mat = vec_arr
-            else:
-                if self._vecs_mat.shape[0] >= self.max_vecs:
-                    self._vecs_mat = np.vstack((self._vecs_mat[1:], vec_arr))
+            arr = np.asarray(record.vector, dtype=np.float32).reshape(-1)
+            buf = self._vecs_mat
+            if buf is not None and self.max_vecs > 0 and buf.shape[0] == self.max_vecs and arr.size == buf.shape[1]:
+                idx = self._vecs_cursor
+                try:
+                    buf[idx, :] = arr
+                    self._vecs_cursor = (self._vecs_cursor + 1) % buf.shape[0]
+                    self._vecs_filled = min(self._vecs_filled + 1, buf.shape[0])
+                except Exception:
+                    pass
+            elif arr.size == self.vec_dim:
+                arr2 = arr.reshape(1, -1)
+                if buf is None:
+                    self._vecs_mat = arr2
                 else:
-                    self._vecs_mat = np.vstack((self._vecs_mat, vec_arr))
+                    try:
+                        self._vecs_mat = np.vstack((buf, arr2))
+                    except Exception:
+                        return
+                    if self.max_vecs > 0 and self._vecs_mat.shape[0] > self.max_vecs:
+                        self._vecs_mat = self._vecs_mat[-self.max_vecs:]
+                self._vecs_filled = self._vecs_mat.shape[0] if self._vecs_mat is not None else 0
+                self._vecs_cursor = self._vecs_filled % max(1, self.max_vecs) if self.max_vecs > 0 else 0
         if self._faiss_sim is not None and record.sig_bytes is not None:
             try:
                 self._faiss_sim.add(record.sig_bytes)
