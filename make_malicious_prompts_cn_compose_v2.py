@@ -188,8 +188,7 @@ TEMPLATE_VER = "v2.1-intent-gate"
 
 def audit_reject(reason: str, ctx: dict):
     """
-    统一的拒绝/错误审计：把阶段/原因/片段/家族/意图等写入 AUDIT_*，
-    便于 _stats.json 汇总分析。
+    统一的拒绝/告警出口，将阶段/原因/片段/结构写入 AUDIT_*，便于 _stats.json 进一步分析
     """
     import sys, re, time
     try:
@@ -197,14 +196,11 @@ def audit_reject(reason: str, ctx: dict):
             "ts": round(time.time(), 3),
             "reason": reason,
         }
-        # 常见元信息（有则收）
         for k in ("phase", "task", "family", "intent", "pair_id", "combo", "sig", "policy"):
             if k in ctx and ctx[k] is not None:
                 rec[k] = ctx[k]
-        # 错误/异常
         if "err" in ctx and ctx["err"]:
             rec["err"] = str(ctx["err"])
-        # 文本片段（裁剪，防炸文件）
         if "text" in ctx and ctx["text"]:
             snip = re.sub(r"\s+", " ", str(ctx["text"]).replace("\n", " "))[:160]
             rec["text_snippet"] = snip
@@ -212,8 +208,23 @@ def audit_reject(reason: str, ctx: dict):
         AUDIT_REASON_COUNT[reason] = AUDIT_REASON_COUNT.get(reason, 0) + 1
         AUDIT_REJECTS.append(rec)
     except Exception as e:
-        # 审计自身失败时至少报到 stderr
         sys.stderr.write(f"[audit_reject-fail] {reason}: {e}\n")
+
+
+def _cfg_attr(cfg_obj, name: str, default):
+    if cfg_obj is None:
+        return default
+    if isinstance(cfg_obj, dict):
+        return cfg_obj.get(name, default)
+    return getattr(cfg_obj, name, default)
+
+def audit_soft(reason: str, exc: Exception, ctx: dict | None = None):
+    payload = dict(ctx or {})
+    try:
+        payload["err"] = str(exc)
+    except Exception:
+        payload["err"] = repr(exc)
+    audit_reject(reason, payload)
 
 # Central configuration dataclass to carry a single source of truth
 from dataclasses import dataclass
@@ -2521,7 +2532,7 @@ def _pick_delivery_mode(rng: random.Random) -> str:
         return rng.choice(DELIVERY_MODES)
 
 def build_delivery(target_prompt: str, inj_text: str, force_mode: Optional[str] = None,
-                   rng: Optional[random.Random] = None) -> Tuple[str, str]:
+                   rng: Optional[random.Random] = None, cfg: Optional[Config] = None) -> Tuple[str, str]:
     """Wrap injection by delivery mode. // 用不同投递方式包装注入。"""
     local_rng = rng or random
     mode = force_mode if force_mode in DELIVERY_MODES else _pick_delivery_mode(local_rng)
@@ -2553,7 +2564,7 @@ def build_delivery(target_prompt: str, inj_text: str, force_mode: Optional[str] 
         show_slot = (local_rng.random() < 0.70)
         # 可选：在最后注入前插入“工具参数示例”的多轮版本
         try:
-            rate = float(getattr(globals().get('cfg', _NS(mt_tool_override_rate=0.25)), 'mt_tool_override_rate', 0.25))
+            rate = float(_cfg_attr(cfg, 'mt_tool_override_rate', 0.25))
         except Exception:
             rate = 0.25
         if local_rng.random() < rate:
@@ -3475,13 +3486,14 @@ def randomize_field_aliases(body: str, p_cn: float = None, rng: random.Random = 
     try:
         from dsl_core import randomize_field_aliases as _rf
         body = _rf(body, p_cn if p_cn is not None else ALIAS_P_CN, rng=rng)
-    except Exception:
-        pass  # 没有 dsl_core 就直接走本地规则
+    except Exception as exc:
+        audit_soft("alias_randomize_import_fail", exc, {"phase": "alias_randomize"})
     # 2) 再叠加本地更精确的 alias 规则
     for rx, repl in _ALIAS_RXES:
         try:
             body = rx.sub(repl, body)
-        except Exception:
+        except Exception as exc:
+            audit_soft("alias_randomize_regex_error", exc, {"phase": "alias_randomize", "pattern": getattr(rx, 'pattern', None)})
             continue
     return body
 
@@ -3516,7 +3528,8 @@ def choose_carrier_name(rng: random.Random | None = None, include_none: bool = T
         return picker.choice(names)
     try:
         return picker.choices(names, weights=normed, k=1)[0]
-    except Exception:
+    except Exception as exc:
+        audit_soft("carrier_choice_error", exc, {"phase": "carrier_picker", "candidate_count": len(names)})
         return picker.choice(names)
 
 def wrap_with_domain(body: str) -> Tuple[str,str]:
@@ -4516,9 +4529,9 @@ def _attack_render_core(seed: int) -> tuple[Optional[RenderPacket], list[tuple[s
     try:
         if (channel == "multi_turn" or force_multi) and rng.random() < 0.40:
             inj_text_prog = compose_conversation_attacks_sample(t['prompt'], payload)
-            base, mode = build_delivery(t['prompt'], inj_text_prog, force_mode="multi_turn", rng=rng)
+            base, mode = build_delivery(t['prompt'], inj_text_prog, force_mode="multi_turn", rng=rng, cfg=cfg)
         else:
-            base, mode = build_delivery(t['prompt'], inj_text, force_mode=("multi_turn" if force_multi else None), rng=rng)
+            base, mode = build_delivery(t['prompt'], inj_text, force_mode=("multi_turn" if force_multi else None), rng=rng, cfg=cfg)
     except Exception as e:
         logs.append(("delivery_error", {"err": str(e)}))
         base, mode = inj_text, "in_context"
@@ -4842,7 +4855,8 @@ class AttackSelector:
                  target_n: int,
                  wanted: int,
                  targets: List[Dict[str, Any]],
-                 adaptive: Optional[AdaptiveOversample] = None):
+                 adaptive: Optional[AdaptiveOversample] = None,
+                 cfg: Optional[Config] = None):
         self.seed = seed
         self.min_cjk_share = min_cjk_share
         self.min_cjk_share_auto = min_cjk_share_auto
@@ -4879,6 +4893,7 @@ class AttackSelector:
         self.wanted = max(1, int(wanted))
         self.adaptive = adaptive
         self.targets = targets
+        self.cfg = cfg
         self.cover = Counter()
         self.fam_count = Counter()
         self.cands: list[dict] = []
@@ -4984,7 +4999,7 @@ class AttackSelector:
         bucket_min = (0.70 if mode == 'multi_turn' else (0.50 if has_struct else 0.60))
         target_min_cjk = max(bucket_min, base_cjk)
         cur_share = cjk_share(text)
-        policy = str(getattr(globals().get('cfg', _NS(cjk_policy='tiered')), 'cjk_policy', 'tiered'))
+        policy = _cfg_attr(self.cfg, 'cjk_policy', 'tiered')
         if policy == 'hard':
             if cur_share < target_min_cjk:
                 audit_reject("cjk_ratio", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
@@ -5002,22 +5017,22 @@ class AttackSelector:
         _ok_diag, vio = gate_by_contract_from_dsl(contract, dsl, text, require_support=bool(self.gate_semantic_injection))
 
         def _passes_side_effects(text_eval: str) -> bool:
-            _cfg_local = globals().get('cfg')
-            votes, total = 0, max(1, int(getattr(_cfg_local, 'se_votes', 1)))
+            total = max(1, int(_cfg_attr(self.cfg, 'se_votes', 1)))
+            votes = 0
             for i in range(total):
                 te = re.sub("[\u200b\u200c\u2060]", "", text_eval) if (i % 2 == 0) else re.sub(r"\s+", " ", text_eval)
                 try:
-                    se = run_sim_agent(t.get("task"), te, contract)
+                    se = run_sim_agent(t.get('task'), te, contract)
                 except Exception as e:
                     audit_reject("side_effects_engine_missing", {"err": str(e)})
                     return False
                 if _side_effects_violate_contract(contract, se):
                     votes += 1
             return votes >= max(1, (total+1)//2)
-        _cfg_local = globals().get('cfg')
-        if (_cfg_local and bool(getattr(_cfg_local, 'require_side_effects', False))):
+
+        if bool(_cfg_attr(self.cfg, 'require_side_effects', False)):
             if not _passes_side_effects(text):
-                audit_reject("side_effects_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                audit_reject("side_effects_gate", {"task": t.get('task','_'), "family": fam_name, "intent": mapped_intent, "pair_id": None})
                 return False
 
         if self.gate_semantic_injection:
@@ -5063,8 +5078,8 @@ class AttackSelector:
                 text = inject_soft_hints(text, need=2, must_include_contract=False, rnd=rng_pair)
                 vio = (vio or {})
                 vio = {**vio, "soft_hint_applied": True}
-        except Exception:
-            pass
+        except Exception as exc:
+            audit_soft("soft_hint_apply_error", exc, {"phase": "soft_hint", "pair_id": pair_id})
 
         artifact_free_applied = False
         if self.artifact_free_pos_ratio > 1e-9:
@@ -5283,7 +5298,8 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     use_model_eval: bool = False,
                     artifact_free_pos_ratio: float | None = None,
                     gate_semantic_injection: bool = True,
-                    coverage_min_per_combo: int = 0) -> List[Dict[str,Any]]:
+                    coverage_min_per_combo: int = 0,
+                    cfg: Optional[Config] = None) -> List[Dict[str,Any]]:
     random.seed(seed)
     # unify effective knobs with CLI defaults
     disc_rate = _effective_disc_rate(disc_rate)
@@ -5372,16 +5388,15 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
         force_multi = (random.random() < 0.30)
         if (channel == "multi_turn" or force_multi) and random.random() < 0.40:
             inj_text_prog = compose_conversation_attacks_sample(t['prompt'], payload)
-            base, mode = build_delivery(t['prompt'], inj_text_prog, force_mode="multi_turn")
+            base, mode = build_delivery(t['prompt'], inj_text_prog, force_mode="multi_turn", cfg=cfg)
         else:
-            base, mode = build_delivery(t['prompt'], inj_text, force_mode=("multi_turn" if force_multi else None))
+            base, mode = build_delivery(t['prompt'], inj_text, force_mode=("multi_turn" if force_multi else None), cfg=cfg)
         raw  = inject_unicode_noise(inject_noise_light(base), p=NOISE_P)
         text = normalize(raw)
         # —— 1) Optional adversarial hill‑climb to reduce artifacty evidence while preserving effect ——
         try:
-            _cfg = globals().get('cfg')
-            if _cfg and bool(getattr(_cfg, 'adv_mutate', False)):
-                text = adversarial_search(text, contract, payload, max_iters=int(getattr(_cfg, 'adv_iters', 6)), seed=seed)
+            if bool(_cfg_attr(cfg, 'adv_mutate', False)):
+                text = adversarial_search(text, contract, payload, max_iters=int(_cfg_attr(cfg, 'adv_iters', 6)), seed=seed)
         except Exception as e:
             audit_reject("adv_mutate_error", {"phase":"compose_pos", "err": str(e)})
         # 近邻软拒（放在 normalize/对抗搜索 后、CJK 检查前）
@@ -5400,7 +5415,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
         bucket_min = (0.70 if mode == 'multi_turn' else (0.50 if has_struct else 0.60))
         target_min_cjk = max(bucket_min, base_cjk)
         cur_share = cjk_share(text)
-        policy = str(getattr(globals().get('cfg', _NS(cjk_policy='tiered')), 'cjk_policy', 'tiered'))
+        policy = _cfg_attr(cfg, 'cjk_policy', 'tiered')
         if policy == 'hard':
             if cur_share < target_min_cjk:
                 audit_reject("cjk_ratio", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
@@ -5424,7 +5439,8 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
 
         # 6) （可选）副作用证据一致性投票：工具/通道/上游/检索/记忆 任一命中
         def _passes_side_effects(text_eval: str) -> bool:
-            votes, total = 0, max(1, int((cfg.se_votes if 'cfg' in globals() else 1)))
+            total = max(1, int(_cfg_attr(cfg, 'se_votes', 1)))
+            votes = 0
             for i in range(total):
                 te = re.sub("[\u200b\u200c\u2060]", "", text_eval) if (i % 2 == 0) else re.sub(r"\s+", " ", text_eval)
                 try:
@@ -5435,7 +5451,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                 if _side_effects_violate_contract(contract, se):
                     votes += 1
             return votes >= max(1, (total+1)//2)
-        if (globals().get('cfg') and bool(getattr(cfg, 'require_side_effects', False))):
+        if bool(_cfg_attr(cfg, 'require_side_effects', False)):
             if not _passes_side_effects(text):
                 audit_reject("side_effects_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
                 continue
@@ -5481,8 +5497,8 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                 text = inject_soft_hints(text, need=2, must_include_contract=False, rnd=rng_pair)
                 neg_diag_audit = (neg_diag_audit or {})
                 neg_diag_audit["soft_hint_applied"] = True
-        except Exception:
-            pass
+        except Exception as exc:
+            audit_soft("soft_hint_apply_error", exc, {"phase": "soft_hint", "pair_id": locals().get("pair_id")})
         # 强制一部分正样本“无显词/弱锚点”，降低关键字依赖
         artifact_free_applied = False
         if artifact_free_pos_ratio > 1e-9:
@@ -5724,7 +5740,8 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     gate_semantic_injection: bool = True,
                     coverage_min_per_combo: int = 0,
                     workers: int = 0,
-                    producer_batch: int = 128) -> List[Dict[str,Any]]:
+                    producer_batch: int = 128,
+                    cfg: Optional[Config] = None) -> List[Dict[str,Any]]:
     workers = int(workers or 0)
     # 1 = serial; 0 or >=2 => parallel with auto-tuning
     if workers == 1:
@@ -5744,6 +5761,7 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
             artifact_free_pos_ratio=artifact_free_pos_ratio,
             gate_semantic_injection=gate_semantic_injection,
             coverage_min_per_combo=coverage_min_per_combo,
+            cfg=cfg,
         )
 
     workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
@@ -5789,6 +5807,7 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
         wanted=wanted,
         targets=target_pool,
         adaptive=oversample_ctl,
+        cfg=cfg,
     )
     selector.set_quotas(n)
 
@@ -5807,7 +5826,6 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
     except Exception:
         print('[faiss] status unknown')
 
-    _cfg = globals().get('cfg')
     cfg_dict = {
         "artifact_rate": artifact_rate,
         "carrier_mix_prob": carrier_mix_prob,
@@ -5815,9 +5833,10 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
         "code_switch_prob": code_switch_prob,
         "use_model_eval": use_model_eval,
         "evolve_variants": evolve_variants,
-        "adv_mutate": bool(_cfg and getattr(_cfg, 'adv_mutate', False)),
-        "adv_iters": int(getattr(_cfg, 'adv_iters', 6)) if _cfg else 6,
+        "adv_mutate": bool(_cfg_attr(cfg, 'adv_mutate', False)),
+        "adv_iters": int(_cfg_attr(cfg, 'adv_iters', 6)),
         "noise_p": NOISE_P,
+        "mt_tool_override_rate": float(_cfg_attr(cfg, 'mt_tool_override_rate', 0.25)),
     }
 
     max_attempts = max(20000, wanted * 50)
@@ -5913,7 +5932,8 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
                       dedupe_preserve_codeblocks: bool = False,
                       use_end_nonce: bool = False,
                       use_model_eval: bool = False,
-                      strict_neg_diag_gate: bool = True) -> List[Dict[str,Any]]:
+                      strict_neg_diag_gate: bool = True,
+                      cfg: Optional[Config] = None) -> List[Dict[str,Any]]:
     random.seed(seed + 1337)
     disc_rate = _effective_disc_rate(disc_rate)
     eff_mult, _ = _resolve_oversample_multiplier(k, oversample_mult)
@@ -5974,7 +5994,7 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
                 ok_diag, _vio = gate_by_contract_from_dsl(contract_neg, PIDSL("policy_bypass","in_context","inline","result_slot","html_comment"), txt, require_support=True)
                 if ok_diag:
                     suspect_neg += 1
-                    keep_p = float(getattr(globals().get('cfg', _NS(gray_neg_keep_frac=0.35)), 'gray_neg_keep_frac', 0.35))
+                    keep_p = float(_cfg_attr(cfg, 'gray_neg_keep_frac', 0.35))
                     if random.random() > keep_p:
                         continue
                     else:
@@ -5990,7 +6010,7 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
 
         # --- CJK share policy: hard/tiered/audit ---
         cur_share = cjk_share(text)
-        policy = str(getattr(globals().get('cfg', _NS(cjk_policy='tiered')), 'cjk_policy', 'tiered'))
+        policy = _cfg_attr(cfg, 'cjk_policy', 'tiered')
         base_cjk = (random.choice([0.6,0.7,0.85,0.9]) if min_cjk_share_auto else min_cjk_share)
         if policy == 'hard':
             if cur_share < target_min_cjk:
@@ -6092,7 +6112,8 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
                       use_model_eval: bool = False,
                       strict_neg_diag_gate: bool = True,
                       workers: int = 0,
-                      producer_batch: int = 128) -> List[Dict[str,Any]]:
+                      producer_batch: int = 128,
+                      cfg: Optional[Config] = None) -> List[Dict[str,Any]]:
     workers = int(workers or 0)
     if workers == 1:
         return _compose_hard_negs_serial(
@@ -6108,6 +6129,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
             use_end_nonce=use_end_nonce,
             use_model_eval=use_model_eval,
             strict_neg_diag_gate=strict_neg_diag_gate,
+            cfg=cfg,
         )
 
     workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
@@ -6128,7 +6150,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
         'max_vecs': getattr(deduper, 'max_vecs', 20000),
     }
 
-    cfg = {
+    cfg_dict = {
         'seed': seed,
         'min_cjk_share': min_cjk_share,
         'min_cjk_share_auto': bool(min_cjk_share_auto),
@@ -6144,6 +6166,8 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
         'use_end_nonce': use_end_nonce,
         'use_model_eval': use_model_eval,
         'strict_neg_diag_gate': strict_neg_diag_gate,
+        'gray_neg_keep_frac': float(_cfg_attr(cfg, 'gray_neg_keep_frac', 0.35)),
+        'cjk_policy': _cfg_attr(cfg, 'cjk_policy', 'tiered'),
         'worker_family_cap': max(1, int(math.ceil(producer_batch * max(1.0, eff_mult)))),
         'deduper_params': deduper_params,
     }
@@ -6155,7 +6179,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
     max_attempts = max(wanted * 50, int(producer_batch * workers * 10))
 
     with Pool(processes=workers, initializer=_hard_neg_producer_init,
-              initargs=(target_pool, cfg)) as pool:
+              initargs=(target_pool, cfg_dict)) as pool:
         try:
             for payload in pool.imap_unordered(_hard_neg_producer_job, job_stream, chunksize=chunk_size):
                 chunk = payload.get('cands', []) if isinstance(payload, dict) else []
@@ -6402,7 +6426,8 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
             try:
                 body = fn(content)
                 return (name, body)
-            except Exception:
+            except Exception as exc:
+                audit_soft("carrier_render_error", exc, {"phase": "benign_carrier", "carrier": name})
                 return (name, content)
         return ("none", content)
 
@@ -7871,7 +7896,7 @@ def main():
             effect_replicas=args.effect_replicas,
             evolve_variants=args.evolve_variants,
             mask_on=args.mask_on,
-                        dedupe_preserve_carrier=args.dedupe_preserve_carrier,
+            dedupe_preserve_carrier=args.dedupe_preserve_carrier,
             dedupe_preserve_codeblocks=args.dedupe_preserve_codeblocks,
             use_end_nonce=args.invariance_end_nonce,
             use_model_eval=args.use_model_eval,
@@ -7880,6 +7905,7 @@ def main():
             coverage_min_per_combo=args.coverage_min_per_combo,
             workers=args.mp_workers,
             producer_batch=args.mp_batch,
+            cfg=cfg,
         )
     # Plain negatives quota // 纯净良性指令配额
     plain_quota  = int(round(neg_n * max(0.0, min(1.0, args.plain_neg_ratio))))
@@ -7925,7 +7951,8 @@ def main():
         use_model_eval=args.use_model_eval,
         strict_neg_diag_gate=(args.balance_mode=="strict" or args.effect_gate_for in {"devtest","all"}),
         workers=args.mp_workers,
-        producer_batch=args.mp_batch
+        producer_batch=args.mp_batch,
+        cfg=cfg
     ) if other_quota>0 else []
     # Real-world negatives (optional)
     target_paired = paired_quota
@@ -8734,7 +8761,7 @@ def main():
     print(f"[leakage] disclaimer P(pos)={disc_pos:.3f}  P(neg)={disc_neg:.3f}  Δ={abs(disc_pos-disc_neg):.3f}")
     print(f"[leakage] artifact   P(pos)={art_pos:.3f}   P(neg)={art_neg:.3f}   Δ={abs(art_pos-art_neg):.3f}")
     try:
-        req_se = bool(getattr(cfg, 'require_side_effects', False)) if 'cfg' in globals() else False
+        req_se = bool(_cfg_attr(cfg, 'require_side_effects', False))
         print(f"[side_effects] require={req_se} rejects={AUDIT_REASON_COUNT.get('semantic_gate',0)}")
     except Exception as e:
         audit_reject("stats_print_error", {"phase":"main", "err": e})
