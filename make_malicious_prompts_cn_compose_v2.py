@@ -2492,6 +2492,14 @@ ATTACK_FAMILIES_ARTIFACT: Dict[str, List[str]] = {
 }
 
 DELIVERY_MODES = ["direct","format","indirect","multi_turn","long_web"]
+DELIVERY_WEIGHTS = {
+    "direct": 0.32,
+    "format": 0.20,
+    "indirect": 0.13,
+    "multi_turn": 0.20,
+    "long_web": 0.15,
+}
+
 ROLE_SETS = [
     ("用户", "助手"),
     ("提问者", "解答者"),
@@ -2502,11 +2510,21 @@ ROLE_SETS = [
     ("[User]", "[Assistant]")
 ]
 
+def _pick_delivery_mode(rng: random.Random) -> str:
+    weights = [max(0.0, float(DELIVERY_WEIGHTS.get(m, 1.0))) for m in DELIVERY_MODES]
+    total = sum(weights)
+    if total <= 0.0:
+        return rng.choice(DELIVERY_MODES)
+    try:
+        return rng.choices(DELIVERY_MODES, weights=weights, k=1)[0]
+    except Exception:
+        return rng.choice(DELIVERY_MODES)
+
 def build_delivery(target_prompt: str, inj_text: str, force_mode: Optional[str] = None,
                    rng: Optional[random.Random] = None) -> Tuple[str, str]:
     """Wrap injection by delivery mode. // 用不同投递方式包装注入。"""
     local_rng = rng or random
-    mode = force_mode if force_mode in DELIVERY_MODES else local_rng.choice(DELIVERY_MODES)
+    mode = force_mode if force_mode in DELIVERY_MODES else _pick_delivery_mode(local_rng)
     sep = random_sep(local_rng); title = random_title(local_rng)
     if mode == "direct":
         base = f"{title}\n{target_prompt}{sep}{inj_text}"
@@ -3651,10 +3669,21 @@ CARRIER_WEIGHTS = {
     "js_multiline_comment":0.02, "env_file":0.02, "email_forward_chain":0.02, "pr_template":0.02,
     "footnote_richtext":0.02, "rtl_wrapper":0.02, "pdf_like":0.02,
     # Natural domain extras
-    "ticket_comment":0.06, "short_post":0.06, "chat_dialog":0.20,
+    "ticket_comment":0.06, "short_post":0.06,
     # none baseline
     "none":0.10
 }
+
+def _carrier_weight_lookup(name: str, default: float = 0.05) -> float:
+    if name == "chat_dialog":
+        return float(DELIVERY_WEIGHTS.get("multi_turn", default))
+    return float(CARRIER_WEIGHTS.get(name, default))
+
+def _set_carrier_weight(name: str, value: float) -> None:
+    if name == "chat_dialog":
+        DELIVERY_WEIGHTS["multi_turn"] = float(value)
+    elif name in CARRIER_WEIGHTS:
+        CARRIER_WEIGHTS[name] = float(value)
 
 def _char_ngrams(s: str, n: int = 3, cap: int = 2048) -> list[str]:
     s = _re.sub(r"\s+", " ", s or "").strip()
@@ -6233,10 +6262,11 @@ def pick_by_intent_carrier_delivery_anchor(rows_pos, pos_n, seed: int):
     iw = [INTENT_TARGET_DIST.get(i, 0.05) for i in intents]
     iw_s = sum(iw) or 1.0; iw = [x/iw_s for x in iw]
     # 归一 carrier
-    cw = [CARRIER_WEIGHTS.get(c, 0.05) for c in carriers]
+    cw = [_carrier_weight_lookup(c, 0.05) for c in carriers]
     cw_s = sum(cw) or 1.0; cw = [x/cw_s for x in cw]
     # delivery 均匀
-    dw = [1.0/len(deliveries) for _ in deliveries]
+    dw = [DELIVERY_WEIGHTS.get(d, 0.2) for d in deliveries]
+    dw_s = sum(dw) or 1.0; dw = [x/dw_s for x in dw]
     aw = [0.5, 0.5]
     # 生成配额并取整
     plan = []
@@ -7555,9 +7585,25 @@ def main():
             with open(weights_path, "r", encoding="utf-8") as f:
                 w = json.load(f)
                 if isinstance(w, dict):
-                    for k, v in w.items():
-                        if k in CARRIER_WEIGHTS and isinstance(v, (int, float)):
-                            CARRIER_WEIGHTS[k] = float(v)
+                    carriers_section = {}
+                    deliveries_section = {}
+                    if any(isinstance(v, dict) for v in w.values()):
+                        carriers_section = w.get('carriers', {}) if isinstance(w.get('carriers'), dict) else {}
+                        deliveries_section = w.get('deliveries', {}) if isinstance(w.get('deliveries'), dict) else {}
+                    else:
+                        carriers_section = w
+                    for k, v in (carriers_section or {}).items():
+                        if isinstance(v, (int, float)):
+                            if k == 'chat_dialog':
+                                DELIVERY_WEIGHTS['multi_turn'] = float(v)
+                            elif k in CARRIER_WEIGHTS:
+                                CARRIER_WEIGHTS[k] = float(v)
+                    for k, v in (deliveries_section or {}).items():
+                        if isinstance(v, (int, float)):
+                            if k in DELIVERY_WEIGHTS:
+                                DELIVERY_WEIGHTS[k] = float(v)
+                            elif k == 'chat_dialog':
+                                DELIVERY_WEIGHTS['multi_turn'] = float(v)
             print("[reweight] warm-started from", weights_path)
     except Exception as e:
         print("[reweight][warn] failed to warm-start:", e)
@@ -7641,6 +7687,7 @@ def main():
             "args": {k: v for k, v in vars(args).items()},
             "goal_weights": GOAL_WEIGHTS,
             "carrier_weights": CARRIER_WEIGHTS,
+            "delivery_weights": DELIVERY_WEIGHTS,
             "template_ver": TEMPLATE_VER,
         }
         blob = json.dumps(cfg_obj, ensure_ascii=False, sort_keys=True).encode('utf-8')
@@ -7741,7 +7788,7 @@ def main():
                 eps = 1e-6
                 ratio = (tgt + eps) / (obs + eps)
                 beta  = float(getattr(args, "rebalance_beta", 0.30) if "args" in globals() else 0.30)
-                base  = max(0.02, CARRIER_WEIGHTS.get(ca, 0.02))
+                base  = max(0.02, _carrier_weight_lookup(ca, 0.02))
                 target_w = base * ratio
                 new_w = (1.0 - beta) * base + beta * target_w
                 gamma = float(getattr(args, "rebalance_gamma", 0.40))  # 新增超参，默认 0.40
@@ -7749,7 +7796,7 @@ def main():
                 adj = max(0.5, min(1.5, adj))             # 夹逼，防爆
                 new_w = new_w * adj
                 # Clamp to reasonable bounds: [0.25×, 4×] of original base
-                CARRIER_WEIGHTS[ca] = max(0.25*base, min(4.0*base, new_w))
+                _set_carrier_weight(ca, max(0.25*base, min(4.0*base, new_w)))
         except Exception as _e:
             print("[warn] dynamic reweight failed:", _e)
         try:
@@ -8405,6 +8452,7 @@ def main():
                 'template_ver': TEMPLATE_VER,
                 'goal_weights': GOAL_WEIGHTS,
                 'carrier_weights': CARRIER_WEIGHTS,
+                'delivery_weights': DELIVERY_WEIGHTS,
                 'targets_json': args.targets_json,
                 'artifact_free_pos_ratio': args.artifact_free_pos_ratio,
                 'disc_rate': args.disc_rate,
@@ -8429,13 +8477,14 @@ def main():
         try:
             weights_path = Path(str(outp)).with_suffix("").as_posix() + "_weights.json"
             with open(weights_path, "w", encoding="utf-8") as f:
-                json.dump(CARRIER_WEIGHTS, f, ensure_ascii=False, indent=2)
+                json.dump({'carriers': CARRIER_WEIGHTS, 'deliveries': DELIVERY_WEIGHTS}, f, ensure_ascii=False, indent=2)
             # 同时把快照抄一份进 stats（便于观测；若刚写就是最新可跳过）
             try:
                 stats_path = Path(str(outp).replace('.jsonl','_stats.json'))
                 with open(stats_path, "r+", encoding="utf-8") as fs:
                     data = json.load(fs)
                     data["carrier_weights"] = CARRIER_WEIGHTS
+                    data["delivery_weights"] = DELIVERY_WEIGHTS
                     # （可选）效果级可用性与策略，便于复现排查
                     data["effect_available"] = bool(globals().get("EFFECT_DEPS_OK", ("run_sim_agent" in globals())))
                     data["effect_policy"]    = getattr(args, "effect_policy", "skip")
