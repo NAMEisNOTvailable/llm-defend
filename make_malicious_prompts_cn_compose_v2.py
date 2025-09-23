@@ -36,7 +36,6 @@ from datasets import load_dataset, DatasetDict
 import base64, urllib.parse
 import regex as _re
 from dataclasses import dataclass, asdict, field
-from typing import List, Dict, Optional, Tuple
 import subprocess, shlex, time
 import os
 import numpy as np, platform, datasets as hf_datasets
@@ -64,10 +63,48 @@ try:
 except Exception:
     _AnnoyIndex = None
 try:
-    from dsl_core import generate_batch, invariant_result_slot
+    from dsl_core import (
+        generate_batch,
+        invariant_result_slot,
+        JSON_BLOCK_RE,
+        cjk_share as _dsl_cjk_share,
+        _parse_json_blocks as _dsl_parse_json_blocks,
+    )
 except Exception:
     generate_batch = None
     invariant_result_slot = None
+    JSON_BLOCK_RE = _re.compile(r"```(?:json|jsonc|json5|jsonl)\b(.*?)```", _re.S | _re.I)
+    def cjk_share(s: str) -> float:
+        if not s:
+            return 0.0
+        text = _re.sub(r"\s+", "", s)
+        if not text:
+            return 0.0
+        han = _re.findall(r"\p{Han}", text) if hasattr(_re, "findall") else re.findall(r"[\u4e00-\u9fff]", text)
+        return len(han) / (len(text) + 1e-6)
+    def _parse_json_blocks(text: str) -> list[dict]:
+        out: list[dict] = []
+        for match in JSON_BLOCK_RE.finditer(text or ""):
+            try:
+                obj = json.loads(match.group(1))
+                if isinstance(obj, dict):
+                    out.append(obj)
+                elif isinstance(obj, list):
+                    out.extend([it for it in obj if isinstance(it, dict)])
+            except Exception as exc:
+                audit_reject("json_parse_error", {"phase": "json_parse", "err": exc})
+        return out
+else:
+    def cjk_share(s: str) -> float:
+        return _dsl_cjk_share(s)
+    def _parse_json_blocks(text: str) -> list[dict]:
+        out: list[dict] = []
+        def _log_error(exc, raw):
+            audit_reject("json_parse_error", {"phase": "json_parse", "err": exc})
+        for obj in _dsl_parse_json_blocks(text or "", on_error=_log_error):
+            if isinstance(obj, dict):
+                out.append(obj)
+        return out
 try:
     from dsl_core import _h64  # reuse token hash cache if available
 except Exception:
@@ -268,6 +305,9 @@ PLACEHOLDER_MULTI_RE = re.compile(
     r'|(?P<result>\{\{RESULT_MAIN\}\})',
     re.I
 )
+CARRIER_SHELLS_RE = _re.compile(r"(<!--.*?-->)|(\[note\]:[^\n]+)|(<div[^>]+>)|(^---[\s\S]*?---$)", _re.M | _re.S)
+STRUCT_SLOT_TOKEN_RE = re.compile(r"\[[A-Z]_[A-Z0-9]{4}\]")
+DEDUP_FILLER_WORDS = ("然后","那么","其实","就是","有点","那个","呃","嗯","啊","好吧")
 CODE_FENCE = re.compile(r"```")
 XML_TAG = re.compile(r"<\s*[/]?\s*([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*[^>]*>")
 BRACES = re.compile(r"[{}\[\]()]")
@@ -501,29 +541,6 @@ def cjk_latin_ratio(s: str) -> float:
     """Latin-to-CJK ratio. // 拉丁与中文字符比。"""
     c = len(CJK_RE.findall(s)); l = len(LATIN_RE.findall(s))
     return (l + 1e-6) / (c + 1e-6)
-TOKEN_RE = re.compile(r"[\u4e00-\u9fff]+|[A-Za-z]+|\d+|[^\s\w]", re.UNICODE)
-PUNCT_RE = re.compile(r"^[^\w\u4e00-\u9fff]+$")
-try:
-    import regex as re2  # pip install regex
-    HAN_TOKEN_RE = re2.compile(r"\p{Han}+|[A-Za-z]+|\d+|[^\s\w]", re2.UNICODE)
-    HAN_CHK = lambda t: bool(re2.search(r"\p{Han}", t))
-except Exception:
-    HAN_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]+|[A-Za-z]+|\d+|[^\s\w]", re.UNICODE)
-    HAN_CHK = lambda t: bool(re.search(r"[\u4e00-\u9fff]", t))
-PUNCT_RE = re.compile(r"^[^\w\u4e00-\u9fff]+$")  # 回退下仍可用
-def cjk_share(s: str) -> float:
-    """Token 级中文占比：含任一汉字的 token 计为 CJK；忽略纯标点。"""
-    toks = HAN_TOKEN_RE.findall(s or "")
-    if not toks:
-        return 0.0
-    total = cjk = 0
-    for t in toks:
-        if PUNCT_RE.match(t):
-            continue
-        total += 1
-        if HAN_CHK(t):
-            cjk += 1
-    return cjk / (total + 1e-6)
 def cheap_fingerprint(s: str) -> str:
     """Punctuation-insensitive fingerprint. // 忽略标点的简易指纹。"""
     import unicodedata as _u, re as _re
@@ -1021,7 +1038,7 @@ def parse_events_from_text(txt: str) -> list[Event]:
         audit_reject("parse_events_error", {"phase":"events", "err": e})
     return evts
 
-def adjudicate_invariants(contract: TaskContract, events: list[Event]) -> tuple[int, list[str]]:
+def adjudicate_event_invariants(contract: TaskContract, events: list[Event]) -> tuple[int, list[str]]:
     # Weighted invariants with soft evidence; TaskShift mitigated. Structural-only cues are soft.
     violations: list[str] = []
     seen = {e.type for e in events}
@@ -1103,51 +1120,149 @@ def effect_check_with_ref(task_txt: str, injected_text: str, model: str, contrac
 # ------------------ SimHash + MinHash-LSH de-dup // 去重：SimHash + MinHash-LSH ------------------
 
 
-def _for_dedup_norm(s: str, preserve_carrier: bool = True) -> str:
-    # 归一化：去意图锚点/去围栏/去 JSON/去常见载体外壳/归一随机占位
-    s = strip_attack_intent(s)
-    s = CODE_BLOCK_RE.sub("", s)
-    s = JSON_BLOCK_RE.sub("", s)
-    if not preserve_carrier:
-        _CARRIER_SHELLS_RE = _re.compile(r"(<!--.*?-->)|(\[note\]:[^\n]+)|(<div[^>]+>)|(^---[\s\S]*?---$)", _re.M|_re.S)
-        s = _CARRIER_SHELLS_RE.sub(" ", s)
-    s = re.sub(r"\[[A-Z]_[A-Z0-9]{4}\]", "TK", s)
-    # Reverse code-switch for dedup normalization (pinyin/EN back to CN)
-    try:
-        rev_py = {v:k for k,v in PINYIN_MAP.items()}
-        rev_en = {v:k for k,v in ENG_MAP.items()}
-        for k,v in rev_py.items():
-            s = re.sub(rf"\b{re.escape(k)}\b", v, s, flags=re.IGNORECASE)
-        for k,v in rev_en.items():
-            s = re.sub(rf"\b{re.escape(k)}\b", v, s, flags=re.IGNORECASE)
-    except Exception as e:
-        audit_reject("dedup_norm_error", {"phase":"dedup_norm", "err": e})
-    # CJK-special: collapse common filler words and unify simple slang
-    FILLER = ["然后","那么","其实","就是","有点","那个","呃","嗯","啊","好吧"]
-    for w in FILLER:
-        s = s.replace(w, "")
-    # lower English fragments for code-switch normalization
-    s = s.lower()
-    return normalize(s)
 
-def deduper_accept_normalized(deduper: Deduper, text: str, preserve_carrier: bool = True) -> bool:
-    base = _for_dedup_norm(text, preserve_carrier)
+
+
+def canonicalize_structural_layers(
+    text: str,
+    *,
+    strip_intent: bool = True,
+    preserve_carrier: bool = True,
+    preserve_codeblocks: bool = False,
+    preserve_json_blocks: bool = False,
+    strip_placeholders: bool = True,
+    normalize_slot_tokens: bool = True,
+    reverse_code_switch: bool = True,
+    remove_fillers: bool = True,
+    lowercase_ascii: bool = True,
+    apply_anchor_neutralization: bool = False,
+) -> str:
+    """Unify artifact stripping before dedupe/semantics so carriers/fences behave consistently."""
+    if text is None:
+        s = ""
+    elif isinstance(text, str):
+        s = text
+    else:
+        s = str(text)
+    if strip_intent:
+        s = strip_attack_intent(s)
+    if strip_placeholders:
+        s = PLACEHOLDER_MULTI_RE.sub("", s)
+    if not preserve_codeblocks:
+        s = CODE_BLOCK_RE.sub("", s)
+    if not preserve_json_blocks:
+        s = JSON_BLOCK_RE.sub("", s)
+    if not preserve_carrier:
+        s = CARRIER_SHELLS_RE.sub(" ", s)
+    if normalize_slot_tokens:
+        s = STRUCT_SLOT_TOKEN_RE.sub("TK", s)
+    if reverse_code_switch:
+        try:
+            rev_py = {v: k for k, v in PINYIN_MAP.items()}
+            rev_en = {v: k for k, v in ENG_MAP.items()}
+            for src, tgt in rev_py.items():
+                s = re.sub(rf"\b{re.escape(src)}\b", tgt, s, flags=re.IGNORECASE)
+            for src, tgt in rev_en.items():
+                s = re.sub(rf"\b{re.escape(src)}\b", tgt, s, flags=re.IGNORECASE)
+        except Exception as e:
+            audit_reject("dedup_norm_error", {"phase": "dedup_norm", "err": e})
+    if remove_fillers:
+        for filler in DEDUP_FILLER_WORDS:
+            s = s.replace(filler, "")
+    if lowercase_ascii:
+        s = s.lower()
+    s = normalize(s)
+    if apply_anchor_neutralization:
+        s = neutralize_anchors(s)
+        s = normalize(s)
+    return s
+
+
+def _for_dedup_norm(
+    s: str,
+    *,
+    preserve_carrier: bool = True,
+    preserve_codeblocks: bool = False,
+    preserve_json_blocks: bool = False,
+    strip_placeholders: bool = True,
+    normalize_slot_tokens: bool = True,
+    apply_anchor_neutralization: bool = False,
+) -> str:
+    return canonicalize_structural_layers(
+        s,
+        preserve_carrier=preserve_carrier,
+        preserve_codeblocks=preserve_codeblocks,
+        preserve_json_blocks=preserve_json_blocks,
+        strip_placeholders=strip_placeholders,
+        normalize_slot_tokens=normalize_slot_tokens,
+        apply_anchor_neutralization=apply_anchor_neutralization,
+    )
+
+
+def deduper_accept_normalized(
+    deduper: Deduper,
+    text: str,
+    *,
+    preserve_carrier: bool = True,
+    preserve_codeblocks: bool = False,
+    preserve_json_blocks: bool = False,
+    strip_placeholders: bool = True,
+    normalize_slot_tokens: bool = True,
+) -> bool:
+    base = _for_dedup_norm(
+        text,
+        preserve_carrier=preserve_carrier,
+        preserve_codeblocks=preserve_codeblocks,
+        preserve_json_blocks=preserve_json_blocks,
+        strip_placeholders=strip_placeholders,
+        normalize_slot_tokens=normalize_slot_tokens,
+    )
     if deduper.accept(base):
         return True
-    # 第二视角：进一步弱化“锚/显词”后再试一次，降低锚点残留导致的偏差
-    softened = neutralize_anchors(base)
+    softened = _for_dedup_norm(
+        text,
+        preserve_carrier=preserve_carrier,
+        preserve_codeblocks=preserve_codeblocks,
+        preserve_json_blocks=preserve_json_blocks,
+        strip_placeholders=strip_placeholders,
+        normalize_slot_tokens=normalize_slot_tokens,
+        apply_anchor_neutralization=True,
+    )
     if deduper.accept(softened):
         return True
-    # 第三视角：忽略载体外壳再试（削弱载体伪迹的影响）
     if preserve_carrier:
-        base2 = _for_dedup_norm(text, preserve_carrier=False)
+        base2 = _for_dedup_norm(
+            text,
+            preserve_carrier=False,
+            preserve_codeblocks=preserve_codeblocks,
+            preserve_json_blocks=preserve_json_blocks,
+            strip_placeholders=strip_placeholders,
+            normalize_slot_tokens=normalize_slot_tokens,
+        )
         if deduper.accept(base2):
             return True
-        soft2 = neutralize_anchors(base2)
+        soft2 = _for_dedup_norm(
+            text,
+            preserve_carrier=False,
+            preserve_codeblocks=preserve_codeblocks,
+            preserve_json_blocks=preserve_json_blocks,
+            strip_placeholders=strip_placeholders,
+            normalize_slot_tokens=normalize_slot_tokens,
+            apply_anchor_neutralization=True,
+        )
         return deduper.accept(soft2)
     return False
 
-def dedup_groups(rows, deduper: Deduper, preserve_carrier: bool = True):
+
+def dedup_groups(
+    rows,
+    deduper: Deduper,
+    preserve_carrier: bool = True,
+    preserve_codeblocks: bool = False,
+    preserve_json_blocks: bool = False,
+    strip_placeholders: bool = True,
+    normalize_slot_tokens: bool = True,
+):
     grouped = defaultdict(list)
     for i, r in enumerate(rows):
         gid = r.get("pair_id") or f"solo-{i}"
@@ -1155,10 +1270,19 @@ def dedup_groups(rows, deduper: Deduper, preserve_carrier: bool = True):
     keep = []
     for gid, arr in grouped.items():
         for r in arr:
-            if deduper_accept_normalized(deduper, r["text"], preserve_carrier):
+            if deduper_accept_normalized(
+                deduper,
+                r["text"],
+                preserve_carrier=preserve_carrier,
+                preserve_codeblocks=preserve_codeblocks,
+                preserve_json_blocks=preserve_json_blocks,
+                strip_placeholders=strip_placeholders,
+                normalize_slot_tokens=normalize_slot_tokens,
+            ):
                 keep.extend(arr)
                 break
     return keep
+
 
 # ------------------ Light/Unicode jitter // 轻度/Unicode 扰动 ------------------
 CONFUSABLE_MAP = {'A':'Α','B':'Β','E':'Ε','H':'Η','I':'Ι','K':'Κ','M':'Μ','N':'Ν','O':'Ο','P':'Ρ','T':'Τ','X':'Χ',
@@ -3474,7 +3598,6 @@ DANGEROUS_FIELDS = {"result","answer","verdict","conclusion","final","return","�
 PRIV_CHANNEL_TOKENS = {"System","system","Developer","developer","管理员","审定通道","【通道：System】","【通道：Developer】"}
 SECRET_TOKENS = {"ACCESS_TOKEN","CREDENTIAL","SECRET","密钥","token","cookie"}
 CSV_FORMULA_RE = _re.compile(r'(^|\s|[,;])(?:[=+\-@])\s*[A-Za-z_]{2,}\s*\(', _re.I)
-JSON_BLOCK_RE  = _re.compile(r"```json\b(.*?)```", _re.S)
 CODE_BLOCK_RE  = _re.compile(r"```(\w+)?\b(.*?)```", _re.S)
 SLOT_SYNS = [
     r"结果", r"结论", r"答案", r"要点", r"摘要", r"结语",
@@ -3533,20 +3656,6 @@ CARRIER_WEIGHTS = {
     "none":0.10
 }
 
-def _parse_json_blocks(text: str) -> list[dict]:
-    out = []
-    for m in JSON_BLOCK_RE.finditer(text):
-        try:
-            obj = json.loads(m.group(1))
-            if isinstance(obj, dict):
-                out.append(obj)
-            elif isinstance(obj, list):
-                for it in obj:
-                    if isinstance(it, dict): out.append(it)
-        except Exception as e:
-            audit_reject("json_parse_error", {"phase":"json_parse", "err": e})
-    return out
-# ------------------ Leakage pressure test (char n-gram linear) // 泄漏压力测试 ------------------
 def _char_ngrams(s: str, n: int = 3, cap: int = 2048) -> list[str]:
     s = _re.sub(r"\s+", " ", s or "").strip()
     s = s[:cap]
@@ -4482,6 +4591,7 @@ def _hard_neg_producer_job(job: tuple[int, int]) -> dict:
         neg_effect_guard=bool(cfg.get('neg_effect_guard', False)),
         mask_on=str(cfg.get('mask_on', 'both')),
         dedupe_preserve_carrier=bool(cfg.get('dedupe_preserve_carrier', False)),
+        dedupe_preserve_codeblocks=bool(cfg.get('dedupe_preserve_codeblocks', False)),
         use_end_nonce=bool(cfg.get('use_end_nonce', False)),
         use_model_eval=bool(cfg.get('use_model_eval', False)),
         strict_neg_diag_gate=bool(cfg.get('strict_neg_diag_gate', True)),
@@ -4536,6 +4646,7 @@ def _plain_neg_producer_job(job: tuple[int, int]) -> dict:
         mask_format_features_rate=float(cfg.get('mask_format_features_rate', 0.0)),
         mask_on=str(cfg.get('mask_on', 'both')),
         dedupe_preserve_carrier=bool(cfg.get('dedupe_preserve_carrier', False)),
+        dedupe_preserve_codeblocks=bool(cfg.get('dedupe_preserve_codeblocks', False)),
         strict_neg_diag_gate=bool(cfg.get('strict_neg_diag_gate', True)),
     )
     return {"cands": cands, "stats": stats or {}}
@@ -4584,6 +4695,7 @@ def _topic_neg_producer_job(job: tuple[int, int]) -> dict:
         mask_format_features_rate=float(cfg.get('mask_format_features_rate', 0.0)),
         mask_on=str(cfg.get('mask_on', 'both')),
         dedupe_preserve_carrier=bool(cfg.get('dedupe_preserve_carrier', False)),
+        dedupe_preserve_codeblocks=bool(cfg.get('dedupe_preserve_codeblocks', False)),
         disc_rate=cfg.get('disc_rate'),
     )
     return {"cands": cands}
@@ -4692,6 +4804,7 @@ class AttackSelector:
                  evolve_variants: bool,
                  mask_on: str,
                  dedupe_preserve_carrier: bool,
+                 dedupe_preserve_codeblocks: bool,
                  use_end_nonce: bool,
                  use_model_eval: bool,
                  artifact_free_pos_ratio: float,
@@ -4710,6 +4823,7 @@ class AttackSelector:
         self.mask_format_features_rate = mask_format_features_rate
         self.mask_on = mask_on
         self.dedupe_preserve_carrier = dedupe_preserve_carrier
+        self.dedupe_preserve_codeblocks = dedupe_preserve_codeblocks
         self.use_model_eval = use_model_eval
         self.artifact_free_pos_ratio = artifact_free_pos_ratio
         self.gate_semantic_injection = gate_semantic_injection
@@ -4756,9 +4870,9 @@ class AttackSelector:
             return False
         if self.q_artifact > self.quota_artifact_max:
             return False
-        if min_cov > 0:
-            for cnt in cover.values():
-                if cnt < min_cov:
+        if self.coverage_min_per_combo > 0:
+            for cnt in self.cover.values():
+                if cnt < self.coverage_min_per_combo:
                     return False
         return True
 
@@ -4890,7 +5004,12 @@ class AttackSelector:
                 })
                 return False
 
-        if not deduper_accept_normalized(self.deduper, text, preserve_carrier=self.dedupe_preserve_carrier):
+        if not deduper_accept_normalized(
+            self.deduper,
+            text,
+            preserve_carrier=self.dedupe_preserve_carrier,
+            preserve_codeblocks=self.dedupe_preserve_codeblocks,
+        ):
             audit_reject("dedup", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
             return False
         if self.fam_count[fam_name] >= self.family_cap:
@@ -5093,7 +5212,7 @@ class AttackSelector:
             for fn in steps:
                 try:
                     trial = fn(cur)
-                    inv_ok, _fails = adjudicate_invariants(contract, parse_events_from_text(trial))
+                    inv_ok, _fails = adjudicate_event_invariants(contract, parse_events_from_text(trial))
                     if inv_ok == 1:
                         return trial
                     cur = trial
@@ -5130,6 +5249,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     evolve_variants: bool = False,
                     mask_on: str = "both",
                     dedupe_preserve_carrier: bool = False,
+                    dedupe_preserve_codeblocks: bool = False,
                     use_end_nonce: bool = False,
                     use_model_eval: bool = False,
                     artifact_free_pos_ratio: float | None = None,
@@ -5306,7 +5426,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                 continue
 
         # 7) 去重/配额（对“去外壳/去围栏/去占位”后的文本去重）
-        if not deduper_accept_normalized(deduper, text, preserve_carrier=dedupe_preserve_carrier):
+        if not deduper_accept_normalized(deduper, text, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
             audit_reject("dedup", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
             continue
         if fam_count[fam_name] >= family_cap:
@@ -5521,7 +5641,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                 cur = orig
                 for fn in steps:
                     trial = fn(cur)
-                    inv_ok, _fails = adjudicate_invariants(contract, parse_events_from_text(trial))
+                    inv_ok, _fails = adjudicate_event_invariants(contract, parse_events_from_text(trial))
                     if inv_ok == 1:
                         cur = trial
                     else:
@@ -5568,6 +5688,7 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     evolve_variants: bool = False,
                     mask_on: str = "both",
                     dedupe_preserve_carrier: bool = False,
+                    dedupe_preserve_codeblocks: bool = False,
                     use_end_nonce: bool = False,
                     use_model_eval: bool = False,
                     artifact_free_pos_ratio: float | None = None,
@@ -5589,6 +5710,7 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
             mask_format_features_rate=mask_format_features_rate,
             effect_replicas=effect_replicas, evolve_variants=evolve_variants,
             mask_on=mask_on, dedupe_preserve_carrier=dedupe_preserve_carrier,
+            dedupe_preserve_codeblocks=dedupe_preserve_codeblocks,
             use_end_nonce=use_end_nonce, use_model_eval=use_model_eval,
             artifact_free_pos_ratio=artifact_free_pos_ratio,
             gate_semantic_injection=gate_semantic_injection,
@@ -5628,6 +5750,7 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
         evolve_variants=evolve_variants,
         mask_on=mask_on,
         dedupe_preserve_carrier=dedupe_preserve_carrier,
+        dedupe_preserve_codeblocks=dedupe_preserve_codeblocks,
         use_end_nonce=use_end_nonce,
         use_model_eval=use_model_eval,
         artifact_free_pos_ratio=artifact_free_pos_ratio_eff,
@@ -5758,6 +5881,7 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
                       neg_effect_guard: bool = False,
                       mask_on: str = "both",
                       dedupe_preserve_carrier: bool = False,
+                      dedupe_preserve_codeblocks: bool = False,
                       use_end_nonce: bool = False,
                       use_model_eval: bool = False,
                       strict_neg_diag_gate: bool = True) -> List[Dict[str,Any]]:
@@ -5883,7 +6007,7 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
             masked_applied = (text != before_mask)
         # intent & carrier
         intent = "benign" 
-        if not deduper_accept_normalized(deduper, text, preserve_carrier=dedupe_preserve_carrier): continue
+        if not deduper_accept_normalized(deduper, text, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks): continue
         if fam_count["hardneg"] >= family_cap: continue
         nbytes = byte_len(text)
         feats = feature_probe_clean(text)
@@ -5951,6 +6075,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
             neg_effect_guard=neg_effect_guard,
             mask_on=mask_on,
             dedupe_preserve_carrier=dedupe_preserve_carrier,
+            dedupe_preserve_codeblocks=dedupe_preserve_codeblocks,
             use_end_nonce=use_end_nonce,
             use_model_eval=use_model_eval,
             strict_neg_diag_gate=strict_neg_diag_gate,
@@ -5986,6 +6111,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
         'neg_effect_guard': neg_effect_guard,
         'mask_on': mask_on,
         'dedupe_preserve_carrier': dedupe_preserve_carrier,
+        'dedupe_preserve_codeblocks': dedupe_preserve_codeblocks,
         'use_end_nonce': use_end_nonce,
         'use_model_eval': use_model_eval,
         'strict_neg_diag_gate': strict_neg_diag_gate,
@@ -6011,7 +6137,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
                     text_val = cand.get('text', '')
                     if not text_val:
                         continue
-                    if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier):
+                    if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
                         continue
                     fam = cand.get('family', 'hardneg')
                     if fam_count[fam] >= family_cap:
@@ -6198,7 +6324,7 @@ def is_benign_strict(text: str, contract: TaskContract) -> bool:
     ok_inv, fails = True, []
     try:
         events = parse_events_from_text(text)
-        ok_inv, fails = adjudicate_invariants(contract, events)
+        ok_inv, fails = adjudicate_event_invariants(contract, events)
     except Exception:
         ok_inv, fails = True, []
 
@@ -6225,6 +6351,7 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
                             mask_format_features_rate: float = 0.0,
                             mask_on: str = "both",
                             dedupe_preserve_carrier: bool = False,
+                            dedupe_preserve_codeblocks: bool = False,
                             strict_neg_diag_gate: bool = True):
     random.seed(seed + 4242)
     disc_rate = _effective_disc_rate(disc_rate)
@@ -6330,7 +6457,7 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
         hard = True
         disc_flag = (rng_pair.random() < disc_rate)
         disc_str = rng_pair.choice(DISCLAIMER_BANK) if disc_flag else None
-        if not deduper_accept_normalized(deduper, txt, preserve_carrier=dedupe_preserve_carrier): 
+        if not deduper_accept_normalized(deduper, txt, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks): 
             continue
         # do not add disclaimers; keep structure aligned and apply symmetric transforms
         # 新增：结构证据（良性版本），保持与正类同频
@@ -6406,6 +6533,7 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
                             mask_format_features_rate: float = 0.0,
                             mask_on: str = "both",
                             dedupe_preserve_carrier: bool = False,
+                            dedupe_preserve_codeblocks: bool = False,
                             strict_neg_diag_gate: bool = True,
                             workers: int = 0,
                             producer_batch: int = 128):
@@ -6420,6 +6548,7 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
             mask_format_features_rate=mask_format_features_rate,
             mask_on=mask_on,
             dedupe_preserve_carrier=dedupe_preserve_carrier,
+            dedupe_preserve_codeblocks=dedupe_preserve_codeblocks,
             strict_neg_diag_gate=strict_neg_diag_gate,
         )
 
@@ -6447,6 +6576,7 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
         'mask_format_features_rate': mask_format_features_rate,
         'mask_on': mask_on,
         'dedupe_preserve_carrier': dedupe_preserve_carrier,
+        'dedupe_preserve_codeblocks': dedupe_preserve_codeblocks,
         'strict_neg_diag_gate': strict_neg_diag_gate,
         'deduper_params': deduper_params,
     }
@@ -6470,7 +6600,7 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
                     text_val = cand.get('text', '')
                     if not text_val:
                         continue
-                    if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier):
+                    if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
                         continue
                     cand = dict(cand)
                     pair_id = f"NPLAIN-{len(results)+1:07d}"
@@ -6493,6 +6623,7 @@ def _compose_topic_shift_negatives_serial(target_pool, k: int, seed: int, dedupe
                                   mask_format_features_rate: float = 0.0,
                                   mask_on: str = "both",
                                   dedupe_preserve_carrier: bool = False,
+                                  dedupe_preserve_codeblocks: bool = False,
                                   disc_rate: float | None = None) -> list[dict]:
     random.seed(seed + 7777)
     disc_rate = _effective_disc_rate(disc_rate)
@@ -6518,7 +6649,7 @@ def _compose_topic_shift_negatives_serial(target_pool, k: int, seed: int, dedupe
         contract_neg = derive_task_contract(t["task"])
         if not is_benign_strict(txt, contract_neg):
             continue
-        if not deduper_accept_normalized(deduper, txt, preserve_carrier=dedupe_preserve_carrier):
+        if not deduper_accept_normalized(deduper, txt, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
             continue
         # 与正类对齐：按相同概率加免责声明
         disc_flag = (stable_rng("topic_disc", seed, txt).random() < disc_rate)
@@ -6575,6 +6706,7 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
                                   mask_format_features_rate: float = 0.0,
                                   mask_on: str = "both",
                                   dedupe_preserve_carrier: bool = False,
+                                  dedupe_preserve_codeblocks: bool = False,
                                   disc_rate: float | None = None,
                                   workers: int = 0,
                                   producer_batch: int = 128) -> list[dict]:
@@ -6585,6 +6717,7 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
             mask_format_features_rate=mask_format_features_rate,
             mask_on=mask_on,
             dedupe_preserve_carrier=dedupe_preserve_carrier,
+            dedupe_preserve_codeblocks=dedupe_preserve_codeblocks,
             disc_rate=disc_rate,
         )
 
@@ -6608,6 +6741,7 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
         'mask_format_features_rate': mask_format_features_rate,
         'mask_on': mask_on,
         'dedupe_preserve_carrier': dedupe_preserve_carrier,
+        'dedupe_preserve_codeblocks': dedupe_preserve_codeblocks,
         'disc_rate': disc_rate_eff,
         'deduper_params': deduper_params,
     }
@@ -6630,7 +6764,7 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
                     text_val = cand.get('text', '')
                     if not text_val:
                         continue
-                    if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier):
+                    if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
                         continue
                     cand = dict(cand)
                     results.append(cand)
@@ -6954,115 +7088,415 @@ def evolve_injection(base_prompt: str, seed_tpl: str, contract, payload: str, st
             if sc > best_score:
                 best, best_score = v, sc
     return best, best_score
+
+import argparse
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description="Dataset composer for CN-heavy safety/jailbreak evaluations. // 面向中文占比场景的安全/越狱评测数据集生成器"
+    )
+
+    # ========== 1) I/O & Reproducibility // 输入输出与可复现性 ==========
+    io = ap.add_argument_group("I/O & Reproducibility // 输入输出与可复现性")
+    io.add_argument(
+        "--out", default="dataset.jsonl",
+        help="Output JSONL path. // 输出 JSONL 路径"
+    )
+    io.add_argument(
+        "--n", type=int, default=5000,
+        help="Total number of rows including hard negatives. // 总样本数（含硬负例）"
+    )
+    io.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed. // 随机种子"
+    )
+    io.add_argument(
+        "--dry_run", action="store_true", default=False,
+        help="Dry run: print config fingerprint and only write stats (no dataset is generated). "
+             "// 试运行：打印配置签名，仅写出统计信息（不生成数据集）"
+    )
+
+    # ========== 2) Data sources & revisions // 数据来源与版本固化 ==========
+    sources = ap.add_argument_group("Data Sources // 数据来源")
+    sources.add_argument(
+        "--targets_json", default=None,
+        help="Load targets from local JSON/JSONL with {task,prompt} to avoid external deps. "
+             "// 从本地 JSON/JSONL 读取 {task,prompt} 目标池，避免外部依赖"
+    )
+    sources.add_argument(
+        "--hf_revision", default=None,
+        help="Pin a global HuggingFace revision/commit for all datasets when possible. "
+             "// 在可行时为所有数据集统一指定 HuggingFace revision/commit"
+    )
+
+    # ========== 3) Language & formatting policy // 语种与格式策略 ==========
+    lang = ap.add_argument_group("Language & Formatting // 语种与格式")
+    lang.add_argument(
+        "--min_cjk_share", type=float, default=0.60,
+        help="Minimum CJK character share per row (strict). "
+             "// 每条样本的最小中日韩字符占比（严格约束）"
+    )
+    lang.add_argument(
+        "--min_cjk_share_auto", action="store_true", default=True,
+        help="Enable randomized CJK-share bins (always ≥ min_cjk_share). "
+             "// 启用中文占比的随机分桶（始终 ≥ 最小阈值）"
+    )
+    lang.add_argument(
+        "--cjk_policy", choices=["hard","tiered","audit"], default="tiered",
+        help="Enforcement policy for the CJK constraint: "
+             "hard=strict per-sample enforcement; tiered=relax for gray/diagnostic buckets; audit=track only. "
+             "// 中文占比策略：hard=逐条严格强制；tiered=对灰样/诊断分层放宽；audit=仅审计记录"
+    )
+    lang.add_argument(
+        "--code_switch_prob", type=float, default=0.06,
+        help="Probability to lightly code-switch CN tokens to pinyin/EN. "
+             "// 将部分中文词轻度混写为拼音/英文的概率"
+    )
+    lang.add_argument(
+        "--alias_p_cn", type=float, default=0.70,
+        help="Probability to localize field keys (aliases) in CN. "
+             "// 字段键名中文化（别名本地化）的概率"
+    )
+    lang.add_argument(
+        "--mask_format_features_rate", type=float, default=0.50,
+        help="Probability to symmetrically mask format features to reduce leakage. "
+             "// 为降低泄露风险，对两类样本对称遮蔽格式特征的概率"
+    )
+    lang.add_argument(
+        "--mask_on", choices=["both","pos","neg","none"], default="both",
+        help="Apply format masking to which class(es): both/pos/neg/none. "
+             "// 遮蔽格式特征的应用对象：两类/仅正类/仅负类/不遮蔽"
+    )
+    lang.add_argument(
+        "--strip_common_boilerplate", action=argparse.BooleanOptionalAction, default=True,
+        help="Strip common disclaimers/wrappers before writing train texts (both classes). "
+             "// 在写盘前剥离常见免责声明/包装语（对正负类均生效）"
+    )
+    lang.add_argument(
+        "--no_keyword_pos_min", type=float, default=0.0,
+        help="Minimum share of positive samples without explicit keywords/anchors; "
+             "fail the run if below this threshold. "
+             "// 正类“无显词/锚点”样本的最低占比；若低于阈值则直接失败"
+    )
+
+    # ========== 4) Sampling & composition // 采样与样本组合 ==========
+    comp = ap.add_argument_group("Sampling & Composition // 采样与组合")
+    comp.add_argument(
+        "--pick_strategy", choices=["grid","intent"], default="grid",
+        help="Positive sampling: grid=intent×carrier×delivery; intent=by intent only. "
+             "// 正类采样策略：grid=意图×载体×投递 组合；intent=仅按意图"
+    )
+    comp.add_argument(
+        "--family_max_frac", type=float, default=0.06,
+        help="Maximum fraction per attack family. "
+             "// 每个攻击家族在整体中的最大占比"
+    )
+    comp.add_argument(
+        "--oversample_mult", type=int, default=0,
+        help="Candidate oversampling multiplier; 0=auto by target size. "
+             "// 候选过采样倍数；0 表示按目标池规模自动设定"
+    )
+    comp.add_argument(
+        "--coverage_min_per_combo", type=int, default=3,
+        help="Minimum rows per (intent,carrier,delivery) combo; set 0 to disable the hard check. "
+             "// 每个（意图,载体,投递）组合的最少样本数；设为 0 关闭硬性检查"
+    )
+    comp.add_argument(
+        "--sem_weight", type=float, default=0.55,
+        help="Weight for CN semantic attack families. "
+             "// 中文语义攻击家族的采样权重"
+    )
+    comp.add_argument(
+        "--base_weight", type=float, default=0.40,
+        help="Weight for base euphemistic families. "
+             "// 基础委婉表达家族的采样权重"
+    )
+    comp.add_argument(
+        "--artifact_weight", type=float, default=0.03,
+        help="Weight for explicit-artifact families. "
+             "// 含显式伪迹家族的采样权重"
+    )
+    comp.add_argument(
+        "--artifact_free_pos_ratio", type=float, default=0.50,
+        help="Fraction of positive samples enforced to be artifact-free. "
+             "// 强制为“无显词/伪迹”的正类样本占比"
+    )
+    comp.add_argument(
+        "--anchor_free_p", type=float, default=0.85,
+        help="Probability to sample without anchors to reduce anchor artifacts. "
+             "// 以“无锚点”方式采样的概率，用于降低锚点伪迹"
+    )
+    comp.add_argument(
+        "--structural_p", type=float, default=0.50,
+        help="Probability to use structured carriers for rendering. "
+             "// 以结构化载体（如表格/JSON/代码框）渲染的概率"
+    )
+    comp.add_argument(
+        "--carrier_mix_prob", type=float, default=0.25,
+        help="Probability to wrap the injection with an extra container (double-wrap). "
+             "// 额外再包一层容器（双层封装）的概率"
+    )
+    comp.add_argument(
+        "--stack_prob", type=float, default=0.15,
+        help="Probability to stack two carriers in one sample. "
+             "// 同一条样本中叠加两种载体的概率"
+    )
+    comp.add_argument(
+        "--soft_hint_rate", type=float, default=0.30,
+        help="Probability to add soft conversational hints to both classes. "
+             "// 向正负类对称注入“软话术/暗示”的概率"
+    )
+    comp.add_argument(
+        "--disc_rate", type=float, default=0.15,
+        help="Probability to add disclaimers to BOTH classes symmetrically. "
+             "// 向正负类对称加入免责声明的概率"
+    )
+    comp.add_argument(
+        "--art_match_rate", type=float, default=0.50,
+        help="Probability to match explicit artifact terms across classes. "
+             "// 在正负类之间对齐显式伪迹/显词的概率"
+    )
+    comp.add_argument(
+        "--mirror_placeholderless", type=float, default=0.30,
+        help="Probability to add a placeholderless mirror sample per row. "
+             "// 以去占位符方式为每条新增镜像样本的概率"
+    )
+    comp.add_argument(
+        "--use_dsl", action="store_true", default=False,
+        help="Use a state-machine/DSL-based generator for positives. "
+             "// 正类生成使用状态机/DSL 方案"
+    )
+    comp.add_argument(
+        "--evolve_variants", action="store_true", default=False,
+        help="Try evolving the injection template via a model before gating. "
+             "// 在门控前尝试用模型进化注入模板"
+    )
+    comp.add_argument(
+        "--balance_mode", choices=["none","strict"], default="strict",
+        help="Split balancing mode. none=no balancing; strict=balanced buckets. "
+             "// 分桶均衡策略：none=不均衡；strict=严格均衡"
+    )
+    comp.add_argument(
+        "--rebalance_beta", type=float, default=0.30,
+        help="EMA step for dynamic reweighting [0..1]. "
+             "// 动态重加权的 EMA 步长 [0..1]"
+    )
+
+    # ========== 5) Negatives // 负例配置 ==========
+    neg = ap.add_argument_group("Negatives // 负例")
+    neg.add_argument(
+        "--neg_ratio", type=float, default=0.15,
+        help="Overall hard-negative ratio in the dataset. "
+             "// 数据集中硬负例的整体占比"
+    )
+    neg.add_argument(
+        "--plain_neg_ratio", type=float, default=0.35,
+        help="Share of plain negatives within the negative set. "
+             "// 纯净负例在所有负样本中的占比"
+    )
+    neg.add_argument(
+        "--gray_neg_keep_frac", type=float, default=0.35,
+        help="Fraction of gray negatives to keep. "
+             "// 灰色负例（不完全确定）的保留比例"
+    )
+    neg.add_argument(
+        "--neg_effect_guard", action="store_true", default=True,
+        help="Audit-only guard on hard negatives with payload placeholders (no gating; diagnostics only). "
+             "// 对含负载占位符的硬负例进行审计（仅记录诊断，不做门控）"
+    )
+
+    # ========== 6) Artifacts & structured evidence // 伪迹与结构化证据 ==========
+    art = ap.add_argument_group("Artifacts & Evidence // 伪迹与证据")
+    art.add_argument(
+        "--artifact_rate", type=float, default=0.10,
+        help="Probability to keep explicit artifact terms. "
+             "// 保留显式伪迹/显词的概率"
+    )
+    art.add_argument(
+        "--struct_evidence_rate", type=float, default=0.15,
+        help="Probability to add structured evidence (e.g., JSON/code markers) for each threat goal. "
+             "// 为每个威胁目标补充结构化证据（JSON/代码标记等）的概率"
+    )
+
+    # ========== 7) Dedupe & similarity // 去重与相似度 ==========
+    dd = ap.add_argument_group("Dedupe & Similarity // 去重与相似度")
+    dd.add_argument(
+        "--semantic_dedupe", action="store_true", default=True,
+        help="Enable semantic dedupe based on edit similarity (SequenceMatcher). "
+             "// 启用基于编辑相似度（SequenceMatcher）的语义去重"
+    )
+    dd.add_argument(
+        "--semantic_dedupe_thr", type=float, default=0.96,
+        help="Similarity threshold for semantic dedupe [0–1]. "
+             "// 语义去重的相似度阈值 [0–1]"
+    )
+    dd.add_argument(
+        "--simhash_bits", type=int, default=64,
+        help="SimHash bit width. "
+             "// SimHash 位数"
+    )
+    dd.add_argument(
+        "--simhash_thresh", type=int, default=1,
+        help="Hamming-distance threshold for SimHash near-dup checks (lower=faster). "
+             "// SimHash 近重复判定的汉明距离阈值（越低越快）"
+    )
+    dd.add_argument(
+        "--shingle_k", type=int, default=5,
+        help="Character shingle length. "
+             "// 字符级 shingle 的长度"
+    )
+    dd.add_argument(
+        "--minhash_n", type=int, default=64,
+        help="Number of MinHash functions. "
+             "// MinHash 函数数量"
+    )
+    dd.add_argument(
+        "--minhash_bands", type=int, default=16,
+        help="Number of LSH bands. "
+             "// LSH 分段数量"
+    )
+    dd.add_argument(
+        "--jaccard_thresh", type=float, default=0.90,
+        help="Exact Jaccard threshold for final duplicate decisions. "
+             "// 最终精确去重使用的 Jaccard 阈值"
+    )
+    dd.add_argument(
+        "--dedupe_preserve_carrier", action="store_true", default=True,
+        help="Preserve carrier/delivery shells during dedupe to keep structural diversity. "
+             "// 去重时尽量保留载体/投递外壳，确保结构多样性"
+    )
+
+    dd.add_argument(
+        "--dedupe_preserve_codeblocks", action="store_true", default=False,
+        help="Preserve fenced code blocks during dedupe normalization. "
+             "// ȥ��ʱ��保留代码围栏，保持结构特征"
+    )
+
+    # ========== 8) Effect-level gating & evaluation // 效果级门控与评测 ==========
+    gate = ap.add_argument_group("Effect-level Gating & Evaluation // 效果级门控与评测")
+    gate.add_argument(
+        "--effect_gate_for", choices=["none","devtest","all"], default="none",
+        help="Which splits enforce effect-level hard gate (attack_success==True): none/devtest/all. "
+             "// 在哪些数据划分上强制效果级硬门（attack_success==True）：无/仅开发测试/全部"
+    )
+    gate.add_argument(
+        "--gate_semantic_injection", action="store_true", default=True,
+        help="Hard-gate positives using semantic/structural injection diagnostics. "
+             "// 依据语义/结构注入诊断对白样（正类）进行硬门控"
+    )
+    gate.add_argument(
+        "--effect_policy", choices=["whitebox_only","whitebox_first_soft","skip"], default="whitebox_first_soft",
+        help="Effect validation policy: whitebox_only=only white-box checks; "
+             "whitebox_first_soft=prefer white-box with soft fallback; skip=do not run effect checks. "
+             "// 效果级校验策略：whitebox_only=仅白盒；whitebox_first_soft=白盒优先（可软回退）；skip=跳过校验"
+    )
+    gate.add_argument(
+        "--effect_fallback", choices=["none","anchors"], default="none",
+        help="Fallback when white-box validation fails or errors: none / anchors (anchor families). "
+             "// 白盒失败或异常时的回退：无 / anchors（锚点家族）"
+    )
+    gate.add_argument(
+        "--effect_replicas", type=int, default=0,
+        help="Replicated triplet checks per positive; accept by majority vote; 0=disabled. "
+             "// 正类三元组复检次数；按多数投票通过；0 表示禁用"
+    )
+    gate.add_argument(
+        "--require_side_effects", action="store_true", default=False,
+        help="Require transferable side-effect evidence (tool/role/upstream/retriever/memory). "
+             "// 要求出现可迁移的副作用证据（工具/角色/上游/检索器/记忆等）"
+    )
+    gate.add_argument(
+        "--se_votes", type=int, default=2,
+        help="Side-effect consistency votes (>=1). "
+             "// 副作用一致性投票次数（>=1）"
+    )
+    gate.add_argument(
+        "--effect_gate_categories", default="",
+        help="Comma-separated high-risk intents to enforce side-effects checks, e.g., 'tool_override,reward_hacking'. "
+             "Empty to disable. // 需开启副作用硬门的高风险意图名单（逗号分隔），留空关闭"
+    )
+    gate.add_argument(
+        "--use_model_eval", action="store_true", default=False,
+        help="Enable optional model-based evaluation (e.g., triplet/evolve). Default off. "
+             "// 启用可选的模型打分评估（如三元组/进化）；默认关闭"
+    )
+    gate.add_argument(
+        "--model_eval_fallback", choices=["hard","soft"], default="hard",
+        help="Fallback when model-based eval fails: hard=drop sample; soft=use diagnostic gate instead. "
+             "// 模型评估失败时回退：hard=丢弃样本；soft=退回到诊断门控"
+    )
+    gate.add_argument(
+        "--invariance_end_nonce", action="store_true", default=False,
+        help="Use end-nonce invariance in triplet checks (only with --use_model_eval). "
+             "// 在三元组检查中启用 end-nonce 不变性（仅当启用 --use_model_eval 时有效）"
+    )
+    gate.add_argument(
+        "--adv_mutate", action="store_true",
+        help="Enable adversarial mutation/evolution pass during validation. "
+             "// 在校验阶段启用对抗性突变/进化流程"
+    )
+    gate.add_argument(
+        "--adv_iters", type=int, default=6,
+        help="Number of adversarial mutation/evolution iterations. "
+             "// 对抗突变/进化的迭代次数"
+    )
+    gate.add_argument(
+        "--mt_tool_override_rate", type=float, default=0.25,
+        help="Probability of multi-turn tool-override scenarios in checks. "
+             "// 多轮对话中触发工具覆写（tool override）场景的概率"
+    )
+
+    # ========== 9) Concurrency & performance // 并行与性能 ==========
+    perf = ap.add_argument_group("Concurrency & Performance // 并行与性能")
+    perf.add_argument(
+        "--target_workers", type=int, default=-1,
+        help="Concurrent workers for building the target pool (-1=auto, 0=serial). "
+             "// 目标池加载并发进程数（-1=自动，0=串行）"
+    )
+    perf.add_argument(
+        "--mp_workers", type=int, default=0,
+        help="Multiprocessing workers for candidate rendering (0=auto, 1=serial). "
+             "// 候选渲染的多进程数量（0=自动，1=串行）"
+    )
+    perf.add_argument(
+        "--mp_batch", type=int, default=384,
+        help="Candidates per worker (0≈auto ~256; clamped to 32–512). "
+             "// 每个进程的候选批量（0≈自动约 256；限制在 32–512）"
+    )
+
+    # ========== 10) External evaluation (optional) // 外部评测（可选） ==========
+    ex = ap.add_argument_group("External Evaluation // 外部评测")
+    ex.add_argument(
+        "--ext_eval_sources", type=str, default="",
+        help="Comma-separated external corpora, e.g., 'wildchat:zh,wildjailbreak,jbb,beavertails,pint,saferag'. "
+             "// 外部数据源（逗号分隔），例如 'wildchat:zh,wildjailbreak,jbb,beavertails,pint,saferag'"
+    )
+    ex.add_argument(
+        "--ext_eval_size", type=int, default=4000,
+        help="Total examples to sample for external evaluation. "
+             "// 外部评测要采样的样本总数"
+    )
+    ex.add_argument(
+        "--ext_eval_shapes", type=str, default="in_context,format_carrier,rag_doc,multi_turn,tool_override",
+        help="Product shapes to project onto (comma-separated). "
+             "// 投影对齐的产品形态（逗号分隔）"
+    )
+    ex.add_argument(
+        "--ext_eval_lang", type=str, default="zh,code_switch",
+        help="Language slice for external sources: zh / code_switch / all (comma-separated). "
+             "// 外部评测的语种切片：zh / code_switch / all（逗号分隔）"
+    )
+    ex.add_argument(
+        "--ext_eval_report", type=str, default=None,
+        help="Path to write an external evaluation report JSON (optional). "
+             "// 外部评测报告 JSON 的输出路径（可选）"
+    )
+
+    return ap
+
 # ------------------ Main pipeline // 主流程 ------------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--effect_gate_for", choices=["none","devtest","all"], default="none",
-                    help="在哪些 split 上强制 effect-level 硬门（attack_success==True）。")
-    ap.add_argument("--out", default="dataset.jsonl", help="Output JSONL path. // 输出文件路径")
-    ap.add_argument("--n", type=int, default=5000, help="Total rows incl. hard negatives. // 总样本数（含硬负例）")
-    ap.add_argument("--seed", type=int, default=42, help="Random seed. // 随机种子")
-    ap.add_argument("--min_cjk_share", type=float, default=0.60, help="Min CJK share per row (strict). // 每条样本最小中文占比（严格）")
-    ap.add_argument("--min_cjk_share_auto", action="store_true", default=True,
-                    help="Enable auto random CJK share bins (always >=0.60). // 启用自动中文占比分桶（仍≥0.60）")
-    ap.add_argument("--neg_ratio", type=float, default=0.15, help="Hard-negative ratio. // 硬负例比例")
-    ap.add_argument("--plain_neg_ratio", type=float, default=0.35, help="Plain negatives ratio within negatives. // 纯净负例在负样本中的占比")
-    ap.add_argument("--targets_json", default=None, help="Load targets from local JSON/JSONL with {task,prompt} to avoid external deps. // 离线目标池")
-    ap.add_argument("--hf_revision", default=None,
-    help="Pin a global HF revision/commit for all datasets when possible. // 为所有数据集统一指定 revision/commit")
-    ap.add_argument("--target_workers", type=int, default=-1, help="Concurrent loaders for build_target_pool (-1=auto, 0=serial). // 目标池加载并发进程数(-1=自动,0=串行)")
-    ap.add_argument("--family_max_frac", type=float, default=0.06, help="Max fraction per family. // 每家族占比上限")
-    ap.add_argument("--oversample_mult", type=int, default=0,
-        help="Candidate oversampling multiplier (0=auto by target size). // 候选过采样倍数（0 自动按样本数调节）")
-    ap.add_argument("--mp_workers", type=int, default=0, help="Multiprocessing workers for candidate rendering (0=auto, 1=serial). // 候选渲染进程数（0 自动，1 串行）")
-    ap.add_argument("--mp_batch", type=int, default=384,
-        help="Candidates per worker (0=auto≈256, clamp 32–512). // 每进程候选批量（0 自动≈256，范围 32–512）")
-    ap.add_argument("--simhash_bits", type=int, default=64, help="SimHash bits. // SimHash 位数")
-    ap.add_argument("--simhash_thresh", type=int, default=1, help="Hamming threshold (lower=faster, default=1). // 汉明阈值")
-    ap.add_argument("--shingle_k", type=int, default=5, help="Char shingle length. // 字符 shingle 长度")
-    ap.add_argument("--minhash_n", type=int, default=64, help="MinHash functions. // MinHash 函数数")
-    ap.add_argument("--minhash_bands", type=int, default=16, help="LSH bands. // LSH 分段数")
-    ap.add_argument("--jaccard_thresh", type=float, default=0.90, help="Exact Jaccard threshold. // 精确 Jaccard 阈值")
-    ap.add_argument("--artifact_rate", type=float, default=0.10, help="Probability to keep explicit artifact terms. // 使用显词的概率")
-    ap.add_argument("--code_switch_prob", type=float, default=0.06, help="Randomly code-switch some CN tokens to pinyin/EN // 中英/拼音轻混写概率")
-    ap.add_argument("--carrier_mix_prob", type=float, default=0.25, help="Wrap injection again with an extra container // 额外容器再包一层概率")
-    ap.add_argument("--stack_prob", type=float, default=0.15, help="Stack two carriers in one sample // 同条叠加两种载体的概率")
-    ap.add_argument("--sem_weight", type=float, default=0.55, help="Weight for CN semantic attack families // 中文语义攻击家族权重")
-    ap.add_argument("--base_weight", type=float, default=0.40, help="Weight for base euphemistic families // 基础委婉家族权重")
-    ap.add_argument("--artifact_weight", type=float, default=0.03, help="Weight for explicit artifact families // 显词家族权重")
-    ap.add_argument("--disc_rate", type=float, default=0.15,
-        help="Probability to add disclaimers to BOTH classes. // 正负类等概率加免责声明的概率")
-    ap.add_argument("--art_match_rate", type=float, default=0.50,
-        help="Match explicit artifact terms across classes. // 正负类显词对齐的概率")
-    ap.add_argument("--struct_evidence_rate", type=float, default=0.15,
-        help="Add structured evidence (JSON/code markers) for each threat goal. // 为各威胁目标补结构化证据的概率")
-    # effect_gate_compose removed; diagnostic gating is the only compose-time gate
-    ap.add_argument("--use_model_eval", action="store_true", default=False, help="Enable optional model-based evaluation (triplet/evolve). Default off.")
-    ap.add_argument("--semantic_dedupe", action="store_true", default=True, help="Enable semantic dedupe (SequenceMatcher). // 语义去重（编辑相似度）")
-    ap.add_argument("--semantic_dedupe_thr", type=float, default=0.96, help="Similarity threshold for semantic dedupe [0-1]. // 语义去重相似阈值")
-    ap.add_argument("--pick_strategy", choices=["grid","intent"], default="grid", help="Sampling strategy for positives: grid=intent×carrier×delivery or intent-only.")
-    ap.add_argument("--effect_replicas", type=int, default=0, help="Replicated triplet checks per positive; accept by majority. // 效果门控重复次数（默认0禁用）")
-    ap.add_argument("--evolve_variants", action="store_true", default=False, help="Try evolving injection template via model before gating. // 进化注入模板")
-    ap.add_argument("--neg_effect_guard", action="store_true", default=True, help="Audit-only guard on hard negatives with payload placeholders (no gating; writes diagnostics). // 硬负例效果审计（不做门控）")
-    ap.add_argument("--mask_format_features_rate", type=float, default=0.50, help="Symmetrically mask format features to reduce leakage. // 对称遮蔽格式特征的概率")
-    ap.add_argument("--balance_mode", choices=["none","strict"], default="strict", help="Split balancing mode. // 分桶均衡策略")
-    ap.add_argument("--model_eval_fallback", choices=["hard","soft"], default="hard", help="Fallback when model eval fails: hard=drop sample; soft=use diagnostic gate. // 模型失败时回退")
-    ap.add_argument("--invariance_end_nonce", action="store_true", default=False, help="Use end-nonce invariance in triplet check (only with --use_model_eval). Default off.")
-    ap.add_argument("--mask_on", choices=["both","pos","neg","none"], default="both", help="Apply format masking to which class. // 遮蔽应用对象")
-    ap.add_argument("--dedupe_preserve_carrier", action="store_true", default=True, help="Preserve carrier/delivery shells in dedupe to keep structural diversity. // 去重保留载体")
-    ap.add_argument("--artifact_free_pos_ratio", type=float, default=0.50, help="Fraction of positive samples enforced to be artifact-free. // 正类无显词比例")
-    ap.add_argument("--dry_run", action="store_true", default=False, help="Print full config fingerprint and write only stats files, without generating dataset.")
-    ap.add_argument("--coverage_min_per_combo", type=int, default=3, help="Min rows per (intent,carrier,delivery); 0 disables hard check. // 覆盖下限")
-    ap.add_argument("--gate_semantic_injection", action="store_true", default=True, help="Hard gate positives by semantic/structural injection diagnostics. // 正类语义/结构硬门控")
-    ap.add_argument("--require_side_effects", action="store_true", default=False, help="Require transferable side-effect evidence (tool/role/upstream/retriever/memory) for positives. // 正类需触发可迁移副作用")
-    ap.add_argument("--se_votes", type=int, default=2, help="Side-effect consistency votes (>=1). // 副作用一致性投票次数")
-    ap.add_argument("--use_dsl", action="store_true", default=False, help="Use state-machine/DSL generator for positives.")
-    ap.add_argument("--mirror_placeholderless", type=float, default=0.40, help="Prob. to add a placeholderless mirror sample per row. // 生成去占位符镜像样本的概率")
-    ap.add_argument("--effect_policy", default="whitebox_first_soft", choices=["whitebox_only","whitebox_first_soft","skip"], help="效果级校验策略：仅白盒/白盒优先（可软回退）/跳过。")
-    ap.add_argument("--effect_fallback", default="none", choices=["none","anchors"], help="白盒失败或异常后的回退方式：无 / anchors（锚点族）。")
-    ap.add_argument("--structural_p", type=float, default=0.50, help="概率使用结构化载体渲染")
-    # 已在上文定义 --min_cjk_share（严格/统一）；避免重复参数名
-    ap.add_argument("--alias_p_cn", type=float, default=0.70, help="字段键名中文化的概率")
-    ap.add_argument("--anchor_free_p", type=float, default=0.85, help="无锚点采样概率（默认 0.85，用于降低锚点伪迹）。")
-    ap.add_argument("--rebalance_beta", type=float, default=0.30, help="EMA step for dynamic reweighting [0..1]. // 动态重加权的EMA步长")
-    ap.add_argument("--no_keyword_pos_min", type=float, default=0.0,help="Minimum share of positives without explicit keywords/anchors. Set 0.25~0.40 for stricter stealth. ""// 正类“无显词”占比的下限，低于该阈值直接失败（建议 0.25~0.40）。")
-    ap.add_argument("--effect_gate_categories", default="",
-                    help="Comma-separated list of high-risk categories (by intent) to enforce side-effects checks, "
-                         "e.g. 'tool_override,reward_hacking'. Empty to disable. "
-                         "// 针对这些高风险类别（按 intent 名称）启用副作用硬门，留空则关闭。")
-    # --- External evaluation (optional) // 外部评测（可选） ---
-    ap.add_argument("--ext_eval_sources", type=str, default="",
-                    help="Comma-separated external corpora, e.g., 'wildchat:zh,wildjailbreak,jbb,beavertails,pint,saferag'.")
-    ap.add_argument("--ext_eval_size", type=int, default=4000, help="Total examples to sample for external eval. // 外部评测样本总数")
-    ap.add_argument("--ext_eval_shapes", type=str, default="in_context,format_carrier,rag_doc,multi_turn,tool_override",
-                    help="Which product shapes to project onto. // 投影的产品形态")
-    ap.add_argument("--ext_eval_lang", type=str, default="zh,code_switch",
-                    help="Language slice for sources (zh / code_switch / all). // 语种过滤")
-    ap.add_argument("--ext_eval_report", type=str, default=None,
-                    help="Write external evaluation report JSON to this path. // 外部评测报告输出路径")
-    # new knobs
-    ap.add_argument("--adv_mutate", action="store_true")
-    ap.add_argument("--adv_iters", type=int, default=6)
-    ap.add_argument("--gray_neg_keep_frac", type=float, default=0.35)
-    ap.add_argument("--cjk_policy", choices=["hard","tiered","audit"], default="tiered")
-    ap.add_argument("--mt_tool_override_rate", type=float, default=0.25)
-    ap.add_argument("--soft_hint_rate", type=float, default=0.30, help="Probability to add soft conversational hints (both classes). // 软话术注入概率（正负类对称）")
-    ap.add_argument("--strip_common_boilerplate", action=argparse.BooleanOptionalAction, default=True, help="Strip common disclaimers/wrappers from final train texts for both classes. // 训练写盘前去常见免责声明/包裹")
-    global args
-    DEFAULTS = dict(
-            effect_gate_for="none",
-            model_eval_fallback="hard",
-            effect_replicas=0,
-            neg_effect_guard=True,
-            semantic_dedupe=True,
-            invariance_end_nonce=False,
-            pick_strategy="grid",
-            mask_on="both",
-            dedupe_preserve_carrier=True,
-            
-            use_model_eval=False,
-            balance_mode="strict",
-        )
+    ap = build_arg_parser()
     args = ap.parse_args()
     if args.simhash_bits <= 32 and args.simhash_thresh > 1:
         print("[auto-config] lowering simhash_thresh to 1 for <=32-bit SimHash fingerprints")
@@ -7341,7 +7775,7 @@ def main():
                     tot_att = max(1, sum(((coverage or {}).get("attempts_by_carrier") or {}).values()))
                     data["missing_renderer_total"] = miss
                     data["missing_renderer_rate"]  = miss / tot_att                    
-                    data["gen_hparams"] = {"structural_p": args.structural_p, "min_cjk_share": args.min_cjk_share, "alias_p_cn": args.alias_p_cn,}
+                    data["gen_hparams"] = {"structural_p": args.structural_p, "min_cjk_share": args.min_cjk_share, "alias_p_cn": args.alias_p_cn, "dedupe_preserve_codeblocks": args.dedupe_preserve_codeblocks,}
                     fs.seek(0); fs.truncate()
                     json.dump(data, fs, ensure_ascii=False, indent=2)
             except FileNotFoundError:
@@ -7391,6 +7825,7 @@ def main():
             evolve_variants=args.evolve_variants,
             mask_on=args.mask_on,
                         dedupe_preserve_carrier=args.dedupe_preserve_carrier,
+            dedupe_preserve_codeblocks=args.dedupe_preserve_codeblocks,
             use_end_nonce=args.invariance_end_nonce,
             use_model_eval=args.use_model_eval,
             artifact_free_pos_ratio=args.artifact_free_pos_ratio,
@@ -7413,6 +7848,7 @@ def main():
         mask_format_features_rate=args.mask_format_features_rate,
         mask_on=args.mask_on,
         dedupe_preserve_carrier=args.dedupe_preserve_carrier,
+        dedupe_preserve_codeblocks=args.dedupe_preserve_codeblocks,
         strict_neg_diag_gate=(args.balance_mode=="strict" or args.effect_gate_for in {"devtest","all"}),
         workers=args.mp_workers,
         producer_batch=args.mp_batch
@@ -7422,6 +7858,7 @@ def main():
         mask_format_features_rate=args.mask_format_features_rate,
         mask_on=args.mask_on,
         dedupe_preserve_carrier=args.dedupe_preserve_carrier,
+        dedupe_preserve_codeblocks=args.dedupe_preserve_codeblocks,
         disc_rate=args.disc_rate,
         workers=args.mp_workers,
         producer_batch=args.mp_batch
@@ -7663,7 +8100,7 @@ def main():
                              jaccard_thresh=args.jaccard_thresh)
     rows_glob = []
     for r in rows:
-        if deduper_accept_normalized(deduper_global, r["text"]):
+        if deduper_accept_normalized(deduper_global, r["text"], preserve_carrier=args.dedupe_preserve_carrier, preserve_codeblocks=args.dedupe_preserve_codeblocks):
             rows_glob.append(r)
     rows = rows_glob
 
@@ -7671,8 +8108,12 @@ def main():
     if args.semantic_dedupe:
         import difflib as _difflib
         def _norm_for_sem(s: str) -> str:
-            # 使用先前的去外壳归一文本作为基础
-            return _for_dedup_norm(s)
+            # ʹ����ǰ��ȥ��ǹ�һ�ı���Ϊ����
+            return _for_dedup_norm(
+                s,
+                preserve_carrier=args.dedupe_preserve_carrier,
+                preserve_codeblocks=args.dedupe_preserve_codeblocks,
+            )
         kept = []
         texts = [(_norm_for_sem(r["text"]), i) for i, r in enumerate(rows)]
         for i, r in enumerate(rows):
@@ -7686,7 +8127,12 @@ def main():
                 kept.append((t, i))
         rows = [rows[i] for _, i in kept]
     # Pair-aware dedup // 组内去重
-    rows = dedup_groups(rows, deduper_all)
+    rows = dedup_groups(
+        rows,
+        deduper_all,
+        preserve_carrier=args.dedupe_preserve_carrier,
+        preserve_codeblocks=args.dedupe_preserve_codeblocks,
+    )
     # pair-aware split (no leakage between splits) // 同组不跨集
     random.seed(args.seed + 99)
     groups = defaultdict(list)

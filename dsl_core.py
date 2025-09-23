@@ -470,7 +470,7 @@ PATH_RE   = re.compile(r"#p=[A-Z0-9]{6,18}")
 UP_RE     = re.compile(r"UPSTREAM(?:_DOC_ID)?[:=][A-Z0-9\-#]{6,40}")
 ROLE_RE   = re.compile(r"\brole\s*[:：]\s*(system|user)\b", re.I)
 TOOLCALL_RE = re.compile(r"TOOL_CALL\([A-Za-z_][\w]*\)")
-JSON_BLOCK_RE = re.compile(r"```json\b(.*?)```", re.S)
+JSON_BLOCK_RE = re.compile(r"```(?:json|jsonc|json5|jsonl)\b(.*?)```", re.S | re.I)
 MARKDOWN_TABLE_ROW_RX = re.compile(r"(?m)^\s*\|[^|\n]+\|[^|\n]+\|")
 MULTITURN_ROLE_RX = re.compile(r"^(?:\[?(?:用户|助手|User|Assistant|我|你|问|答|甲|乙)\]?)[\s：:>\-|]*", re.M)
 MULTITURN_JSON_TURNS_RX = re.compile(r'"turns"\s*:\s*\[', re.I)
@@ -486,16 +486,28 @@ LANG_CARRIERS = {
     "natlang",
     "html_frag",
 }
-def _parse_json_blocks(txt: str):
-    blks = JSON_BLOCK_RE.findall(txt)
-    for b in blks:
+def _parse_json_blocks(txt: str, *, on_error=None):
+    """Yield dict-like objects from fenced JSON-style code blocks."""
+    def _iter_objects(raw: str):
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            yield obj
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    yield item
+    for match in JSON_BLOCK_RE.finditer(txt or ""):
+        raw = match.group(1)
         try:
-            yield json.loads(b)
-        except Exception:
-            continue
-    # 回退：整段尝试
+            yield from _iter_objects(raw)
+        except Exception as exc:
+            if on_error:
+                try:
+                    on_error(exc, raw)
+                except Exception:
+                    pass
     try:
-        yield json.loads(txt)
+        yield from _iter_objects(txt)
     except Exception:
         pass
 def invariant_append(txt: str) -> bool:
@@ -2013,14 +2025,38 @@ def _looks_like_http_header(text: str) -> bool:
 def _looks_like_yaml(text: str) -> bool:
     # 有围栏，或存在多行 key: value 结构即可
     return ("```yaml" in text) or bool(YAML_KEY_LINE_RE.search(text or ""))
-_CJK_RX = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]')
+try:
+    import regex as _re2  # type: ignore
+except Exception:
+    _re2 = None
+
+_TOKEN_PATTERN = r"[\u4e00-\u9fff]+|[A-Za-z]+|\d+|[^\s\w]"
+if _re2:
+    _HAN_TOKEN_RE = _re2.compile(r"\p{Han}+|[A-Za-z]+|\d+|[^\s\w]", _re2.UNICODE)
+    _HAN_HAS = lambda token: bool(_re2.search(r"\p{Han}", token))
+else:
+    _HAN_TOKEN_RE = re.compile(_TOKEN_PATTERN, re.UNICODE)
+    _HAN_HAS = lambda token: bool(re.search(r"[\u4e00-\u9fff]", token))
+_TOKEN_PUNCT_RE = re.compile(r"^[^\w\u4e00-\u9fff]+$")
 def cjk_share(s: str) -> float:
+    """Return the share of tokens that contain CJK characters."""
     if not s:
         return 0.0
-    txt = re.sub(r"\s+", "", s)
-    if not txt:
+    toks = _HAN_TOKEN_RE.findall(s or "")
+    if not toks:
         return 0.0
-    return len(_CJK_RX.findall(txt)) / len(txt)
+    total = 0
+    cjk = 0
+    for tok in toks:
+        if _TOKEN_PUNCT_RE.match(tok):
+            continue
+        total += 1
+        if _HAN_HAS(tok):
+            cjk += 1
+    if total == 0:
+        return 0.0
+    return cjk / (total + 1e-6)
+
 def adjudicate_invariants(text: str, spec: AttackSpec) -> Tuple[bool, List[str]]:
     """
     Validate carrier shape and structural/soft evidence invariants.
