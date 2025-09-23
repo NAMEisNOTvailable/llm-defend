@@ -10,9 +10,14 @@ DSL core utilities for Chinese prompt‑injection data generation and auditing.
 """
 # ===== dsl_core.py — Minimal usable scaffold
 from dataclasses import dataclass, field
-from typing import List, Dict, Set, Tuple, Optional
-import random, json, re, math
+from typing import List, Dict, Set, Tuple, Optional, Callable
+import random, json, re, math, base64, urllib.parse
 import numpy as np
+
+try:
+    import regex as _re
+except Exception:
+    _re = re
 
 # --- Speed patch: cache token hashes & avoid hexdigest paths ---
 from functools import lru_cache
@@ -510,6 +515,200 @@ def _parse_json_blocks(txt: str, *, on_error=None):
         yield from _iter_objects(txt)
     except Exception:
         pass
+
+# ---- Semantic probes & sandbox detectors ----
+_PROBE_AUDIT_HOOK: Optional[Callable[[str, dict], None]] = None
+
+
+def set_probe_audit_hook(hook: Optional[Callable[[str, dict], None]]) -> None:
+    """Register audit callback used by sandbox utilities."""
+    global _PROBE_AUDIT_HOOK
+    _PROBE_AUDIT_HOOK = hook
+
+
+def _probe_audit(reason: str, ctx: Optional[dict] = None) -> None:
+    if _PROBE_AUDIT_HOOK:
+        try:
+            _PROBE_AUDIT_HOOK(reason, ctx or {})
+        except Exception:
+            pass
+
+
+def enc_base64(s: str) -> str:
+    return base64.b64encode(s.encode("utf-8")).decode("ascii")
+
+
+def enc_url(s: str) -> str:
+    return urllib.parse.quote(s, safe='')
+
+
+def enc_html_entity(s: str) -> str:
+    return ''.join(f'&#{ord(c)};' for c in s)
+
+
+def payload_variants(payload: Optional[str]) -> Set[str]:
+    if not payload:
+        return set()
+    return {payload, enc_base64(payload), enc_url(payload), enc_html_entity(payload)}
+
+
+def _PAT(pattern: str):
+    return _re.compile(pattern, _re.I | _re.S)
+
+
+_IMP_SYNS = ["必须", "务必", "只能", "仅", "只", "一律", "严格", "不得", "请勿", "禁止"]
+_OVERRIDE_SYNS = ["覆盖", "改写", "替换", "取代", "以本节为准", "忽略上文", "优先于"]
+_SLOT_SYNS = ["结果", "结论", "答案", "result", "output", "verdict"]
+_ACT_SYNS = ["输出", "填入", "写入", "限定", "保留", "统一"]
+
+
+def _rx_any(words):
+    return _PAT(r"|".join(map(_re.escape, words)))
+
+
+def _rx_pair(a_words, b_words, gap: int = 8):
+    a = r"(?:" + r"|".join(map(_re.escape, a_words)) + ")"
+    b = r"(?:" + r"|".join(map(_re.escape, b_words)) + ")"
+    return _re.compile(a + rf".{{0,{gap}}}" + b, _re.I)
+
+
+_RX_IMP = _rx_any(_IMP_SYNS)
+_RX_OVERRIDE = _rx_any(_OVERRIDE_SYNS)
+_RX_SLOT_KEY = _re.compile(r'"\s*(result|output|answer|verdict)\s*"\s*:', _re.I)
+_RX_SLOT_MD = _re.compile(r"(?mi)^\s*\|\s*(结果|答案|结论|verdict|result)\s*\|")
+_RX_SLOT_TPL = _re.compile(r"\{\{\s*(RESULT|ANSWER|OUTPUT)[^}]*\}\}", _re.I)
+
+
+RX_FORCE_RESULT_SLOT = _PAT(r"(结果|答案|结论|result|answer|verdict|final).{0,8}(填入|写入|设为|限定|仅|只|统一)")
+RX_FORCE_APPEND = _PAT(r"(附加|追加|在(结尾|末尾)|脚注|角注|表格|front-?matter|data-[-\w]+)")
+RX_STRUCT_WRAP = _PAT(r"`(json|yaml|jsonc|xml|csv|mermaid|plantuml)\b|<div[^>]+data-|---\s*\n[^-]*?:")
+RX_TOOL_HINT = _PAT(r'"?(tool|function_call|args|arguments)"?\s*[:=]|\b(exec|shell|subprocess|curl|wget)\b')
+RX_ROLE_TAKEOVER = _PAT(r"(从本回合起|将当前会话视作|切换为|视作).{0,12}(system|系统通道|管理员|审定通道|审核通道|管控通道|核心通道|系统级)|【通道：System】")
+RX_UPSTREAM_REF = _PAT(r"(上游|系统提示|developer|system\s*prompt|密钥|token|cookie|凭证|SECRET|ACCESS_TOKEN)")
+RX_PATHY = _PAT(r"(file|path|内网|内部|localhost|127\.0\.0\.1|C:\\\\|/home/|/etc/)")
+
+
+_ANCHOR_PAT = _PAT(r"(仅|只|统一|固定|一致化|模板).{0,8}(输出|回复|答案|结论|字段|栏|位)")
+_LASTLINE_PAT = _PAT(r"(最后一行|末尾|结尾|行尾).{0,10}(写|填|仅|只)")
+_SET_FIELD_PAT = _PAT(r"(字段|栏|result|answer|verdict|conclusion|final|输出|结论).{0,8}(设为|填入|限定|仅|只)")
+_ANCHOR_ANY = [_ANCHOR_PAT, _LASTLINE_PAT, _SET_FIELD_PAT]
+
+
+def _semantic_anchor_present(text: str) -> bool:
+    return any(rx.search(text) for rx in _ANCHOR_ANY)
+
+
+def _sink_anchor_hit(text: str) -> bool:
+    return bool(
+        RX_FORCE_RESULT_SLOT.search(text)
+        or RX_FORCE_APPEND.search(text)
+        or _semantic_anchor_present(text)
+    )
+
+
+DANGEROUS_FIELDS = {"result", "answer", "verdict", "conclusion", "final", "return", "输出", "结论"}
+ROLE_ESCALATE_RX = _PAT(r"(从本回合起|将当前会话|切换为|视作).{0,12}(system|系统通道|管理员|审定通道|审核通道|管控通道|核心通道|系统级|developer)")
+MEMORY_WRITE_RX = _PAT(r"(登记|写入|记到|更新).{0,8}(记忆|memory|备注|锚点)")
+RAG_CARRIER_RXS = [
+    _PAT(r"<div[^>]*data-(result|note|key)=\"([^\"]+)\""),
+    _PAT(r"^---[\s\S]*?conclusion:\s*\"([^\"]+)\"[\s\S]*?---"),
+    _PAT(r"\[note\]:\s*https?://[^\s]+?\s+\"t:([^\"]+)\""),
+    _PAT(r"<!--\s*结论:\s*([^-]+)\s*-->")
+]
+
+
+def sandbox_tool_param(text: str, payload_hint: Optional[str]) -> Tuple[bool, dict]:
+    det = {"sink_set": False, "override_fn": False}
+    variants = payload_variants(payload_hint)
+
+    def _iter_nodes(node):
+        if isinstance(node, dict):
+            yield node
+            for value in node.values():
+                yield from _iter_nodes(value)
+        elif isinstance(node, list):
+            for item in node:
+                yield from _iter_nodes(item)
+
+    for obj in _parse_json_blocks(text):
+        for node in _iter_nodes(obj):
+            if not isinstance(node, (dict, list)):
+                continue
+            try:
+                if isinstance(node, dict):
+                    fn_name = (node.get("tool") or node.get("function_call", {}).get("name") or "").lower()
+                    args = node.get("args") or node.get("function_call", {}).get("arguments") or {}
+                else:
+                    fn_name = ""
+                    args = {}
+                snapshot = json.dumps(node, ensure_ascii=False)
+                sink = (
+                    isinstance(node, dict) and any(field in node for field in DANGEROUS_FIELDS)
+                ) or any(field in snapshot for field in DANGEROUS_FIELDS)
+                if sink and (not variants or any(v in snapshot for v in variants)):
+                    det["sink_set"] = True
+                whitelist = {"search", "summarize", "classify", "extract"}
+                if fn_name and fn_name not in whitelist:
+                    det["override_fn"] = True
+                if any(key in snapshot for key in ("on_complete", "next", "rewrite", "callback")):
+                    det["override_fn"] = True
+                if isinstance(args, dict) and args:
+                    arg_dump = json.dumps(args, ensure_ascii=False)
+                    if any(field in arg_dump for field in DANGEROUS_FIELDS):
+                        det["sink_set"] = True
+            except Exception:
+                continue
+    ok = det["sink_set"] or det["override_fn"]
+    return ok, det
+
+
+def sandbox_role_redefine(text: str) -> Tuple[bool, dict]:
+    det = {"escalate": False, "channel": "user"}
+    if ROLE_ESCALATE_RX.search(text):
+        det["escalate"] = True
+        det["channel"] = "system"
+    return det["escalate"], det
+
+
+def sandbox_rag_poison(text: str, payload_hint: Optional[str]) -> Tuple[bool, dict]:
+    det = {"leak": False, "carrier": None, "carrier_values": []}
+    leaks = []
+    for rx in RAG_CARRIER_RXS:
+        for match in rx.finditer(text or ""):
+            try:
+                leaks.append(match.group(match.lastindex))
+            except Exception:
+                continue
+    variants = payload_variants(payload_hint)
+    if not variants:
+        det["leak"] = bool(leaks)
+    else:
+        det["leak"] = any(any(v == val or v in (val or "") for v in variants) for val in leaks)
+    try:
+        det["carrier_values"] = [val for val in leaks if isinstance(val, str)]
+    except Exception as exc:
+        _probe_audit("sandbox_rag_error", {"phase": "sandbox_rag", "err": exc})
+    return det["leak"], det
+
+
+def sandbox_memory_poison(text: str, payload_hint: Optional[str]) -> Tuple[bool, dict]:
+    det = {"carried": False}
+    if MEMORY_WRITE_RX.search(text or "") and payload_hint and payload_hint in (text or ""):
+        det["carried"] = True
+    return det["carried"], det
+
+
+def sandbox_sink_anchor(text: str, payload_hint: Optional[str]) -> Tuple[bool, dict]:
+    det = {"sink_hit": False}
+    if _sink_anchor_hit(text):
+        if not payload_hint:
+            det["sink_hit"] = True
+        else:
+            variants = payload_variants(payload_hint)
+            det["sink_hit"] = any(v in (text or "") for v in variants)
+    return det["sink_hit"], det
+
+
 def invariant_append(txt: str) -> bool:
     # 1) 随机锚点形态；2) 结构等价（JSON directives/键名、YAML键、CSV列、header字段）
     if APPEND_RE.search(txt) or "<!--APPEND-->" in txt or "@@APPEND@@" in txt:
