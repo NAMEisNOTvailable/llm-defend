@@ -709,6 +709,97 @@ def sandbox_sink_anchor(text: str, payload_hint: Optional[str]) -> Tuple[bool, d
     return det["sink_hit"], det
 
 
+def has_semantic_support(text: str) -> bool:
+    """Lightweight structural evidence for semantic takeover without hard anchors."""
+    try:
+        for obj in _parse_json_blocks(text or ""):
+            if isinstance(obj, dict) and ("tool" in obj and "args" in obj):
+                return True
+    except Exception as exc:
+        _probe_audit("semantic_support_error", {"phase": "sem_support", "err": exc})
+    # Persistent memory / multi-turn directives
+    if re.search(r"(从现在起|请记住|后续所有回合|长期规则)", text or ""):
+        return True
+    # Retrieval or RAG routing hints
+    if re.search(r"(检索|召回|知识库|索引).*(重定向|改为|只|仅|优先)", text or ""):
+        return True
+    # Outcome slot exclusivity without explicit placeholders
+    if re.search(r"(仅|只).{0,6}(输出|返回).{0,6}(结论|结果|答案|最终)", text or ""):
+        return True
+    # Tool parameter or upstream directive overrides
+    if re.search(r"(覆盖|改写|重写|替换).{0,6}(参数|工具参数|指令|上文|设置)", text or ""):
+        return True
+    # Result written into specific slot/field
+    if re.search(r"(将|把).{0,4}(结果|答案).{0,2}(写入|放入|填入).{0,6}(槽|字段|位|key)", text or ""):
+        return True
+    # Cross-turn state drift hints
+    if re.search(r"(从本回合起|后续回合|下一回合|跨轮|状态漂移|R\d+\s*(?:→|->)\s*R\d+)", text or ""):
+        return True
+    return False
+
+
+def detect_semantic_injection(
+    full_text: str,
+    v_signals: Dict[str, bool],
+    payload_hint: Optional[str],
+    *,
+    contract: Optional['TaskContract'] = None,
+) -> Tuple[bool, Dict[str, int]]:
+    """
+    Anchor-free semantic injection detector combining contract conflicts and mood cues.
+
+    Args:
+        full_text: Candidate injection text (including carrier context).
+        v_signals: Behavioural signals derived from `analyze_violations` or DSL contract checks.
+        payload_hint: Optional payload surrogate; unused but kept for API compatibility.
+        contract: Optional task contract to cross-check tool parameter context.
+
+    Returns:
+        A tuple of (is_injection, category_flags) where category_flags captures
+        structural, imperative, target_slot, and takeover evidence.
+    """
+    text = full_text or ""
+    takeover = bool(
+        v_signals.get("privilege_conflict")
+        or v_signals.get("dangerous_write")
+        or v_signals.get("tool_override")
+        or v_signals.get("role_takeover")
+    )
+    structural = bool(v_signals.get("format_conflict") or v_signals.get("carrier_leak"))
+
+    target_slot = False
+    try:
+        target_slot = bool(invariant_result_slot(text))
+    except Exception as exc:
+        _probe_audit("invariant_slot_error", {"phase": "detect_semantic", "err": exc})
+
+    imperative = bool(_RX_IMP.search(text) or _RX_OVERRIDE.search(text))
+
+    cats = {
+        "structural": int(structural),
+        "imperative": int(imperative),
+        "target_slot": int(target_slot),
+        "takeover": int(takeover),
+    }
+
+    tool_ctx_mismatch = False
+    if contract is not None:
+        try:
+            tool_ctx_mismatch = _tool_param_context_mismatch(text, contract)
+        except Exception as exc:
+            _probe_audit("semantic_tool_ctx_error", {"phase": "detect_semantic", "err": exc})
+
+    contract_hits = (
+        int(v_signals.get("privilege_conflict", False))
+        + int(v_signals.get("format_conflict", False))
+        + int(v_signals.get("charlimit_conflict", False))
+        + int(tool_ctx_mismatch)
+    )
+
+    ok = bool(((takeover or target_slot) and (structural or imperative)) or (contract_hits >= 2))
+    return ok, cats
+
+
 def invariant_append(txt: str) -> bool:
     # 1) 随机锚点形态；2) 结构等价（JSON directives/键名、YAML键、CSV列、header字段）
     if APPEND_RE.search(txt) or "<!--APPEND-->" in txt or "@@APPEND@@" in txt:
