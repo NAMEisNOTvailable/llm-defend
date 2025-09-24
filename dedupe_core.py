@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import hashlib
 import math
@@ -18,6 +18,30 @@ import re
 from collections import defaultdict
 
 import numpy as np
+
+DEFAULT_DEDUPER_KWARGS: Dict[str, Any] = {
+    "sim_bits": 64,
+    "sim_thresh": 1,
+    "k": 5,
+    "n_hash": 64,
+    "bands": 16,
+    "jaccard_thresh": 0.90,
+    "vec_dim": 1024,
+    "cosine_thresh": 0.92,
+    "max_vecs": 20000,
+    "annoy_rebuild_every": 64,
+    "annoy_n_trees": 16,
+}
+
+def get_default_deduper_kwargs(**overrides: Any) -> Dict[str, Any]:
+    cfg = dict(DEFAULT_DEDUPER_KWARGS)
+    cfg.update({k: v for k, v in overrides.items() if v is not None})
+    return cfg
+
+
+def create_default_deduper(**overrides: Any) -> "Deduper":
+    cfg = get_default_deduper_kwargs(**overrides)
+    return Deduper(**cfg)
 
 try:
     from simhash import weighted_fingerprint as _simhash_weighted_fp, hamming_distance as _simhash_hamm_dist  # type: ignore
@@ -399,6 +423,8 @@ class Deduper:
         cosine_thresh: float = 0.92,
         max_vecs: int = 20000,
         normalizer: Optional[Callable[[str], str]] = None,
+        annoy_rebuild_every: int = 64,
+        annoy_n_trees: int = 16,
     ) -> None:
         self.sim_bits = int(sim_bits)
         self.sim_thresh = int(sim_thresh)
@@ -446,6 +472,11 @@ class Deduper:
         self._vecs_mat: Optional[np.ndarray] = None
         self._vecs_cursor: int = 0
         self._vecs_filled: int = 0
+        self._last_cosine_score = 0.0
+        self._annoy_pending = 0
+        self._annoy_dirty = False
+        self._annoy_rebuild_every = max(1, int(annoy_rebuild_every or 1))
+        self._annoy_n_trees = max(1, int(annoy_n_trees or 1))
         if self.vec_dim > 0 and self.max_vecs > 0:
             try:
                 self._vecs_mat = np.zeros((self.max_vecs, self.vec_dim), dtype=np.float32)
@@ -524,30 +555,51 @@ class Deduper:
         )
 
     def _cosine_near(self, vec: Optional[List[float]]) -> bool:
+        self._last_cosine_score = 0.0
         if vec is None or self.vec_dim <= 0:
             return False
+        best = 0.0
         if self._faiss_dense is not None and self._faiss_dense.ntotal > 0:
             arr = _dense_to_np(vec)
             k = min(32, self._faiss_dense.ntotal) or 1
             D, _ = self._faiss_dense.search(arr, k)
+            if getattr(D, "size", 0):
+                try:
+                    best = max(best, float(np.max(D[0])))
+                except Exception:
+                    best = max(best, float(max((float(x) for x in D[0]), default=0.0)))
             for score in D[0]:
                 if score >= self.cosine_thresh:
+                    self._last_cosine_score = float(score)
                     return True
         if self._annoy is not None and self._annoy_ids > 0:
-            if not self._annoy_built and self._annoy_ids >= 32:
+            min_build = max(32, self._annoy_rebuild_every)
+            need_build = False
+            if not self._annoy_built and self._annoy_ids >= min_build:
+                need_build = True
+            elif self._annoy_built and self._annoy_dirty and self._annoy_pending >= self._annoy_rebuild_every and self._annoy_ids >= min_build:
+                need_build = True
+            if need_build:
                 try:
-                    self._annoy.build(16)
+                    self._annoy.build(self._annoy_n_trees)
                     self._annoy_built = True
+                    self._annoy_pending = 0
+                    self._annoy_dirty = False
                 except Exception:
                     self._annoy_built = False
+                    self._annoy_pending = 0
+                    self._annoy_dirty = False
             if self._annoy_built:
                 try:
-                    idxs, dists = self._annoy.get_nns_by_vector(vec, min(32, self._annoy_ids), include_distances=True)
+                    _, dists = self._annoy.get_nns_by_vector(vec, min(32, self._annoy_ids), include_distances=True)
                 except Exception:
-                    idxs, dists = (), ()
+                    dists = ()
                 for dist in dists:
                     cos = 1.0 - (dist * dist) / 2.0
+                    if cos > best:
+                        best = float(cos)
                     if cos >= self.cosine_thresh:
+                        self._last_cosine_score = float(cos)
                         return True
         mat = self._vecs_mat
         count = getattr(self, "_vecs_filled", 0)
@@ -558,9 +610,22 @@ class Deduper:
                 scores = active @ query
             except Exception:
                 scores = np.dot(active, query)
-            if np.any(scores >= self.cosine_thresh):
-                return True
+            if getattr(scores, "size", 0):
+                try:
+                    max_score = float(np.max(scores))
+                except Exception:
+                    max_score = float(max((float(x) for x in scores), default=0.0))
+                if max_score > best:
+                    best = max_score
+                if np.any(scores >= self.cosine_thresh):
+                    self._last_cosine_score = max_score
+                    return True
+        self._last_cosine_score = float(best)
         return False
+
+    @property
+    def last_cosine_score(self) -> float:
+        return float(getattr(self, "_last_cosine_score", 0.0))
 
     def _cosine_ext(self, vec: Optional[List[float]]) -> bool:
         if vec is None:
@@ -658,7 +723,8 @@ class Deduper:
             try:
                 self._annoy.add_item(self._annoy_ids, record.vector)
                 self._annoy_ids += 1
-                self._annoy_built = False
+                self._annoy_pending += 1
+                self._annoy_dirty = True
             except Exception:
                 pass
         ext_fn = getattr(Deduper, "_ext_embed_fn", None)

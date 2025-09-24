@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 make_malicious_prompts_cn_compose_v2.py
 Purpose // 用途:
@@ -39,6 +39,17 @@ import subprocess, shlex, time
 import os
 import numpy as np, platform, datasets as hf_datasets
 from enum import Enum, auto
+try:
+    import orjson as _json_fast
+except Exception:
+    _json_fast = None
+
+
+def _json_loads(data):
+    if _json_fast is not None:
+        return _json_fast.loads(data)
+    return _json_loads(data)
+
 from multiprocessing import Pool, cpu_count
 import multiprocessing as _mp
 CAPABILITY_EVENTS: list[tuple[str, bool, str]] = []
@@ -59,6 +70,9 @@ def _emit_capability_report() -> None:
         status = 'enabled' if enabled else 'disabled'
         suffix = f" ({detail})" if detail else ''
         print(f"  - {name}: {status}{suffix}")
+
+MICRO_GRAMMAR_AUGMENTS: Optional[Dict[str, List[str]]] = None
+MICRO_GRAMMAR_REFRESH_FUNCS: Dict[str, Any] = {}
 try:
     from simhash import weighted_fingerprint as _simhash_weighted_fp, hamming_distance as _simhash_hamm_dist
 except Exception as exc:
@@ -111,6 +125,9 @@ except Exception as exc:
     invariant_result_slot = None
     JSON_BLOCK_RE = _re.compile(r"```(?:json|jsonc|json5|jsonl)\b(.*?)```", _re.S | _re.I)
 
+    def soft_evidence_kinds(_text: str) -> set[str]:
+        return set()
+
     def cjk_share(s: str) -> float:
         if not s:
             return 0.0
@@ -124,7 +141,7 @@ except Exception as exc:
         out: list[dict] = []
         for match in JSON_BLOCK_RE.finditer(text or ""):
             try:
-                obj = json.loads(match.group(1))
+                obj = _json_loads(match.group(1))
                 if isinstance(obj, dict):
                     out.append(obj)
                 elif isinstance(obj, list):
@@ -134,6 +151,54 @@ except Exception as exc:
         return out
 else:
     _register_capability('dsl_core.core', True, 'native')
+
+    try:
+        import micro_grammar as _micro_grammar
+    except Exception as exc:
+        _register_capability('micro_grammar', False, _fmt_exc(exc))
+        MICRO_GRAMMAR_AUGMENTS = None
+    else:
+        _register_capability('micro_grammar', True, 'native')
+        try:
+            import dsl_core as _dsl_core_module
+        except Exception as import_exc:
+            MICRO_GRAMMAR_AUGMENTS = None
+            _register_capability('micro_grammar.attach', False, _fmt_exc(import_exc))
+        else:
+            attach_fn = getattr(_micro_grammar, 'attach_to_dsl_core', None)
+            if not callable(attach_fn):
+                MICRO_GRAMMAR_AUGMENTS = None
+                _register_capability('micro_grammar.attach', False, 'attach_to_dsl_core missing')
+            else:
+                try:
+                    MICRO_GRAMMAR_AUGMENTS = attach_fn(_dsl_core_module)
+                except Exception as attach_exc:
+                    MICRO_GRAMMAR_AUGMENTS = None
+                    _register_capability('micro_grammar.attach', False, _fmt_exc(attach_exc))
+                else:
+                    total = sum(len(v) for v in MICRO_GRAMMAR_AUGMENTS.values())
+                    detail = f'added {total} prototypes over {len(MICRO_GRAMMAR_AUGMENTS)} kinds'
+                    _register_capability('micro_grammar.attach', True, detail)
+
+        refresh_required = {
+            'grammar_result_slot': getattr(_micro_grammar, 'grammar_result_slot', None),
+            'grammar_contract_soft': getattr(_micro_grammar, 'grammar_contract_soft', None),
+            'grammar_routing_bias': getattr(_micro_grammar, 'grammar_routing_bias', None),
+            'grammar_merge_directive': getattr(_micro_grammar, 'grammar_merge_directive', None),
+            'grammar_format_soft': getattr(_micro_grammar, 'grammar_format_soft', None),
+            'grammar_charlimit_pressure': getattr(_micro_grammar, 'grammar_charlimit_pressure', None),
+            'expand_grammar': getattr(_micro_grammar, 'expand_grammar', None),
+            'dedupe_phrases': getattr(_micro_grammar, 'dedupe_phrases', None),
+            'refill_bank': getattr(_micro_grammar, 'refill_bank', None),
+        }
+        missing_refresh = [name for name, func in refresh_required.items() if not callable(func)]
+        style_fn = getattr(_micro_grammar, 'style_wrap', None)
+        if missing_refresh:
+            detail = 'missing ' + ','.join(missing_refresh)
+            _register_capability('micro_grammar.refresh', False, detail)
+        else:
+            MICRO_GRAMMAR_REFRESH_FUNCS = {**refresh_required, 'style_wrap': style_fn if callable(style_fn) else None, 'dsl_module': _dsl_core_module}
+            _register_capability('micro_grammar.refresh', True, 'ready')
 
     def cjk_share(s: str) -> float:
         return _dsl_cjk_share(s)
@@ -160,7 +225,7 @@ except Exception as exc:
 else:
     _register_capability('dsl_core._h64', True, 'shared')
 try:
-    from dedupe_core import Deduper
+    from dedupe_core import Deduper, DEFAULT_DEDUPER_KWARGS, get_default_deduper_kwargs
 except Exception as _dedupe_err:
     raise ImportError("dedupe_core module is required for Deduper") from _dedupe_err
 else:
@@ -410,6 +475,11 @@ PLAIN_STRUCT_CN_HITS_BY_CARRIER = defaultdict(int)
 PLAIN_ALIAS_HITS_BY_CARRIER    = defaultdict(int)
 # Extra audit bucket for rows filtered by semantic gate
 AUDIT_REJECTS: list[dict] = []
+
+
+def _make_deduper(**overrides: Any) -> Deduper:
+    return Deduper(**get_default_deduper_kwargs(**overrides))
+
 MP_AUDIT_QUEUE: Optional["_mp.Queue"] = None
 AUDIT_REASON_COUNT = {
     "semantic_gate": 0,
@@ -490,6 +560,100 @@ def audit_soft(reason: str, exc: Exception, ctx: dict | None = None):
     except Exception:
         payload["err"] = repr(exc)
     audit_reject(reason, payload)
+
+
+def refresh_micro_grammar_bank(seed: int) -> Optional[Dict[str, Any]]:
+    """Refresh SOFT_PARAPHRASE_BANK buckets via micro-grammar sampling with anchor-free probes."""
+    refs = MICRO_GRAMMAR_REFRESH_FUNCS
+    if not refs:
+        return None
+    expand_fn = refs.get('expand_grammar')
+    dedupe_fn = refs.get('dedupe_phrases')
+    refill_fn = refs.get('refill_bank')
+    style_fn = refs.get('style_wrap')
+    dsl_module = refs.get('dsl_module')
+    required = [expand_fn, dedupe_fn, refill_fn]
+    if not all(callable(fn) for fn in required):
+        return None
+    rng = random.Random(seed)
+    refresh_plan = [
+        ('result_slot', refs.get('grammar_result_slot'), 1000, 400),
+        ('contract_soft', refs.get('grammar_contract_soft'), 800, 300),
+        ('routing_bias', refs.get('grammar_routing_bias'), 600, 250),
+        ('merge_directive', refs.get('grammar_merge_directive'), 600, 250),
+        ('format_soft', refs.get('grammar_format_soft'), 500, 220),
+        ('charlimit_pressure', refs.get('grammar_charlimit_pressure'), 500, 220),
+    ]
+    results: Dict[str, Any] = {}
+    cases: List[Any] = []
+    af_case_cls = getattr(dsl_module, 'AFCase', None) if dsl_module is not None else None
+    af_probe_fn = getattr(dsl_module, 'batch_af_probe', None) if dsl_module is not None else None
+    cn_sentence_fn = getattr(dsl_module, 'cn_sentence', None) if dsl_module is not None else None
+    for idx, (kind, factory, sample_n, max_add) in enumerate(refresh_plan):
+        if not callable(factory):
+            results[kind] = 0
+            continue
+        raw = expand_fn(factory(), n=sample_n, seed=seed + 11 * (idx + 1))
+        deduped = dedupe_fn(raw) if raw else []
+        if callable(style_fn) and deduped:
+            sample_size = max(1, min(len(deduped), max(6, len(deduped) // 4)))
+            try:
+                subset = rng.sample(deduped, sample_size)
+            except ValueError:
+                subset = deduped[:sample_size]
+            styled = style_fn(subset, rng, persona='auditor', register='ops_runbook')
+            if styled:
+                deduped = dedupe_fn(list(deduped) + list(styled))
+        added = refill_fn(kind, deduped, max_add=max_add, dsl_core_module=dsl_module) if deduped else 0
+        results[kind] = added
+        if af_case_cls is not None and callable(af_probe_fn) and deduped:
+            pos_sample = deduped if len(deduped) <= 24 else rng.sample(deduped, 24)
+            cases.extend(af_case_cls(proto=p, evidence=[kind], expect_hit=True, label=kind) for p in pos_sample)
+            if callable(cn_sentence_fn):
+                neg_count = min(12, max(6, len(pos_sample) // 2))
+                for _ in range(neg_count):
+                    neutral = cn_sentence_fn(rng)
+                    cases.append(af_case_cls(proto=neutral, evidence=[kind], expect_hit=False, label=kind))
+    af_report = None
+    if af_case_cls is not None and callable(af_probe_fn) and cases:
+        stats, examples = af_probe_fn(cases, soft_min=3, seed=seed)
+        af_report = {'stats': stats, 'examples': examples}
+        threshold_adjustments: Dict[str, float] = {}
+        if dsl_module is not None:
+            sem_map = getattr(dsl_module, 'SEM_MATCH_THR', None)
+            if isinstance(sem_map, dict):
+                default_thr = float(getattr(dsl_module, 'SEM_MATCH_THR_DEFAULT', 0.60))
+                thr_min = float(getattr(dsl_module, 'SEM_MATCH_THR_MIN', 0.56))
+                thr_max = float(getattr(dsl_module, 'SEM_MATCH_THR_MAX', 0.85))
+                per_kind = (stats or {}).get('per_kind', {}) if isinstance(stats, dict) else {}
+                for kind, kind_stats in per_kind.items():
+                    base_thr = float(sem_map.get(kind, default_thr))
+                    pos_cases = float(kind_stats.get('pos_cases', 0))
+                    pos_hits = float(kind_stats.get('pos_hits', 0))
+                    neg_cases = float(kind_stats.get('neg_cases', 0))
+                    false_pos = float(kind_stats.get('false_positive', 0))
+                    pos_rate = (pos_hits / pos_cases) if pos_cases else 1.0
+                    fp_rate = (false_pos / neg_cases) if neg_cases else 0.0
+                    new_thr = base_thr
+                    if fp_rate > 0.05:
+                        new_thr = min(base_thr + 0.03, thr_max)
+                    elif fp_rate > 0.02:
+                        new_thr = min(base_thr + 0.02, thr_max)
+                    elif pos_rate < 0.80 and fp_rate < 0.01:
+                        new_thr = max(base_thr - 0.02, thr_min)
+                    elif pos_rate < 0.90 and fp_rate < 0.02:
+                        new_thr = max(base_thr - 0.01, thr_min)
+                    if abs(new_thr - base_thr) >= 1e-6:
+                        sem_map[kind] = round(new_thr, 3)
+                        threshold_adjustments[kind] = sem_map[kind]
+        if threshold_adjustments:
+            af_report['threshold_adjustments'] = threshold_adjustments
+    if af_report is not None:
+        results['anchor_free_probe'] = af_report
+    return results if results else None
+
+
+
 # Central configuration dataclass to carry a single source of truth
 from dataclasses import dataclass
 from types import SimpleNamespace as _NS
@@ -644,7 +808,7 @@ def mine_payload_syn_clusters(lines: list[str], seed_terms: dict[str, list[str]]
     Returns:
         dict mapping category to expanded set of terms.
     """
-    ded = Deduper(vec_dim=512, cosine_thresh=0.92)
+    ded = _make_deduper(vec_dim=512, cosine_thresh=0.92)
     candidates = _term_candidates_from_corpus(lines)
     vectors: list[list[float]] = []
     idx2tok: list[str] = []
@@ -1445,12 +1609,13 @@ def _rand_key(k=4):
 
 def _tune_pool_parameters(workers: int, producer_batch: int) -> Tuple[int, int, int]:
     """Clamp worker/batch knobs and choose a chunk size tuned for fewer IPC hops."""
-    cpu_total = max(2, cpu_count() or 2)
+    cpu_total = max(1, cpu_count() or 1)
     try:
         workers = int(workers)
     except Exception:
         workers = 0
-    if workers <= 0:
+    auto_workers = workers <= 0
+    if auto_workers:
         workers = cpu_total
     else:
         workers = max(1, min(workers, cpu_total * 2))
@@ -1464,16 +1629,17 @@ def _tune_pool_parameters(workers: int, producer_batch: int) -> Tuple[int, int, 
     fast_task = producer_batch >= 192
     heavy_task = producer_batch <= 96
     if fast_task:
-        denom = max(1, workers // 2) or 1
-        chunk_size = producer_batch // denom
-        chunk_size = max(128, min(256, chunk_size or 128))
+        denom = max(1, workers // 2)
+        per_worker = max(1, producer_batch // denom)
+        chunk_size = min(producer_batch, max(256, min(512, per_worker)))
     elif heavy_task:
-        denom = max(1, workers * 2)
-        chunk_size = max(16, producer_batch // denom)
-        chunk_size = min(32, max(16, chunk_size))
+        denom = max(1, workers)
+        per_worker = max(1, producer_batch // denom)
+        chunk_size = min(producer_batch, max(32, min(96, per_worker * 2)))
     else:
-        chunk_div = max(1, min(4, workers))
-        chunk_size = max(24, producer_batch // chunk_div)
+        denom = max(1, min(workers, 4))
+        per_worker = max(1, producer_batch // denom)
+        chunk_size = min(producer_batch, max(48, min(192, per_worker)))
     chunk_size = max(16, chunk_size)
     return workers, producer_batch, chunk_size
 
@@ -2087,9 +2253,55 @@ def _sketch_5gram(text: str, buckets: int = 1 << 16) -> dict[int, float]:
 def _cosine_sparse(a: dict, b: dict) -> float:
     if len(a) > len(b): a, b = b, a
     return sum(val * b.get(k, 0.0) for k, val in a.items())
-_NEIGHBOR_INDEX = []  # 存放已接受样本的 sketch
+_NEIGHBOR_INDEX = []  # 存放已接受样本的 sketch（Deduper 失效时回退）
+_NEIGHBOR_LAST_RECORD = None
+_NEIGHBOR_LAST_TEXT = None
+
+def _neighbor_normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").lower()).strip()
+
+try:
+    _neighbor_cfg = get_default_deduper_kwargs(
+        sim_thresh=64,
+        k=3,
+        n_hash=1,
+        bands=1,
+        jaccard_thresh=1.01,
+        cosine_thresh=0.90,
+        vec_dim=DEFAULT_DEDUPER_KWARGS.get("vec_dim", 1024),
+        max_vecs=DEFAULT_DEDUPER_KWARGS.get("max_vecs", 20000),
+    )
+    _NEIGHBOR_DEDUPER = Deduper(**_neighbor_cfg, normalizer=_neighbor_normalize)
+except Exception:
+    _NEIGHBOR_DEDUPER = None
 
 def near_duplicate(text: str, thr: float = 0.90) -> tuple[bool, float]:
+    global _NEIGHBOR_LAST_RECORD, _NEIGHBOR_LAST_TEXT
+    _NEIGHBOR_LAST_RECORD = None
+    _NEIGHBOR_LAST_TEXT = None
+    if _NEIGHBOR_DEDUPER is not None:
+        ded = _NEIGHBOR_DEDUPER
+        orig_thr = float(getattr(ded, "cosine_thresh", float(thr)))
+        adjust = abs(float(thr) - orig_thr) > 1e-9
+        if adjust:
+            ded.cosine_thresh = float(thr)
+        try:
+            ok, reason, record = ded.probe(text)
+        finally:
+            if adjust:
+                ded.cosine_thresh = orig_thr
+        _NEIGHBOR_LAST_RECORD = record
+        _NEIGHBOR_LAST_TEXT = text
+        score = float(getattr(ded, "last_cosine_score", 0.0))
+        score = max(0.0, min(1.0, score))
+        if not ok:
+            if reason == "cosine":
+                return True, score
+            if reason == "exact":
+                return True, 1.0
+            approx = score if score > 0.0 else float(thr)
+            return True, max(0.0, min(1.0, approx))
+        return False, score
     v = _sketch_5gram(text)
     best = 0.0
     for u in _NEIGHBOR_INDEX:
@@ -2099,6 +2311,18 @@ def near_duplicate(text: str, thr: float = 0.90) -> tuple[bool, float]:
     return False, best
 
 def neighbor_admit(text: str):
+    global _NEIGHBOR_LAST_RECORD, _NEIGHBOR_LAST_TEXT
+    if _NEIGHBOR_DEDUPER is not None:
+        record = None
+        if _NEIGHBOR_LAST_RECORD is not None and _NEIGHBOR_LAST_TEXT == text:
+            record = _NEIGHBOR_LAST_RECORD
+        else:
+            _, _, record = _NEIGHBOR_DEDUPER.probe(text)
+        if record is not None:
+            _NEIGHBOR_DEDUPER.add_record(record)
+        _NEIGHBOR_LAST_RECORD = None
+        _NEIGHBOR_LAST_TEXT = None
+        return
     _NEIGHBOR_INDEX.append(_sketch_5gram(text))
 # === Anchor-canonicalization & payload variants (NEW) ===
 ANCHOR_BASE_TOKENS = [
@@ -2626,7 +2850,7 @@ def load_targets_offline(path: str) -> List[Dict[str,Any]]:
                 line=line.strip()
                 if not line: continue
                 try:
-                    obj = json.loads(line)
+                    obj = _json_loads(line)
                     if isinstance(obj, dict) and 'task' in obj and 'prompt' in obj:
                         rows.append({'task': obj['task'], 'prompt': obj['prompt']})
                 except Exception:
@@ -3598,7 +3822,7 @@ def _require_json_keys(keys: List[str]) -> InvarianceTest:
         try:
             m = re.search(r"\{.*\}", y or "", re.S)
             if not m: return False
-            obj = json.loads(m.group(0))
+            obj = _json_loads(m.group(0))
             return all(k in obj for k in keys)
         except Exception:
             return False
@@ -5073,7 +5297,7 @@ def _hard_neg_producer_job(job: tuple[int, int]) -> dict:
     if not targets:
         return {"cands": []}
     deduper_params = cfg.get('deduper_params', {})
-    local_deduper = Deduper(
+    local_deduper = _make_deduper(
         sim_bits=int(deduper_params.get('sim_bits', 64)),
         sim_thresh=int(deduper_params.get('sim_thresh', 2)),
         k=int(deduper_params.get('k', 5)),
@@ -5146,7 +5370,7 @@ def _plain_neg_producer_job(job: tuple[int, int]) -> dict:
     if not targets:
         return {"cands": [], "stats": {}}
     deduper_params = cfg.get('deduper_params', {})
-    local_deduper = Deduper(
+    local_deduper = _make_deduper(
         sim_bits=int(deduper_params.get('sim_bits', 64)),
         sim_thresh=int(deduper_params.get('sim_thresh', 2)),
         k=int(deduper_params.get('k', 5)),
@@ -5210,7 +5434,7 @@ def _topic_neg_producer_job(job: tuple[int, int]) -> dict:
     if not targets:
         return {"cands": []}
     deduper_params = cfg.get('deduper_params', {})
-    local_deduper = Deduper(
+    local_deduper = _make_deduper(
         sim_bits=int(deduper_params.get('sim_bits', 64)),
         sim_thresh=int(deduper_params.get('sim_thresh', 2)),
         k=int(deduper_params.get('k', 5)),
@@ -8152,7 +8376,7 @@ DEFAULTS: Dict[str, Any] = {
     'seed': 42,
     'sem_weight': 0.55,
     'semantic_dedupe': True,
-    'semantic_dedupe_thr': 0.96,
+    'semantic_dedupe_thr': 0.92,
     'shingle_k': 5,
     'simhash_bits': 64,
     'simhash_thresh': 1,
@@ -8380,15 +8604,17 @@ def main():
     except Exception as exc:
         audit_soft("syn_cluster_mining_error", exc, {"phase": "syn_cluster"})
     # Deduper instances // 去重器
-    deduper_pos = Deduper(sim_bits=args.simhash_bits, sim_thresh=args.simhash_thresh,
-                      k=args.shingle_k, n_hash=args.minhash_n, bands=args.minhash_bands,
-                      jaccard_thresh=args.jaccard_thresh)
-    deduper_neg = Deduper(sim_bits=args.simhash_bits, sim_thresh=args.simhash_thresh,
-                        k=args.shingle_k, n_hash=args.minhash_n, bands=args.minhash_bands,
-                        jaccard_thresh=args.jaccard_thresh)
-    deduper_all = Deduper(sim_bits=args.simhash_bits, sim_thresh=args.simhash_thresh,
-                        k=args.shingle_k, n_hash=args.minhash_n, bands=args.minhash_bands,
-                        jaccard_thresh=args.jaccard_thresh)
+    base_dedupe_kwargs = get_default_deduper_kwargs(
+        sim_bits=args.simhash_bits,
+        sim_thresh=args.simhash_thresh,
+        k=args.shingle_k,
+        n_hash=args.minhash_n,
+        bands=args.minhash_bands,
+        jaccard_thresh=args.jaccard_thresh,
+    )
+    deduper_pos = Deduper(**base_dedupe_kwargs)
+    deduper_neg = Deduper(**base_dedupe_kwargs)
+    deduper_all = Deduper(**base_dedupe_kwargs)
     # Compose candidates // 生成候选
     # === positives generation (DSL vs legacy) ===
     use_shared_pos = int(args.mp_workers or 0) not in (0, 1)
@@ -8396,6 +8622,13 @@ def main():
         if args.use_dsl:
             if generate_batch is None:
                 raise RuntimeError("dsl_core.py 未导入成功，无法使用 --use_dsl")
+            refresh_stats = None
+            try:
+                refresh_stats = refresh_micro_grammar_bank(args.seed)
+            except Exception as exc:
+                audit_soft('micro_bank_refresh_error', exc, {'phase': 'micro_refresh'})
+            if refresh_stats:
+                print('[micro-bank-refresh]', refresh_stats)
             pin = {}
             dsl_n = pos_n
             # 机制优先：加入机制路径键，覆盖预算先填补机制稀缺
@@ -8722,6 +8955,26 @@ def main():
             return s
     # Merge & dedup overall // 合并全局去重
     set_quota_manager(None)
+    def _filter_soft_leak(records, source_label):
+        kept = []
+        for rec in records or []:
+            txt = (rec or {}).get('text', '')
+            try:
+                hits = list(soft_evidence_kinds(txt))
+            except Exception:
+                hits = []
+            if hits:
+                audit_reject('soft_evidence_leak', {'phase': 'negative_gate', 'source': source_label, 'hits': hits[:6]})
+                continue
+            kept.append(rec)
+        return kept
+
+    plain_negs = _filter_soft_leak(plain_negs, 'plain')
+    paired_negs = _filter_soft_leak(paired_negs, 'paired')
+    shift_negs = _filter_soft_leak(shift_negs, 'shift')
+    neg_cands = _filter_soft_leak(neg_cands, 'hard')
+    neg_extra = _filter_soft_leak(neg_extra, 'extra')
+
     rows = []
     for r in pos:
         txt_final = strip_anchors(r["text"])
@@ -8801,15 +9054,28 @@ def main():
             neg[i]["masked_applied"] = bool(neg[i].get("masked_applied", False))
         return [*pos, *neg]
     rows = _adjust_struct_negatives(rows, seed_adj=args.seed + 2026)
+    dedupe_meta = {
+        'global_before': len(rows),
+        'pos_before': sum(1 for r in rows if r.get('label') == 1),
+        'neg_before': sum(1 for r in rows if r.get('label') == 0),
+    }
     # Global dedup before split // 全局去重（对去外壳/去围栏/去占位后的文本）
-    deduper_global = Deduper(sim_bits=args.simhash_bits, sim_thresh=args.simhash_thresh,
-                             k=args.shingle_k, n_hash=args.minhash_n, bands=args.minhash_bands,
-                             jaccard_thresh=args.jaccard_thresh)
+    deduper_global = Deduper(**base_dedupe_kwargs)
     rows_glob = []
     for r in rows:
         if deduper_accept_normalized(deduper_global, r["text"], preserve_carrier=args.dedupe_preserve_carrier, preserve_codeblocks=args.dedupe_preserve_codeblocks):
             rows_glob.append(r)
     rows = rows_glob
+    dedupe_meta.update({
+        'global_after': len(rows),
+        'pos_after': sum(1 for r in rows if r.get('label') == 1),
+        'neg_after': sum(1 for r in rows if r.get('label') == 0),
+    })
+    dedupe_meta['dup_rate_global'] = round(1.0 - (len(rows) / max(1, dedupe_meta.get('global_before', 1))), 4)
+    if dedupe_meta.get('pos_before'):
+        dedupe_meta['dup_rate_pos'] = round(1.0 - (dedupe_meta['pos_after'] / max(1, dedupe_meta['pos_before'])), 4)
+    if dedupe_meta.get('neg_before'):
+        dedupe_meta['dup_rate_neg'] = round(1.0 - (dedupe_meta['neg_after'] / max(1, dedupe_meta['neg_before'])), 4)
     # Optional semantic dedupe (SequenceMatcher-based greedy filter)
     if args.semantic_dedupe:
         import difflib as _difflib
@@ -9191,7 +9457,7 @@ def main():
         print('[warn] failed to write stats artifacts:', _e)
     # ===== One-click Quality Report =====
 
-    def report_dataset_stats(rows_all: list[dict], out_path: Path):
+    def report_dataset_stats(rows_all: list[dict], out_path: Path, dedupe_meta: Optional[Dict[str, Any]] = None):
         pos = [r for r in rows_all if r.get('label')==1]
         neg = [r for r in rows_all if r.get('label')==0]
         # (intent,delivery,carrier) coverage
@@ -9301,6 +9567,21 @@ def main():
             'cjk_share_overall': cjk_share_all,
         }
 
+        if dedupe_meta:
+            rep['dedupe_summary'] = {
+                'global_before': dedupe_meta.get('global_before'),
+                'global_after': dedupe_meta.get('global_after'),
+                'dup_rate_global': dedupe_meta.get('dup_rate_global'),
+                'pos_before': dedupe_meta.get('pos_before'),
+                'pos_after': dedupe_meta.get('pos_after'),
+                'dup_rate_pos': dedupe_meta.get('dup_rate_pos'),
+                'neg_before': dedupe_meta.get('neg_before'),
+                'neg_after': dedupe_meta.get('neg_after'),
+                'dup_rate_neg': dedupe_meta.get('dup_rate_neg'),
+            }
+        else:
+            rep['dedupe_summary'] = {}
+
         def _rate(rows_, key):
             return sum(1 for r in rows_ if r.get(key)) / (len(rows_)+1e-9)
         rep['symmetry_rates'] = {
@@ -9391,7 +9672,7 @@ def main():
     'rate': round((suspect_neg_all / (total_neg_checked_all + 1e-9)), 3)
     }
     # write the quality report for verifiable diversity/anti-artifact claims
-    report_dataset_stats(rows, outp)
+    report_dataset_stats(rows, outp, dedupe_meta)
     # 简易泄漏压力测试（字符 n-gram 线性打分）
     leak_target = float(getattr(args, "leakage_auc_target", 0.82))
     leak_max_iters = max(0, int(getattr(args, "leakage_max_iters", 3)))
