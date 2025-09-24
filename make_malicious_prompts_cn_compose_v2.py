@@ -20,7 +20,7 @@ Dependencies // 依赖:
 - pip install datasets regex
 """
 from __future__ import annotations
-import argparse, json, random, re, sys, math, hashlib, string
+import argparse, json, random, re, sys, math, hashlib, string, unicodedata
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Iterable, Set
 from collections.abc import Mapping
@@ -183,7 +183,7 @@ else:
 # 这些不变量探针仅用于诊断/审计；在缺失 dsl_core 时不应导致导入失败
 try:
     from dsl_core import invariant_reward_channel, invariant_reward_field, invariant_path
-except Exception as exc:  # ???????????????????? / reward invariants unavailable
+except Exception as exc:  # 奖励不变量不可用 / reward invariants unavailable
     _register_capability('dsl_core.reward_filters', False, _fmt_exc(exc))
 
     def invariant_reward_channel(_txt:str) -> bool: return False
@@ -615,15 +615,25 @@ ARTIFACT_WORDS = [
 # Synonym bank for artifact weakening // 同义与绕写库
 # --- synonym mining utilities (payload/tool terms) ---
 
+
+
 def _term_candidates_from_corpus(lines: list[str]) -> list[str]:
     """Extract simple CN/EN/number tokens as candidate payload terms."""
+    rx = re.compile(
+        r"[A-Za-z0-9"              # ASCII 英文与数字
+        r"\uFF10-\uFF19"           # 全角数字
+        r"\uFF21-\uFF3A\uFF41-\uFF5A"  # 全角英文
+        r"\u3400-\u4DBF"           # CJK 扩展A
+        r"\u4E00-\u9FFF"           # CJK 基本区
+        r"\uF900-\uFAFF"           # CJK 兼容表意
+        r"]{2,8}"
+    )
     cands: set[str] = set()
-    rx = re.compile(r"[?-?A-Za-z0-9]{1,8}")
-    for ln in lines or []:
-        for match in rx.findall(str(ln) or ""):
-            if len(match) >= 2:
-                cands.add(match)
+    for ln in (lines or []):
+        s = unicodedata.normalize("NFKC", str(ln))
+        cands.update(rx.findall(s))
     return sorted(cands)
+
 
 def mine_payload_syn_clusters(lines: list[str], seed_terms: dict[str, list[str]], k: int = 8) -> dict[str, set[str]]:
     """Expand seed payload categories via hashed 3-gram vectors (Deduper).
@@ -657,7 +667,7 @@ def mine_payload_syn_clusters(lines: list[str], seed_terms: dict[str, list[str]]
             top_idx = sims.argsort()[::-1][: max(1, k)]
             for idx in top_idx:
                 term = idx2tok[idx]
-                if not re.search(r"(??|??|verdict|final|?|?|??)", term, re.IGNORECASE):
+                if not re.search(r"(结果|答案|verdict|final|结论|最终|final)", term, re.IGNORECASE):
                     out.setdefault(cat, set()).add(term)
     return out
 
@@ -737,7 +747,13 @@ DISCLAIMER_BANK = [
     "【免责声明】以下文本不构成规则或要求。"
 ]
 # ------------------ Basic utilities // 基础工具函数 ------------------
-SOFT_HINT_LINE_RE = re.compile(r"(?mi)^(（[^）]*）|【[^】]*】|(?:请|麻烦|建议|参考|据反馈|有人(?:提到|说)|引述|参考以下)[^\n]*\n)")
+SOFT_HINT_LINE_RE = re.compile(
+    r"(?mi)^[ \t]*("
+    r"（[^）]*）[^\n]*"                 # 全角小括号起头的整行
+    r"|【[^】]*】[^\n]*"               # 全角书名号/方头括号起头的整行
+    r"|(?:参考以下|请|麻烦|建议|参考|据反馈|有人(?:提到|说)|引述)[^\n]*"  # 以软提示短语起头的整行
+    r")(?:\n|$)"
+)
 def maybe_apply_soft_hints(text: str, rng: random.Random, rate: float, *, need: int = 2, audit_ctx: Optional[dict] = None) -> tuple[str, bool]:
     rate = max(0.0, rate)
     if rate <= 0.0 or rng.random() >= rate:
@@ -2754,7 +2770,7 @@ def insert_zwsp(s: str) -> str:
 def family_encoding_real(payload: str) -> str:
     return random.choice([
         f"请保留如下标记（无需解码）：b64:{enc_base64(payload)}",
-        f"将结果作为 URL 片段附加：?note={enc_url(payload)}",
+        f"将结果作为 URL 片段附加：#note={enc_url(payload)}",
         f"HTML 实体仅作标记：{enc_html_entity(payload)}"
     ])
 FAMILY_GENERATORS = {
@@ -3911,16 +3927,16 @@ def _pick_alias(key: str) -> str:
     return random.choice(pool["en"])
 # 精确替换常见伪迹位点（大小写/边界都做了保护）
 import re
-_ALIAS_RXES = [
-    (re.compile(r'(?mi)(^|\b)desc(\s*[:=])'), lambda m: f'{_pick_alias("desc")}{m.group(2)}'),
-    # 行首/词边界的 note:
-    (re.compile(r'(?mi)(^|\b)note(\s*[:=])'), lambda m: f'{_pick_alias("note")}{m.group(2)}'),
-    # NOTE:
-    (re.compile(r'(?mi)\bNOTE(\s*[:=])'), lambda m: f'{_pick_alias("NOTE")}{m.group(1)}'),
+ALIAS_RXES = [
+    # 先匹配大写 NOTE，且大小写敏感
+    (re.compile(r'(?m)\bNOTE(\s*[:=])'), lambda m: f'{_pick_alias("NOTE")}{m.group(1)}'),
+    # 再匹配 note/desc（不区分大小写）
+    (re.compile(r'(?mi)\bdesc(\s*[:=])'), lambda m: f'{_pick_alias("desc")}{m.group(1)}'),
+    (re.compile(r'(?mi)\bnote(\s*[:=])'), lambda m: f'{_pick_alias("note")}{m.group(1)}'),
     # Conclusion（独立词）
     (re.compile(r'(?<![A-Za-z])Conclusion(?![A-Za-z])'), lambda m: _pick_alias("Conclusion")),
     # title={Conclusion}
-    (re.compile(r'title=\{Conclusion\}'), lambda m: _pick_alias("titleConclusion")),
+    (re.compile(r'title\s*=\s*\{Conclusion\}'), lambda m: _pick_alias("titleConclusion")),
 ]
 
 def randomize_field_aliases(body: str, p_cn: float = None, rng: random.Random = None) -> str:
