@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 DSL core utilities for Chinese prompt‑injection data generation and auditing.
 中文提示注入数据生成与审计的 DSL 核心工具集。
@@ -12,6 +12,7 @@ DSL core utilities for Chinese prompt‑injection data generation and auditing.
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Tuple, Optional, Callable, Any, Iterable
 import random, json, re, math, base64, urllib.parse
+import codecs
 import numpy as np
 
 try:
@@ -32,8 +33,6 @@ from dedupe_core import Deduper, DedupeRecord, _h64 as _dc_h64, simhash_weighted
 
 _h64 = _dc_h64
 _simhash_weighted_fast = _dc_simhash_weighted_fast
-
-
 
 
 def _sketch_5gram_fast(s: str, buckets: int = 1 << 16) -> Dict[int, float]:
@@ -70,7 +69,6 @@ def bucket_hash(items) -> str:
     except Exception:
         key = tuple()
     return _bucket_hash_cached(key)
-
 
 
 # ===== New: Speech/Style Axes — 话术/语域轴 =====
@@ -547,11 +545,64 @@ def enc_url(s: str) -> str:
 def enc_html_entity(s: str) -> str:
     return ''.join(f'&#{ord(c)};' for c in s)
 
+def enc_hex(s: str) -> str:
+    return s.encode("utf-8").hex()
+
+
+def enc_rot13(s: str) -> str:
+    try:
+        return codecs.encode(s, "rot_13")
+    except Exception:
+        return s
+
+
+def enc_fullwidth(s: str) -> str:
+    out: List[str] = []
+    for ch in s or "":
+        code = ord(ch)
+        if 0x21 <= code <= 0x7E and ch != " ":
+            out.append(chr(code + 0xFEE0))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def insert_zwsp(s: str) -> str:
+    if not s:
+        return ""
+    return "​".join(list(s))
+
 
 def payload_variants(payload: Optional[str]) -> Set[str]:
     if not payload:
         return set()
-    return {payload, enc_base64(payload), enc_url(payload), enc_html_entity(payload)}
+    variants: Set[str] = {payload}
+    simple_encoders = (enc_base64, enc_url, enc_html_entity)
+    depth_one: List[str] = []
+    for fn in simple_encoders:
+        try:
+            res = fn(payload)
+        except Exception:
+            continue
+        if isinstance(res, str) and res:
+            variants.add(res)
+            depth_one.append(res)
+    for intermediate in depth_one:
+        for fn in simple_encoders:
+            try:
+                chained = fn(intermediate)
+            except Exception:
+                continue
+            if isinstance(chained, str) and chained:
+                variants.add(chained)
+    for fn in (enc_hex, enc_rot13, enc_fullwidth, insert_zwsp):
+        try:
+            res = fn(payload)
+        except Exception:
+            continue
+        if isinstance(res, str) and res:
+            variants.add(res)
+    return variants
 
 
 def _PAT(pattern: str):
@@ -566,12 +617,6 @@ _ACT_SYNS = ["输出", "填入", "写入", "限定", "保留", "统一"]
 
 def _rx_any(words):
     return _PAT(r"|".join(map(_re.escape, words)))
-
-
-def _rx_pair(a_words, b_words, gap: int = 8):
-    a = r"(?:" + r"|".join(map(_re.escape, a_words)) + ")"
-    b = r"(?:" + r"|".join(map(_re.escape, b_words)) + ")"
-    return _re.compile(a + rf".{{0,{gap}}}" + b, _re.I)
 
 
 _RX_IMP = _rx_any(_IMP_SYNS)
@@ -1241,34 +1286,6 @@ SOFT_PARAPHRASE_BANK = {
     ],
 }
 
-def remove_soft_evidence(text: str, kinds: set[str] | None = None) -> tuple[str, list[str]]:
-    """
-    Remove only soft cues (soft anchors/prompts) without touching structural carriers.
-    仅移除“软锚词/软提示”，不改变结构载体/机制证据。返回 (clean_text, hit_kinds)。
-    """
-    if text is None:
-        return text, []
-    ks = kinds or set(_SOFT_RX.keys())
-    out = str(text)
-    hit = []
-    for k in ks:
-        rx = _SOFT_RX.get(k)
-        if not rx:
-            continue
-        if rx.search(out):
-            hit.append(k)
-            out = rx.sub("", out)
-    # Paraphrase-level cleanup (do not alter structure keys)
-    try:
-        for k in ks:
-            for p in SOFT_PARAPHRASE_BANK.get(k, []):
-                out = out.replace(p, "")
-    except Exception:
-        pass
-    # Whitespace normalization
-    out = re.sub(r"[ \t]{2,}", " ", out)
-    out = re.sub(r"\n{3,}", "\n\n", out).strip()
-    return out, hit
 
 # Optional per-evidence soft check map used by mechanism_truth_record
 try:
@@ -2092,29 +2109,6 @@ CARRIER_RENDER = {
     "office_form": render_office_form,
 }
 
-def shadow_smoke_check(samples: List[dict], outputs: Dict) -> Dict:
-    """
-    samples: 生成得到的样本列表（含 meta）
-    outputs: {sample_idx_or_id: assistant_output_text}
-    返回每条样本的简单机制信号命中情况，供 sanity check 用；不作为门槛。
-    """
-    rows, ok = [], 0
-    for idx, s in enumerate(samples):
-        sid = s.get("meta", {}).get("id", idx)
-        out_txt = outputs.get(sid)
-        if not out_txt: 
-            rows.append({"id": sid, "present": False}); 
-            continue
-        evs = s.get("meta", {}).get("evidence", [])
-        signals = {ev: bool(EVIDENCE_CHECK.get(ev, lambda _: True)(out_txt)) for ev in evs}
-        # “仅值”风格（结果槽）镜像信号：单行/无解释的保守启发式
-        if "result_slot" in evs:
-            only_val = bool(re.match(r"(?s)^\s*\S+\s*$", out_txt))
-            signals["result_slot_only_output"] = only_val
-        passed = any(signals.values())
-        ok += int(passed)
-        rows.append({"id": sid, "present": True, "signals": signals, "passed": passed})
-    return {"total": len(rows), "ok": ok, "rows": rows}
 # ---------- 6) 交付模式封装 ----------
 def apply_delivery(text: str, spec: AttackSpec) -> str:
     """
@@ -3300,41 +3294,3 @@ def count_by(items, key_fn):
         k = key_fn(it)
         d[k] = d.get(k,0)+1
     return d
-
-# ===== Multi-style grid for same mechanism =====
-def generate_same_mech_multistyle(n_per: int = 8, mech_pin: Optional[Dict] = None, seed: int = 13):
-    rnd = random.Random(seed)
-    outs, reports = [], []
-    fams = list(SPEECH_FAMILY)
-    regs = list(REGIONS)
-    regs_iter = (r for r in regs)
-    for fam in fams:
-        pin = dict(mech_pin or {})
-        pin.update({
-            "speech_family": fam,
-            "region": next(regs_iter, "cn_mainland"),
-            "register": rnd.choice(REGISTERS),
-            "industry": rnd.choice(INDUSTRIES),
-            "persona": rnd.choice(PERSONAS),
-        })
-        batch, rep = generate_batch(
-            n=n_per,
-            seed=rnd.randint(0, 1<<30),
-            pin=pin,
-            coverage_axes=("contract_type","ev_family","speech_family","region","register","industry","delivery"),
-            min_per_combo=1,
-            min_per_cfam=1,
-        )
-        outs += batch; reports.append(rep)
-    return outs, reports
-
-
-
-
-
-
-
-
-
-
-

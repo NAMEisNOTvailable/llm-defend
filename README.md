@@ -4,6 +4,9 @@ This repository bundles the scripts used to assemble Chinese prompt-injection da
 
 ## Overview
 - `make_malicious_prompts_cn_compose_v2.py` - end-to-end CLI for dataset generation (positives, negatives, auditing, splitting, reporting).
+-  sets the probability of inserting/removing soft hints; positives and negatives now share the same rate to avoid label leakage.
+-  sets the probability of inserting/removing soft hints; positives and negatives now share the same rate to avoid label leakage.
+-  sets the probability of inserting/removing soft hints; positives and negatives now share the same rate to avoid label leakage.
 - `dsl_core.py` - domain-specific language for intent-level attack rendering, invariants, coverage accounting, and local/global de-dup helpers.
 - `dedupe_core.py` - reusable SimHash + MinHash-LSH + hashed n-gram cosine deduper with optional ANN acceleration and extensibility hooks.
 
@@ -91,6 +94,7 @@ The DSL path samples strategy/channel/carrier/delivery combinations, enforces an
 Key CLI toggles to be aware of:
 - `--plain_neg_ratio`, `--topic_neg_ratio`, `--wild_neg_ratio` control the negative mix.
 - `--structural_p`, `--alias_p_cn`, `--anchor_free_p` adjust carrier/style biases across positives.
+- `--soft_hint_rate` sets the probability of inserting/removing soft hints; positives and negatives now share the same rate to avoid label leakage.
 - `--coverage_min_per_combo`, `--coverage_min_per_cfam` add hard minimums for DSL coverage audits.
 - `--simhash_bits`, `--simhash_thresh`, `--minhash_n`, `--minhash_bands`, `--jaccard_thresh` tune dedupe strength.
 
@@ -99,6 +103,8 @@ Given `--out data.jsonl`, the run creates:
 - `data.jsonl` - minimal training view containing `{ "text", "label" }` pairs only.
 - `data_audit.jsonl` - full diagnostics (intent, carrier, delivery, coverage bins, anchor/free flags, symmetry stats, effect metadata).
 - `data_stats.json` - aggregated audits (semantic neighbour percentiles, anchor-free ratios, parity summaries).
+
+Before synthesis starts, the SimHash/MinHash/Jaccard cascade now feeds into a SequenceMatcher pass that uses a tighter default threshold of 0.92 (was 0.96) to merge near-synonymous Chinese templates more aggressively.
 
 ## Pipeline Highlights
 1. Target pool construction mixes HF datasets and local JSON with optional revision pinning and worker pools.
