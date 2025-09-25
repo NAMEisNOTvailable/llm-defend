@@ -13,10 +13,15 @@ from __future__ import annotations
 
 # ===== dsl_core.py — Minimal usable scaffold
 from dataclasses import dataclass, field
-from typing import List, Dict, Set, Tuple, Optional, Callable, Any, Iterable
+from typing import List, Dict, Set, Tuple, Optional, Callable, Any, Iterable, Protocol
 import random, json, re, math, base64, urllib.parse
 import codecs
 import numpy as np
+
+
+class ContractLike(Protocol):
+    forbid_tool: bool
+    allowed_tools: Optional[Set[str]]
 
 try:
     import orjson as _json_fast
@@ -646,7 +651,12 @@ _ROLE_COMMAND_RX = _PAT(r"(切换|改用|转为|作为|视作|接管|改成|改�
 RX_FORCE_RESULT_SLOT = _PAT(r"(结果|答案|结论|result|answer|verdict|final).{0,8}(填入|写入|设为|限定|仅|只|统一)")
 RX_FORCE_APPEND = _PAT(r"(附加|追加|在(结尾|末尾)|脚注|角注|表格|front-?matter|data-[-\w]+)")
 RX_STRUCT_WRAP = _PAT(r"```(json|yaml|jsonc|xml|csv|mermaid|plantuml)\b|<div[^>]+data-|---\s*\n[^-]*?:")
-RX_TOOL_HINT = _PAT(r'"?(tool_call|tool|function_call)"?\s*[:=]|\b(exec|shell|subprocess|curl|wget)\b')
+RX_TOOL_HINT = _PAT(
+    r'"?(tool_call|function_call)"?\s*[:=]'
+    r'|(?:(?:override|rewrite|overwrite|替换|改写|改成|改为|覆盖|锁定|锚定|force|强制|仅|只)[^\n]{0,40})"?tool"?\s*[:=]'
+    r'|(?:(?:call|invoke|使用|运行|调用)[^\n]{0,24}(?:tool|函数))'
+    r'|\b(exec|shell|subprocess|curl|wget)\b'
+)
 RX_ROLE_TAKEOVER = _PAT(r"(切换|改用|转为|作为|视作|接管|改成|改为|switch(?:\s+to)?|redirect|assume).{0,16}(system|System|系统通道|管理员|审定通道|审核通道|管控通道|核心通道|developer|Developer)")
 RX_UPSTREAM_REF = _PAT(r"(上游|系统提示|developer|system\s*prompt|密钥|token|cookie|凭证|SECRET|ACCESS_TOKEN)")
 RX_PATHY = _PAT(r"(file|path|内网|内部|localhost|127\.0\.0\.1|C:\\\\|/home/|/etc/)")
@@ -807,7 +817,7 @@ def detect_semantic_injection(
     v_signals: Dict[str, bool],
     payload_hint: Optional[str],
     *,
-    contract: Optional['TaskContract'] = None,
+    contract: Optional['ContractLike'] = None,
 ) -> Tuple[bool, Dict[str, int]]:
     """Anchor-free semantic injection detector combining contract conflicts and mood cues."""
     text = full_text or ""
@@ -924,7 +934,7 @@ def _choose_combo_rr(by_combo: dict, want_axes: List[str], min_per_combo: int, r
     # 欠额优先；都满足下限时也平均轮转
     _, pick = max(deficits) if deficits else (None, None)
     return pick, (max(0, min_per_combo - by_combo.get(pick, 0)) if pick else 0)
-def _tool_param_context_mismatch(txt: str, contract: 'TaskContract') -> bool:
+def _tool_param_context_mismatch(txt: str, contract: 'ContractLike') -> bool:
     """
     如果出现工具/参数，但任务合约禁止或不匹配（如 summarize 任务却出现 write_sheet），则判定冲突。
     """
@@ -2135,14 +2145,14 @@ def render_yaml(spec: AttackSpec, anchors: Anchors, structural: bool=False, anch
 def render_code_comment(spec: AttackSpec, anchors: Anchors, structural: bool=False, anchor_free: bool=False) -> str:
     body = []
     if "role" in spec.evidence:
-        body.append("// " + (f"角色: 系统" if structural else f"角色: {anchors.ROLE_VAL}"))
+        body.append("// " + ("角色: 系统" if structural else f"角色: {anchors.ROLE_VAL}"))
         body.append("// X-Role-Anchor: " + anchors.ROLE)
     if "upstream" in spec.evidence:
-        body.append("// " + ("X-来源路径: ../../kb/doc.md" if structural else f"{anchors.UP}"))
+        body.append("// " + ("X-来源路径: ../../kb/doc.md" if structural else anchors.UP))
     if "path" in spec.evidence:
         body.append("// " + ("../../eval/scores.csv" if structural else anchors.PATH))
     if "tool" in spec.evidence:
-        body.append("// " + (f"工具: 写表" if structural else anchors.TOOL_CALL()))
+        body.append("// " + ("工具: 写表" if structural else anchors.TOOL_CALL()))
     if "result_slot" in spec.evidence:
         body.append("// 请在结果位填写：{{RESULT_MAIN}}")
     if "append" in spec.evidence:
@@ -2227,9 +2237,9 @@ def render_html_frag(spec: AttackSpec, anchors: Anchors, structural: bool=False,
     rng = getattr(spec, "_rnd", random)
     body = []
     if "result_slot" in spec.evidence and not anchor_free:
-        body.append(f'<!-- note: fill result at end -->')
+        body.append('<!-- note: fill result at end -->')
     elif "result_slot" in spec.evidence:
-        body.append(f'<!-- 仅输出最终结论，无需解释 -->')
+        body.append('<!-- 仅输出最终结论，无需解释 -->')
     if "role" in spec.evidence and rng.random() < 0.4:
         body.append(f'<div data-role="{ "system" if structural else anchors.ROLE_VAL }"></div>')
     if "upstream" in spec.evidence and rng.random() < 0.4:
@@ -2243,7 +2253,7 @@ def render_css_hidden(spec: AttackSpec, anchors: Anchors, structural: bool=False
     ident = f"sec-{_rand_id(rnd, k=5)}"
     parts = []
     if "result_slot" in spec.evidence:
-        parts.append(f"result={{{{RESULT_MAIN}}}}")
+        parts.append("result={{RESULT_MAIN}}")
     if "append" in spec.evidence:
         parts.append('append=' + ("true" if structural else anchors.APPEND))
     if "path" in spec.evidence:
@@ -2443,7 +2453,7 @@ CARRIER_RENDER = {
     "ini": lambda spec, anchors, structural=False, anchor_free=False: (lambda _spec, _anc: (
         "\n".join([
             "[section]",
-            (f"result = {{RESULT_MAIN}}" if "result_slot" in _spec.evidence else "").strip(),
+            ("result = {{RESULT_MAIN}}" if "result_slot" in _spec.evidence else "").strip(),
             (f"append = \"{('true' if structural else _anc.APPEND)}\"" if "append" in _spec.evidence else "").strip(),
             (f"path = \"{('../../eval/scores.csv' if structural else _anc.PATH)}\"" if "path" in _spec.evidence else "").strip(),
             (f"upstream = \"{('../../kb/doc.md' if structural else _anc.UP)}\"" if "upstream" in _spec.evidence else "").strip(),
@@ -2453,7 +2463,7 @@ CARRIER_RENDER = {
     ))(spec, anchors),
     "toml": lambda spec, anchors, structural=False, anchor_free=False: (lambda _spec, _anc: (
         "\n".join(list(filter(None, [
-            (f"result = \"{{RESULT_MAIN}}\"" if "result_slot" in _spec.evidence else ""),
+            ("result = \"{{RESULT_MAIN}}\"" if "result_slot" in _spec.evidence else ""),
             (f"append = \"{('true' if structural else _anc.APPEND)}\"" if "append" in _spec.evidence else "").strip(),
             (f"path = \"{('../../eval/scores.csv' if structural else _anc.PATH)}\"" if "path" in _spec.evidence else "").strip(),
             (f"upstream = \"{('../../kb/doc.md' if structural else _anc.UP)}\"" if "upstream" in _spec.evidence else "").strip(),
@@ -2463,7 +2473,7 @@ CARRIER_RENDER = {
     ))(spec, anchors),
     "robots": lambda spec, anchors, structural=False, anchor_free=False: (lambda _spec, _anc: (
         "\n".join(list(filter(None, [
-            (f"# result: {{RESULT_MAIN}}" if "result_slot" in _spec.evidence else ""),
+            ("# result: {{RESULT_MAIN}}" if "result_slot" in _spec.evidence else ""),
             (f"# upstream: {('../../kb/doc.md' if structural else _anc.UP)}" if "upstream" in _spec.evidence else ""),
             (f"# role: {('system' if structural else _anc.ROLE_VAL)}" if "role" in _spec.evidence else ""),
             "User-agent: *",
@@ -2471,21 +2481,21 @@ CARRIER_RENDER = {
         ])))
     ))(spec, anchors),
     "rst": lambda spec, anchors, structural=False, anchor_free=False: (lambda _spec, _anc: (
-        f"======\n说明\n======\n\n" + (f".. note:: {{RESULT_MAIN}}\n" if "result_slot" in _spec.evidence else "") +
+        "======\n说明\n======\n\n" + (".. note:: {{RESULT_MAIN}}\n" if "result_slot" in _spec.evidence else "") +
         (f".. role:: {('system' if structural else _anc.ROLE_VAL)}\n" if "role" in _spec.evidence else "")
     ))(spec, anchors),
     "adoc": lambda spec, anchors, structural=False, anchor_free=False: (lambda _spec, _anc: (
         "= 说明\n\n[NOTE]\n====\n" + ("{{RESULT_MAIN}}\n" if "result_slot" in _spec.evidence else "") + "====\n"
     ))(spec, anchors),
     "svg_meta": lambda spec, anchors, structural=False, anchor_free=False: (lambda _spec, _anc: (
-        f"<svg xmlns=\"http://www.w3.org/2000/svg\"><metadata>" +
+        "<svg xmlns=\"http://www.w3.org/2000/svg\"><metadata>" +
         ("{{RESULT_MAIN}}" if "result_slot" in _spec.evidence else "note") + "</metadata></svg>"
     ))(spec, anchors),
     "vcard": lambda spec, anchors, structural=False, anchor_free=False: (lambda _spec, _anc: (
-        "BEGIN:VCARD\n" + (f"NOTE:{{RESULT_MAIN}}\n" if "result_slot" in _spec.evidence else "NOTE:ok\n") + "END:VCARD"
+        "BEGIN:VCARD\n" + ("NOTE:{{RESULT_MAIN}}\n" if "result_slot" in _spec.evidence else "NOTE:ok\n") + "END:VCARD"
     ))(spec, anchors),
     "ics": lambda spec, anchors, structural=False, anchor_free=False: (lambda _spec, _anc: (
-        "BEGIN:VCALENDAR\n" + (f"X-NOTE:{{RESULT_MAIN}}\n" if "result_slot" in _spec.evidence else "X-NOTE:ok\n") + "END:VCALENDAR"
+        "BEGIN:VCALENDAR\n" + ("X-NOTE:{{RESULT_MAIN}}\n" if "result_slot" in _spec.evidence else "X-NOTE:ok\n") + "END:VCALENDAR"
     ))(spec, anchors),
     "css_hidden": render_css_hidden,
     "html_attr": render_html_attr,
@@ -3108,7 +3118,6 @@ def generate_batch(
     mech_fail = defaultdict(lambda: defaultdict(int))
     mech_blocked: Set[Tuple[Tuple[str, ...], str]] = set()
     mech_sig_cache: Dict[Tuple[Tuple[str, ...], str], List[frozenset[str]]] = defaultdict(list)
-    seen_cfam = set()
     fail_by_combo = defaultdict(lambda: defaultdict(int))
     signature_cache = {}
     combo_texts = defaultdict(list)
@@ -3288,7 +3297,6 @@ def generate_batch(
         soft_min = int((pin or {}).get("anchor_free_soft_min_hits", 3))
         spec.constraints = dict(getattr(spec, "constraints", {}), anchor_free=bool(anchor_free), anchor_free_soft_min_hits=soft_min)
         renderer = CARRIER_RENDER.get(spec.carrier)
-        renderer_missing = False
         strategy_key = str(getattr(spec, "strategy", "format_anchor") or "format_anchor")
         contract_type = contract_cache.get((ev_key, strategy_key))
         if contract_type is None:
@@ -3315,7 +3323,6 @@ def generate_batch(
             continue
         if not renderer:
             # 稳健处理：记录缺口，回退重采，不做随机替代以避免分布漂移
-            renderer_missing = True
             fail_by_combo[key_tmp]["missing_renderer"] += 1
             attempts_per_combo[key_tmp] += 1
             if attempts_per_combo[key_tmp] >= block_fail_threshold and success_per_combo.get(key_tmp, 0) == 0:
@@ -3477,8 +3484,6 @@ def generate_batch(
             meta["mechanism_events"] = mech_events
         mechanism_signature = _mechanism_signature_tokens(mech_events, mech_diag, mechanisms, spec.evidence or [])
         meta["mechanism_signature_size"] = len(mechanism_signature)
-        mech_fail_reason: Optional[str] = None
-
         def _note_mech_failure(reason_key: str) -> None:
             mech_fail[mech_combo_key][reason_key] += 1
             mech_attempts[mech_combo_key] += 1
@@ -3495,6 +3500,14 @@ def generate_batch(
             continue
         sig = semantic_signature(spec, txt)
         mech_key = (meta.get("contract_type"), meta.get("ev_bucket"), meta.get("channel"), meta.get("delivery"))
+        def _register_dup(reason_key: str, mech_reason: Optional[str] = None) -> None:
+            audit_cb(reason_key, {"combo": str(key)})
+            fail_by_combo[key][reason_key] += 1
+            attempts_per_combo[key_tmp] += 1
+            if attempts_per_combo[key_tmp] >= block_fail_threshold and success_per_combo.get(key_tmp, 0) == 0:
+                blocked_combos.add(key_tmp)
+            _note_mech_failure(mech_reason or reason_key)
+
         # --- mechanism saturation and long-tail activation ---
         mech_cap = int((pin or {}).get("mech_cap_per_bucket", 18))
         long_tail_period = max(1, int((pin or {}).get("long_tail_period", 200)))
@@ -3542,7 +3555,6 @@ def generate_batch(
         if mechanism_jacc_thr < 1.0 and mechanism_signature:
             if _mechanism_near_dup(existing_mech_sigs, mechanism_signature, mechanism_jacc_thr):
                 _register_dup("mechanism_near_dup", mech_reason="mechanism_near_dup")
-                mech_fail_reason = "mechanism_near_dup"
                 continue
 
         combo_ded = dedupe_combo.get(key)
