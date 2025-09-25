@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 make_malicious_prompts_cn_compose_v2.py
 Purpose // 用途:
@@ -22,7 +22,7 @@ Dependencies // 依赖:
 from __future__ import annotations
 import argparse, json, random, re, sys, math, hashlib, string, unicodedata
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple, Iterable, Set
+from typing import List, Dict, Any, Optional, Tuple, Iterable, Set, Callable
 from collections.abc import Mapping
 from array import array
 import itertools
@@ -30,14 +30,18 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue, Empty
 from threading import Thread
-from datasets import load_dataset, DatasetDict
 import base64, urllib.parse
 import codecs
 import regex as _re
 from dataclasses import dataclass, asdict, field
 
 import os
-import numpy as np, platform, datasets as hf_datasets
+import numpy as np, platform
+
+load_dataset = None  # type: ignore
+DatasetDict = None  # type: ignore
+hf_datasets = None  # type: ignore
+_HAS_HF_DATASETS = False
 from enum import Enum, auto
 try:
     import orjson as _json_fast
@@ -71,46 +75,93 @@ def _emit_capability_report() -> None:
         suffix = f" ({detail})" if detail else ''
         print(f"  - {name}: {status}{suffix}")
 
+@dataclass
+class CapabilityProbeResult:
+    value: Any
+    detail: Optional[str] = None
+
+
+def _probe_capability(name: str, loader: Callable[[], Any], *, success_detail: str = 'native') -> Optional[Any]:
+    try:
+        result = loader()
+    except Exception as exc:
+        _register_capability(name, False, _fmt_exc(exc))
+        return None
+    detail = success_detail
+    if isinstance(result, CapabilityProbeResult):
+        if result.detail:
+            detail = result.detail
+        result = result.value
+    _register_capability(name, True, detail)
+    return result
+
+def _load_hf_datasets() -> CapabilityProbeResult:
+    from datasets import load_dataset as _load_dataset  # type: ignore
+    from datasets import DatasetDict as _DatasetDict  # type: ignore
+    import datasets as _hf_datasets  # type: ignore
+    detail = getattr(_hf_datasets, "__version__", "native")
+    return CapabilityProbeResult((_load_dataset, _DatasetDict, _hf_datasets), detail)
+
+_datasets_probe = _probe_capability('datasets', _load_hf_datasets)
+if _datasets_probe is not None:
+    load_dataset, DatasetDict, hf_datasets = _datasets_probe
+    _HAS_HF_DATASETS = True
+else:
+    load_dataset = None  # type: ignore
+    DatasetDict = None  # type: ignore
+    hf_datasets = None  # type: ignore
+    _HAS_HF_DATASETS = False
+
+
 MICRO_GRAMMAR_AUGMENTS: Optional[Dict[str, List[str]]] = None
 MICRO_GRAMMAR_REFRESH_FUNCS: Dict[str, Any] = {}
-try:
-    from simhash import weighted_fingerprint as _simhash_weighted_fp, hamming_distance as _simhash_hamm_dist
-except Exception as exc:
-    _register_capability('simhash', False, _fmt_exc(exc))
-    _simhash_weighted_fp = None
-    _simhash_hamm_dist = None
-else:
-    _register_capability('simhash', True, 'native')
-try:
-    from datasketch import MinHash as _DSMinHash, MinHashLSH as _DSMinHashLSH
-except Exception as exc:
-    _register_capability('datasketch', False, _fmt_exc(exc))
-    _DSMinHash = None
-    _DSMinHashLSH = None
-else:
-    _register_capability('datasketch', True, 'native')
-try:
-    import faiss  # type: ignore
-except Exception as exc_gpu:
+_simhash_weighted_fp = None
+_simhash_hamm_dist = None
+
+def _load_simhash():
+    from simhash import weighted_fingerprint as weighted_fp, hamming_distance as hamm_dist
+    return weighted_fp, hamm_dist
+
+_simhash_probe = _probe_capability('simhash', _load_simhash)
+if _simhash_probe is not None:
+    _simhash_weighted_fp, _simhash_hamm_dist = _simhash_probe
+
+_DSMinHash = None
+_DSMinHashLSH = None
+
+def _load_datasketch():
+    from datasketch import MinHash as _DSMinHash_cls, MinHashLSH as _DSMinHashLSH_cls
+    return _DSMinHash_cls, _DSMinHashLSH_cls
+
+_datasketch_probe = _probe_capability('datasketch', _load_datasketch)
+if _datasketch_probe is not None:
+    _DSMinHash, _DSMinHashLSH = _datasketch_probe
+
+def _load_faiss():
     try:
-        import faiss_cpu as faiss  # type: ignore
-    except Exception as exc_cpu:
-        faiss = None
-        detail = f"gpu {_fmt_exc(exc_gpu)}; cpu {_fmt_exc(exc_cpu)}"
-        _register_capability('faiss', False, detail)
-    else:
+        import faiss  # type: ignore
+        return CapabilityProbeResult(faiss, 'native')
+    except Exception as exc_gpu:
+        try:
+            import faiss_cpu as faiss  # type: ignore
+        except Exception as exc_cpu:
+            raise RuntimeError(f"gpu {_fmt_exc(exc_gpu)}; cpu {_fmt_exc(exc_cpu)}")
         detail = f"faiss_cpu fallback (gpu failed: {_fmt_exc(exc_gpu)})"
-        _register_capability('faiss', True, detail)
-else:
-    _register_capability('faiss', True, 'native')
-try:
-    from annoy import AnnoyIndex as _AnnoyIndex
-except Exception as exc:
-    _register_capability('annoy', False, _fmt_exc(exc))
+        return CapabilityProbeResult(faiss, detail)
+
+faiss = _probe_capability('faiss', _load_faiss)
+if faiss is None:
+    faiss = None
+
+def _load_annoy():
+    from annoy import AnnoyIndex as _AnnoyIndex_cls
+    return _AnnoyIndex_cls
+
+_AnnoyIndex = _probe_capability('annoy', _load_annoy)
+if _AnnoyIndex is None:
     _AnnoyIndex = None
-else:
-    _register_capability('annoy', True, 'native')
-try:
+
+def _load_dsl_core_core():
     from dsl_core import (
         generate_batch,
         invariant_result_slot,
@@ -120,11 +171,21 @@ try:
         _tool_param_context_mismatch,
         AttackSpec,
     )
-except Exception as exc:
-    _register_capability('dsl_core.core', False, _fmt_exc(exc))
+    return {
+        'generate_batch': generate_batch,
+        'invariant_result_slot': invariant_result_slot,
+        'JSON_BLOCK_RE': JSON_BLOCK_RE,
+        '_dsl_cjk_share': _dsl_cjk_share,
+        '_dsl_parse_json_blocks': _dsl_parse_json_blocks,
+        '_tool_param_context_mismatch': _tool_param_context_mismatch,
+        'AttackSpec': AttackSpec,
+    }
+
+_dsl_core_bindings = _probe_capability('dsl_core.core', _load_dsl_core_core)
+if _dsl_core_bindings is None:
     generate_batch = None
     invariant_result_slot = None
-    JSON_BLOCK_RE = _re.compile(r"```(?:json|jsonc|json5|jsonl)\b(.*?)```", _re.S | _re.I)
+    JSON_BLOCK_RE = _re.compile(r"`(?:json|jsonc|json5|jsonl)\b(.*?)`", _re.S | _re.I)
 
     def soft_evidence_kinds(_text: str) -> set[str]:
         return set()
@@ -150,18 +211,21 @@ except Exception as exc:
             except Exception as exc:
                 audit_reject("json_parse_error", {"phase": "json_parse", "err": exc})
         return out
-    def _tool_param_context_mismatch(_text: str, _contract) -> bool: return False
 
+    def _tool_param_context_mismatch(_text: str, _contract) -> bool:
+        return False
 else:
-    _register_capability('dsl_core.core', True, 'native')
+    generate_batch = _dsl_core_bindings['generate_batch']
+    invariant_result_slot = _dsl_core_bindings['invariant_result_slot']
+    JSON_BLOCK_RE = _dsl_core_bindings['JSON_BLOCK_RE']
+    _dsl_cjk_share = _dsl_core_bindings['_dsl_cjk_share']
+    _dsl_parse_json_blocks = _dsl_core_bindings['_dsl_parse_json_blocks']
+    _tool_param_context_mismatch = _dsl_core_bindings['_tool_param_context_mismatch']
+    AttackSpec = _dsl_core_bindings['AttackSpec']
 
-    try:
-        import micro_grammar as _micro_grammar
-    except Exception as exc:
-        _register_capability('micro_grammar', False, _fmt_exc(exc))
-        MICRO_GRAMMAR_AUGMENTS = None
-    else:
-        _register_capability('micro_grammar', True, 'native')
+    _micro_grammar = _probe_capability('micro_grammar', lambda: __import__('micro_grammar'))
+    if _micro_grammar is not None:
+        _dsl_core_module = None
         try:
             import dsl_core as _dsl_core_module
         except Exception as import_exc:
@@ -199,8 +263,12 @@ else:
         if missing_refresh:
             detail = 'missing ' + ','.join(missing_refresh)
             _register_capability('micro_grammar.refresh', False, detail)
-        else:
-            MICRO_GRAMMAR_REFRESH_FUNCS = {**refresh_required, 'style_wrap': style_fn if callable(style_fn) else None, 'dsl_module': _dsl_core_module}
+        elif _dsl_core_module is not None:
+            MICRO_GRAMMAR_REFRESH_FUNCS = {
+                **refresh_required,
+                'style_wrap': style_fn if callable(style_fn) else None,
+                'dsl_module': _dsl_core_module,
+            }
             _register_capability('micro_grammar.refresh', True, 'ready')
 
     def cjk_share(s: str) -> float:
@@ -215,52 +283,60 @@ else:
             if isinstance(obj, dict):
                 out.append(obj)
         return out
-try:
+
+def _load_h64():
     from dsl_core import _h64  # reuse token hash cache if available
-except Exception as exc:
-    _register_capability('dsl_core._h64', False, _fmt_exc(exc))
+    return _h64
+
+_h64_fn = _probe_capability('dsl_core._h64', _load_h64, success_detail='shared')
+if _h64_fn is None:
     from functools import lru_cache as _lru_cache
 
     @_lru_cache(maxsize=1 << 20)
-
     def _h64(g: str) -> int:
         return int.from_bytes(hashlib.blake2b(g.encode('utf-8'), digest_size=8).digest(), 'big')
 else:
-    _register_capability('dsl_core._h64', True, 'shared')
-try:
+    _h64 = _h64_fn
+
+def _load_dedupe_core():
     from dedupe_core import Deduper, DEFAULT_DEDUPER_KWARGS, get_default_deduper_kwargs
-except Exception as _dedupe_err:
-    raise ImportError("dedupe_core module is required for Deduper") from _dedupe_err
-else:
-    _register_capability('dedupe_core', True, 'native')
+    return Deduper, DEFAULT_DEDUPER_KWARGS, get_default_deduper_kwargs
+
+_dedupe_probe = _probe_capability('dedupe_core', _load_dedupe_core)
+if _dedupe_probe is None:
+    raise ImportError('dedupe_core module is required for Deduper')
+Deduper, DEFAULT_DEDUPER_KWARGS, get_default_deduper_kwargs = _dedupe_probe
+
 from math import sqrt
-try:
+def _load_simhash_fast():
     from dsl_core import _simhash_weighted_fast as _dc_simhash_weighted_fast
-except Exception as exc:
-    _register_capability('dsl_core.simhash_fast', False, _fmt_exc(exc))
+    return _dc_simhash_weighted_fast
+
+_dc_simhash_weighted_fast = _probe_capability('dsl_core.simhash_fast', _load_simhash_fast)
+if _dc_simhash_weighted_fast is None:
     _dc_simhash_weighted_fast = None
-else:
-    _register_capability('dsl_core.simhash_fast', True, 'native')
-try:
+
+def _load_shingle_fast():
     from dsl_core import _sketch_5gram_fast as _dc_sketch_5gram_fast
-except Exception as exc:
-    _register_capability('dsl_core.shingle_fast', False, _fmt_exc(exc))
+    return _dc_sketch_5gram_fast
+
+_dc_sketch_5gram_fast = _probe_capability('dsl_core.shingle_fast', _load_shingle_fast)
+if _dc_sketch_5gram_fast is None:
     _dc_sketch_5gram_fast = None
-else:
-    _register_capability('dsl_core.shingle_fast', True, 'native')
-# 这些不变量探针仅用于诊断/审计；在缺失 dsl_core 时不应导致导入失败
-try:
+def _load_reward_filters():
     from dsl_core import invariant_reward_channel, invariant_reward_field, invariant_path
-except Exception as exc:  # 奖励不变量不可用 / reward invariants unavailable
-    _register_capability('dsl_core.reward_filters', False, _fmt_exc(exc))
+    return invariant_reward_channel, invariant_reward_field, invariant_path
 
-    def invariant_reward_channel(_txt:str) -> bool: return False
+_reward_probe = _probe_capability('dsl_core.reward_filters', _load_reward_filters)
+if _reward_probe is None:
+    def invariant_reward_channel(_txt: str) -> bool: return False
 
-    def invariant_reward_field(_txt:str) -> bool: return False
+    def invariant_reward_field(_txt: str) -> bool: return False
 
-    def invariant_path(_txt:str) -> bool: return False
+    def invariant_path(_txt: str) -> bool: return False
 else:
-    _register_capability('dsl_core.reward_filters', True, 'native')
+    invariant_reward_channel, invariant_reward_field, invariant_path = _reward_probe
+
 try:
     from dsl_core import (
         sandbox_tool_param,
@@ -2714,6 +2790,8 @@ def _sample_rows(rows, limit: int, seed: int) -> List[Any]:
 # ------------------ External corpora adapters // 外部评测数据适配器 ------------------
 
 def _yield_wildchat(lang: str = "zh", n: int = 2000, seed: int = 0):
+    if not _HAS_HF_DATASETS or load_dataset is None:
+        return
     try:
         ds = load_dataset("allenai/WildChat-4.8M", split="train")
     except Exception:
@@ -2736,6 +2814,8 @@ def _yield_wildchat(lang: str = "zh", n: int = 2000, seed: int = 0):
             break
 
 def _yield_wildjailbreak(n: int = 2000, seed: int = 0):
+    if not _HAS_HF_DATASETS or load_dataset is None:
+        return
     try:
         ds = load_dataset("allenai/wildjailbreak", split="train")
     except Exception:
@@ -2752,6 +2832,8 @@ def _yield_wildjailbreak(n: int = 2000, seed: int = 0):
             break
 
 def _yield_jbb_behaviors(n: int = 1000, seed: int = 0):
+    if not _HAS_HF_DATASETS or load_dataset is None:
+        return
     try:
         ds = load_dataset("JailbreakBench/JBB-Behaviors", split="train")
     except Exception:
@@ -2767,6 +2849,8 @@ def _yield_jbb_behaviors(n: int = 1000, seed: int = 0):
             break
 
 def _yield_beavertails(n: int = 2000, seed: int = 0):
+    if not _HAS_HF_DATASETS or load_dataset is None:
+        return
     try:
         ds = load_dataset("PKU-Alignment/PKU-SafeRLHF-30K", split="train")
     except Exception:
@@ -2784,38 +2868,57 @@ def _yield_beavertails(n: int = 2000, seed: int = 0):
 
 def _yield_pint(n: int = 1000, seed: int = 0):
     """Try to load PINT benchmark if available; fallback to local JSON via env PINT_PATH.
-    优先从 HuggingFace/本地路径加载；不可用时静默跳过。"""
+    ���ȴ� HuggingFace/����·�����أ�������ʱ��Ĭ������"""
     import os
     cnt = 0
     ds = None
-    try:
-        # Try hypothetical HF datasets (may not exist)
-        for name in ["lakeraai/pint-benchmark", "lakeraai/PINT", "lakera/PINT"]:
-            try:
-                ds = load_dataset(name, split="train")
-                break
-            except Exception:
-                continue
-    except Exception:
-        ds = None
-    # Fallback: local JSON/JSONL path with {text,label}
-    if ds is None:
+    if _HAS_HF_DATASETS and load_dataset is not None:
         try:
-            p = os.environ.get("PINT_PATH")
-            if p and os.path.exists(p):
-                ext = os.path.splitext(p)[1].lower()
-                if ext in (".jsonl", ".json"):
-                    ds = load_dataset("json", data_files=p, split="train")
+            # Try hypothetical HF datasets (may not exist)
+            for name in ["lakeraai/pint-benchmark", "lakeraai/PINT", "lakera/PINT"]:
+                try:
+                    ds = load_dataset(name, split="train")
+                    break
+                except Exception:
+                    continue
         except Exception:
             ds = None
     if ds is None:
+        p = os.environ.get("PINT_PATH")
+        if p and os.path.exists(p):
+            ext = os.path.splitext(p)[1].lower()
+            try:
+                if load_dataset is not None and ext in (".jsonl", ".json"):
+                    ds = load_dataset("json", data_files=p, split="train")
+            except Exception:
+                ds = None
+            if ds is None and ext in (".jsonl", ".json"):
+                try:
+                    if ext == ".jsonl":
+                        with open(p, 'r', encoding='utf-8') as fh:
+                            ds = [json.loads(line) for line in fh if line.strip()]
+                    else:
+                        with open(p, 'r', encoding='utf-8') as fh:
+                            payload = json.load(fh)
+                        if isinstance(payload, list):
+                            ds = payload
+                        elif isinstance(payload, dict):
+                            ds = payload.get('data') or payload.get('items')
+                except Exception:
+                    ds = None
+    if ds is None:
         return
-    for r in ds.shuffle(seed=seed):
-        txt = r.get("prompt") or r.get("text") or r.get("input") or ""
+    iterable = ds.shuffle(seed=seed) if hasattr(ds, 'shuffle') else ds
+    for r in iterable:
+        txt = r.get("prompt") or r.get("text") or r.get("input") or "" if isinstance(r, dict) else ""
+        lab = r.get("label") if isinstance(r, dict) else None
         if not isinstance(txt, str) or not txt.strip():
             continue
-        lab = int(r.get("label", 1))  # default to 1 (injection) if unknown
-        yield {"text": normalize(txt), "label": lab, "source": "pint"}
+        harmful = False
+        if isinstance(lab, (int, float, str)):
+            val = str(lab).lower()
+            harmful = val in {"1", "true", "harmful", "unsafe"}
+        yield {"text": normalize(txt), "label": 1 if harmful else 0, "source": "pint"}
         cnt += 1
         if cnt >= n:
             break

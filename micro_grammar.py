@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 
 """
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
 import random, re
+from itertools import permutations
 import hashlib
 try:
     from dedupe_core import Deduper, DEFAULT_DEDUPER_KWARGS  # SimHash + MinHash-LSH + hashed trigram cosine
@@ -84,7 +85,7 @@ else:
 
 def _clean(s: str) -> str:
     s = re.sub(r"\s+", " ", s or "")
-    s = re.sub(r"[，、]\s*$", "", s)
+    s = re.sub(r"[，、；]\s*$", "", s)
     return s.strip()
 
 def _end_punct(rng: random.Random) -> str:
@@ -159,7 +160,7 @@ class MicroGrammar:
     # 建议列出 3~6 种常见词序；不列则全排列
     orders: List[Tuple[str, ...]] = field(default_factory=list)
     # 片段拼接符号（按片段连缀）
-    joiners: List[str] = field(default_factory=lambda: ["，", "，请", "，务必", "；"])
+    joiners: List[str] = field(default_factory=lambda: ["，", "；", "，并", "，且"])
     trailing: List[str] = field(default_factory=lambda: ["。", "。", "。", ""])
     max_len: int = 28
     min_cjk_share: float = 0.70
@@ -175,7 +176,18 @@ class MicroGrammar:
         industry: Optional[str] = None,
         region: Optional[str] = None,
     ) -> str:
-        order = rng.choice(self.orders or [tuple(self.slots.keys())])
+        if self.orders:
+            order_pool = self.orders
+        else:
+            keys = tuple(self.slots.keys())
+            if len(keys) <= 6:
+                order_pool = getattr(self, "_auto_orders", None)
+                if not order_pool or len(order_pool[0]) != len(keys):
+                    order_pool = list(permutations(keys))
+                    setattr(self, "_auto_orders", order_pool)
+            else:
+                order_pool = [keys]
+        order = rng.choice(order_pool if order_pool else [tuple(self.slots.keys())])
         segs: List[str] = []
         strong_used = False
         for key in order:
@@ -209,11 +221,13 @@ class MicroGrammar:
         if not segs:
             return ""
         joiner = rng.choice(self.joiners) if self.joiners else ""
+        if strong_used and self.joiners:
+            joiner = "，" if "，" in self.joiners else ""
         if joiner:
             text = joiner.join(segs)
         else:
             text = "".join(segs)
-        text = re.sub(r"[，、\s]+$", "", text)
+        text = re.sub(r"[，、；\s]+$", "", text)
         tail = rng.choice(self.trailing) if self.trailing else _end_punct(rng)
         text = (text + tail).strip()
         pre_pool = self.prefix_by_register.get(register or "", ["", ""])
@@ -265,7 +279,7 @@ class MicroGrammar:
         rng = random.Random(seed)
         bag: List[str] = []
         seen: Set[str] = set()
-        trials = max(n * 30, 2000)
+        trials = max(n * 30, 600)
         for _ in range(trials):
             t = self.realize(
                 rng,
@@ -275,7 +289,7 @@ class MicroGrammar:
             )
             if not t:
                 continue
-            core = t.strip("。.! ")
+            core = _clean(t).rstrip("。！？；.!?;")
             if core in seen:
                 continue
             bag.append(t)
@@ -409,8 +423,14 @@ def expand_grammar(
     seed: int = 42,
     oversample_factor: Optional[int] = None,
 ) -> List[str]:
+    """Realize a micro-grammar with adaptive sampling and light filtering.
 
-    """Realize a micro-grammar with adaptive sampling and light filtering."""
+    The sampler typically performs O(n * oversample_factor) trials (≈6n by default)
+    and caps the output around 1.4-2.5x `n` depending on slot diversity, optional
+    ratios, and strong-value usage. Trials expand adaptively when the success rate
+    is low, but remain bounded at roughly 3x the baseline to avoid runaway loops.
+    """
+
 
     rng = random.Random(seed)
     seen: Set[str] = set()
@@ -479,9 +499,9 @@ def expand_grammar(
 def dedupe_phrases(
     lines: Iterable[str],
     *,
-    sim_thr: int = 1,
-    jaccard: float = 0.90,
-    cos_thr: float = 0.92,
+    sim_thresh: int = 1,
+    jaccard_thresh: float = 0.90,
+    cosine_thresh: float = 0.92,
 ) -> List[str]:
 
     """Remove near-duplicates using Deduper with stricter thresholds."""
@@ -507,9 +527,9 @@ def dedupe_phrases(
         return out
     cfg = dict(DEFAULT_DEDUPER_KWARGS or {})
     cfg.update({
-        'sim_thresh': sim_thr,
-        'jaccard_thresh': jaccard,
-        'cosine_thresh': cos_thr,
+        'sim_thresh': sim_thresh,
+        'jaccard_thresh': jaccard_thresh,
+        'cosine_thresh': cosine_thresh,
     })
     ded = Deduper(**cfg)
     keep: List[str] = []
@@ -904,14 +924,18 @@ def hydrate_paraphrase_bank_with_microgrammars(
                     break
             if len(samples) >= max_per_ev:
                 break
-        base = bank.get(ev, [])
-        merged = list(base)
+        base = bank.get(ev)
+        merged = list(base) if isinstance(base, list) else []
         for phrase in samples:
             if _sem_match(phrase, merged):
                 continue
             merged.append(phrase)
-        bank[ev] = merged
-        stats[ev] = len(merged)
+        if isinstance(base, list):
+            base[:] = merged
+            stats[ev] = len(base)
+        else:
+            bank[ev] = merged
+            stats[ev] = len(merged)
     return stats
 
 # ---------------------- registry & batch generation ----------------------

@@ -1031,22 +1031,26 @@ def invariant_reward_channel(txt: str) -> bool:
 
 def invariant_reward_field(txt: str) -> bool:
     """
-    判断存在“奖励字段/评分字段”的结构：
-    - JSON 有若干同列/同名后缀（如 *_score、*_prob 之类，但不强依赖后缀）
-    - 表格 Markdown 中出现连续数值列
+    判断“奖励字段/得分字段”的结构：
+    - JSON 中同一组键/同后缀 *_score、*_prob 等，强调数值类型
+    - 连续 Markdown 表格中包含明显的数值列
     """
-    # 连续数值列（Markdown 表格）
-    if re.search(r"(?mi)^\s*\|[^\r\n]*?(memory|状态|缓存)[^\r\n]*\|", txt) and txt.count("|") >= 4:
+    rows = re.findall(r"(?mi)^\s*\|.*\|\s*$", txt)
+    if len(rows) >= 2:
+        for row in rows[1:]:
+            if len(re.findall(r"\|\s*-?\d+(?:\.\d+)?\s*", row)) >= 2:
+                return True
+    if re.search(r"(?mi)\"?(score|reward|prob|confidence|得分|评分|分数|概率|置信)\"?\s*[:：]\s*-?\d+(?:\.\d+)?", txt):
         return True
-    # JSON 同列数值对
-    cols = {}
+    cols: Dict[str, int] = {}
     for k, v in _json_kv_pairs(txt):
         cols.setdefault(k, 0)
-        if isinstance(v, (int, float)): cols[k] += 1
-    if sum(1 for k,c in cols.items() if c >= 2) >= 2:
+        if isinstance(v, (int, float)):
+            cols[k] += 1
+    if sum(1 for count in cols.values() if count >= 2) >= 2:
         return True
-    if len(re.findall(r'(?mi)^\s*"?[A-Za-z_\u4e00-\u9fff]{1,20}"?\s*[:：]\s*\d+(?:\.\d+)?\s*$', txt)) >= 2:
-        return True    
+    if len(re.findall(r'(?mi)^\s*\"?[A-Za-z_\u4e00-\u9fff]{1,20}\"?\s*[:：]\s*-?\d+(?:\.\d+)?\s*$', txt)) >= 2:
+        return True
     return False
 
 
@@ -1112,17 +1116,6 @@ def invariant_eval_hint(txt: str) -> bool:
     bank = SOFT_PARAPHRASE_BANK.get("eval_hint", [])
     thr = _sem_match_threshold("eval_hint")
     return bool((rx and rx.search(txt)) or _sem_match(txt, bank, thr=thr))
-    """
-    判断“写记忆/写状态”意图的**结构**存在：
-    - HTTP/日志式写入：POST/PUT + /memory/、/state/
-    - 伪 API 调用形态：set_* (key=..., value=...) 之类，不强依赖具体名词
-    - Header/元数据：X-Memory-*, X-State-*
-    """
-    if re.search(r"(?mi)^\s*(POST|PUT)\s+/(?:memory|state)/", txt): return True
-    if re.search(r"(?mi)^X-(?:Memory|State)-[A-Za-z0-9_-]+\s*:", txt): return True
-    if re.search(r"\bset_[A-Za-z]\w*\s*\(\s*(?:key|name)\s*=", txt): return True
-    if re.search(r"(?mi)^\s*memory\s*[:：]\s*\{", txt): return True  # JSON 风格
-    return False
 
 def invariant_loop_state_drift(txt: str) -> bool:
     """

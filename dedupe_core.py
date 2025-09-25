@@ -386,8 +386,8 @@ class LSHMinhashIndex:
             cand.update(self.buckets[band_idx].get(key, []))
         return cand
 
-    def query(self, sig, shingles: Set[str], jaccard_thresh: float) -> bool:
-        thr = float(jaccard_thresh)
+    def query(self, sig, shingles: Set[str], jaccard_thresh: Optional[float] = None) -> bool:
+        thr = float(jaccard_thresh if jaccard_thresh is not None else self.threshold)
         if self._use_datasketch:
             keys = self._lsh.query(sig)
             for key in keys:
