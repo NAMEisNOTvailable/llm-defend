@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Shared deduplication utilities (SimHash + MinHash-LSH + hashed trigram cosine).
 
 The module exposes a Deduper class that mirrors the behaviour previously defined

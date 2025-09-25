@@ -88,7 +88,29 @@ def _clean(s: str) -> str:
     return s.strip()
 
 def _end_punct(rng: random.Random) -> str:
-    return rng.choice(["。", "。", "。", "", ""])
+    return rng.choice(["。", "！", "？", "", ""])
+
+def _stable_h32(text: str) -> int:
+    digest = hashlib.blake2b(text.encode('utf-8'), digest_size=4).digest()
+    return int.from_bytes(digest, 'big')
+
+def _slot_unique_options(slot: "Slot") -> int:
+    pool: Set[str] = set()
+    def _collect(seq: Iterable[str]) -> None:
+        for item in seq:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    pool.add(text)
+    _collect(getattr(slot, "options", []))
+    for mapping in (
+        getattr(slot, "overlay_by_register", {}),
+        getattr(slot, "overlay_by_industry", {}),
+        getattr(slot, "overlay_by_region", {}),
+    ):
+        for seq in mapping.values():
+            _collect(seq)
+    return max(len(pool), 1)
 
 # ---------------------- core data model ----------------------
 
@@ -380,16 +402,58 @@ def style_wrap(
                 out.append(candidate)
     return out
 
-def expand_grammar(mg: MicroGrammar, *, n: int, seed: int = 42, oversample_factor: int = 6) -> List[str]:
+def expand_grammar(
+    mg: MicroGrammar,
+    *,
+    n: int,
+    seed: int = 42,
+    oversample_factor: Optional[int] = None,
+) -> List[str]:
 
-    """Realize a micro-grammar with light filtering and dedupe-friendly limits."""
+    """Realize a micro-grammar with adaptive sampling and light filtering."""
 
     rng = random.Random(seed)
     seen: Set[str] = set()
     out: List[str] = []
-    trials = max(n * oversample_factor, 200)
-    cap = max(n * 3, n)
-    for _ in range(trials):
+    slots = list(mg.slots.values())
+    slot_count = len(slots) or 1
+    if slots:
+        option_counts = [_slot_unique_options(slot) for slot in slots]
+        avg_unique = sum(option_counts) / len(option_counts)
+        optional_ratio = sum(1 for slot in slots if slot.optional) / slot_count
+        strong_ratio = sum(1 for slot in slots if slot.strong_values) / slot_count
+    else:
+        avg_unique = 1.0
+        optional_ratio = 0.0
+        strong_ratio = 0.0
+    base_over = float(oversample_factor) if oversample_factor is not None else 6.0
+    base_over = max(base_over, 1.0)
+    scarcity_factor = 1.0
+    if avg_unique < 4.0:
+        scarcity_factor = min(2.5, 4.0 / max(avg_unique, 1.0))
+    elif avg_unique > 10.0:
+        scarcity_factor = max(0.6, 10.0 / avg_unique)
+    optional_factor = 1.0 + optional_ratio * 0.6
+    strong_factor = 1.0 + strong_ratio * 0.4
+    effective_oversample = int(round(base_over * scarcity_factor * optional_factor * strong_factor))
+    effective_oversample = max(3, min(effective_oversample, 18))
+    cap_multiplier = 1.4 + optional_ratio * 0.8
+    if avg_unique < 4.0:
+        cap_multiplier += 0.3
+    cap = max(int(n * cap_multiplier), n)
+    cap = min(cap, max(n * 5, n))
+    trials = max(int(n * effective_oversample), max(150, int(n * 1.2)))
+    max_trials = max(trials + max(n, 200), int(trials * 3))
+    adjust_window = max(40, slot_count * 10)
+    attempts = 0
+    successes = 0
+    while len(out) < cap:
+        if attempts >= trials:
+            if len(out) >= n or trials >= max_trials:
+                break
+            increment = max(int(trials * 0.4), adjust_window)
+            trials = min(trials + increment, max_trials)
+        attempts += 1
         s = mg.realize(rng)
         if not s:
             continue
@@ -401,10 +465,17 @@ def expand_grammar(mg: MicroGrammar, *, n: int, seed: int = 42, oversample_facto
             continue
         seen.add(s)
         out.append(s)
+        successes += 1
         if len(out) >= cap:
             break
+        if attempts % adjust_window == 0:
+            success_rate = successes / attempts if attempts else 0.0
+            if len(out) < n and success_rate < 0.22 and trials < max_trials:
+                increment = max(int(trials * 0.5), adjust_window)
+                trials = min(trials + increment, max_trials)
+            elif len(out) >= n and success_rate > 0.75:
+                break
     return out
-
 def dedupe_phrases(
     lines: Iterable[str],
     *,
@@ -453,7 +524,7 @@ DIRECTIVE_TONES = [
     "请知悉",
     "请注意统一",
     "统一遵循",
-    "点抬配合",
+    "请配合",
     "请按SOP执行",
     "请依约落实",
     "请按工单流程处理",
@@ -476,8 +547,8 @@ def grammar_result_slot() -> MicroGrammar:
             "mod",
             ["请", "烦请", "劳请", "务请", "仅", "只", "请务必", "务必仅"],
             overlay_by_register={
-                "regulatory": ["严格仅", "仅需"],
-                "sop": ["请仅", "仅需"],
+                "regulatory": ["严格仅", "仅需", "务必只", "一律只"],
+                "sop": ["请仅", "仅需", "请只"],
                 "ops_runbook": ["统一只"],
                 "academic": ["仅保留", "只需给出"],
             },
@@ -786,12 +857,6 @@ def hydrate_paraphrase_bank_with_microgrammars(
     通过 Deduper 去重后，追加进 SOFT_PARAPHRASE_BANK[ev] 作为动态原型。"""
     rng = random.Random(seed)
     keys = list(ev_keys) if ev_keys else list(GRAMMAR_BY_EVIDENCE)
-    dd = None
-    if Deduper is not None:
-        try:
-            dd = Deduper(sim_thresh=2, jaccard_thresh=0.90, cosine_thresh=0.95)
-        except TypeError:
-            dd = Deduper()
     stats: Dict[str, int] = {}
     register_axis = REGISTERS or [None]
     industry_axis = INDUSTRIES or [None]
@@ -804,6 +869,12 @@ def hydrate_paraphrase_bank_with_microgrammars(
         if factory is None:
             continue
         grammar = factory()
+        dd = None
+        if Deduper is not None:
+            try:
+                dd = Deduper(sim_thresh=2, jaccard_thresh=0.90, cosine_thresh=0.95)
+            except TypeError:
+                dd = Deduper()
         samples: List[str] = []
         for register in register_axis:
             for industry in industry_axis:
@@ -873,7 +944,7 @@ def generate_micro_prototypes(keys: Optional[Iterable[str]] = None,
     out: Dict[str, List[str]] = {}
     for k in keys:
         mg = REGISTRY[k]()
-        sub_seed = (seed ^ hash(k)) & 0x7FFFFFFF
+        sub_seed = (seed ^ _stable_h32(k)) & 0x7FFFFFFF
         base = expand_grammar(mg, n=per_kind, seed=sub_seed)
         candidates: List[str] = []
         if include_neutral:
@@ -954,13 +1025,15 @@ def rebuild_soft_check(dsl_core_module=None) -> None:
     sem_match = getattr(dc, '_sem_match', None)
     if not callable(sem_match):
         raise RuntimeError('dsl_core._sem_match is required to rebuild soft checks')
+    thr_fn = getattr(dc, '_sem_match_threshold', lambda k: 0.60)
 
     def _soft_ev(key: str):
         rx = rx_map.get(key)
         bucket = bank.get(key, [])
+        thr = thr_fn(key)
         if rx:
-            return lambda t: bool(rx.search(t)) or sem_match(t, bucket)
-        return lambda t: sem_match(t, bucket)
+            return lambda t, _rx=rx, _bucket=bucket, _thr=thr: bool(_rx.search(t)) or sem_match(t, _bucket, thr=_thr)
+        return lambda t, _bucket=bucket, _thr=thr: sem_match(t, _bucket, thr=_thr)
     dc.SOFT_EVIDENCE_CHECK = {k: _soft_ev(k) for k in soft_keys}
 
 def attach_to_dsl_core(
