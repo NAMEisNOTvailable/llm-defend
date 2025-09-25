@@ -262,19 +262,20 @@ def _minhash_numpy(hashes: np.ndarray, seeds: np.ndarray) -> np.ndarray:
         if out.size:
             out.fill(0)
         return out
-    for i in range(seeds.shape[0]):
-        seed = seeds[i]
-        best = np.uint64(0xFFFFFFFFFFFFFFFF)
-        for hv in hashes:
-            mix = hv ^ seed
-            mix ^= mix >> np.uint64(33)
-            mix *= np.uint64(0xff51afd7ed558ccd)
-            mix ^= mix >> np.uint64(33)
-            mix *= np.uint64(0xc4ceb9fe1a85ec53)
-            mix ^= mix >> np.uint64(33)
-            if mix < best:
-                best = mix
-        out[i] = np.uint32(best & _UINT32_MASK)
+    with np.errstate(over='ignore'):
+        for i in range(seeds.shape[0]):
+            seed = seeds[i]
+            best = np.uint64(0xFFFFFFFFFFFFFFFF)
+            for hv in hashes:
+                mix = hv ^ seed
+                mix ^= mix >> np.uint64(33)
+                mix *= np.uint64(0xff51afd7ed558ccd)
+                mix ^= mix >> np.uint64(33)
+                mix *= np.uint64(0xc4ceb9fe1a85ec53)
+                mix ^= mix >> np.uint64(33)
+                if mix < best:
+                    best = mix
+            out[i] = np.uint32(best & _UINT32_MASK)
     return out
 
 def _char_shingles(text: str, k: int) -> Set[str]:
