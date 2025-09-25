@@ -582,6 +582,11 @@ class Deduper:
                 need_build = True
             if need_build:
                 try:
+                    if self._annoy_built:
+                        try:
+                            self._annoy.unbuild()
+                        except Exception:
+                            pass
                     self._annoy.build(self._annoy_n_trees)
                     self._annoy_built = True
                     self._annoy_pending = 0

@@ -3231,8 +3231,9 @@ def generate_batch(
     combo_cache: Dict[Tuple, Tuple] = {}
     ev_family_cache: Dict[Tuple[str, ...], str] = {}
     contract_cache: Dict[Tuple[Tuple[str, ...], str], str] = {}
-    def combo_key(meta: dict) -> Tuple:
-        key = tuple(meta[a] for a in coverage_axes)
+    def combo_key(meta: dict, axes: Optional[Tuple[str, ...]] = None) -> Tuple:
+        axis = axes or coverage_axes
+        key = tuple(meta.get(a, "_") for a in axis)
         cached = combo_cache.get(key)
         if cached is None:
             combo_cache[key] = key
@@ -3306,8 +3307,9 @@ def generate_batch(
             "appearance": ("openpi" if str(spec.strategy).startswith('openpi_') else 'normal'),
             "contract_type": contract_type,
         }
-        key_tmp = combo_key(meta_tmp)
-        # —— 网格可达性短路 —— 
+        key_tmp_axes = tuple(a for a in coverage_axes if a in meta_tmp)
+        key_tmp = combo_key(meta_tmp, key_tmp_axes)
+        #—— 网格可达性短路 —— 
         if key_tmp in blocked_combos:
             fail_by_combo[key_tmp]["blocked"] += 1
             attempts_per_combo[key_tmp] += 1
@@ -3598,6 +3600,7 @@ def generate_batch(
         final_txt = preview_txt
         seen_signatures.add(sig)
         success_per_combo[key] += 1
+        success_per_combo[key_tmp] += 1
         mech_success[mech_combo_key] += 1
         by_mech_combo[mech_combo_key] += 1
         by_mech[mech_key] += 1

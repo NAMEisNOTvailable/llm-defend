@@ -10,6 +10,9 @@ This repository assembles Chinese prompt-injection datasets with hard negatives,
 | `micro_grammar.py` | Micro-grammar bank for soft-evidence phrases, with adaptive sampling, permutation-based slot ordering, style wrapping, and helpers to refill & rebuild DSL banks safely. |
 
 ## Installation
+Ensure you are using **Python 3.9 or newer** before creating the virtual environment.
+
+
 1. Use Python 3.9 or newer and create a virtualenv.
 2. Install core dependencies:
    ```bash
