@@ -48,7 +48,7 @@ except Exception:
 def _json_loads(data):
     if _json_fast is not None:
         return _json_fast.loads(data)
-    return _json_loads(data)
+    return json.loads(data)
 
 from multiprocessing import Pool, cpu_count
 import multiprocessing as _mp
@@ -5989,6 +5989,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     artifact_free_pos_ratio: float | None = None,
                     gate_semantic_injection: bool = True,
                     coverage_min_per_combo: int = 0,
+                    soft_hint_rate: float | None = None,
                     cfg: Optional[Config] = None) -> List[Dict[str,Any]]:
     random.seed(seed)
     # unify effective knobs with CLI defaults
@@ -6439,6 +6440,7 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     artifact_free_pos_ratio: float | None = None,
                     gate_semantic_injection: bool = True,
                     coverage_min_per_combo: int = 0,
+                    soft_hint_rate: float | None = None,
                     workers: int = 0,
                     producer_batch: int = 128,
                     cfg: Optional[Config] = None,
@@ -6462,6 +6464,7 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
             artifact_free_pos_ratio=artifact_free_pos_ratio,
             gate_semantic_injection=gate_semantic_injection,
             coverage_min_per_combo=coverage_min_per_combo,
+            soft_hint_rate=soft_hint_rate,
             cfg=cfg,
         )
     if quota_bundle is None:
