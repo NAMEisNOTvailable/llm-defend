@@ -3254,18 +3254,40 @@ def generate_batch(
             if "ev_bucket" in want_axes:
                 idx = want_axes.index("ev_bucket")
                 pin_dyn["ev_bucket"] = pick[idx]
+                # Anchor-free status can be forced per combo
+                if "anchor_free" in want_axes:
+                    idx = want_axes.index("anchor_free")
+                    pin_dyn["anchor_free_forced"] = int(pick[idx])
         
 
-        spec = sample_spec(seed=rnd.randint(0, 1<<30), pin={**(pin or {}), **pin_dyn})
-        ev_bucket = bucket_hash(spec.evidence)
-        if "ev_bucket" in pin_dyn and pin_dyn["ev_bucket"] != ev_bucket:
+        pin_payload = {**(pin or {}), **pin_dyn}
+        target_family = None
+        if pick and "ev_family" in want_axes:
+            try:
+                target_family = pick[want_axes.index("ev_family")]
+            except Exception:
+                target_family = None
+        max_family_attempts = 6 if target_family else 1
+        spec = None
+        ev_bucket = None
+        ev_key = ()
+        fam_sig = None
+        for _ in range(max_family_attempts):
+            spec = sample_spec(seed=rnd.randint(0, 1<<30), pin=pin_payload)
+            ev_bucket = bucket_hash(spec.evidence)
+            if "ev_bucket" in pin_dyn and pin_dyn["ev_bucket"] != ev_bucket:
+                continue
+            ev_key = tuple(sorted(spec.evidence or []))
+            fam_sig = ev_family_cache.get(ev_key)
+            if fam_sig is None:
+                fam_sig = "|".join(sorted(evidence_families(spec.evidence)))
+                ev_family_cache[ev_key] = fam_sig
+            if target_family and fam_sig != target_family:
+                continue
+            break
+        else:
             continue
-        ev_key = tuple(sorted(spec.evidence or []))
-        fam_sig = ev_family_cache.get(ev_key)
-        if fam_sig is None:
-            fam_sig = "|".join(sorted(evidence_families(spec.evidence)))
-            ev_family_cache[ev_key] = fam_sig
-        if "ev_family" in pin_dyn and pin_dyn["ev_family"] != fam_sig:
+        if "ev_family" in pin_dyn and fam_sig is not None and pin_dyn["ev_family"] != fam_sig:
             continue
         alias_p_cn = float((pin or {}).get("alias_p_cn", 0.70))
         spec._alias_p_cn = alias_p_cn

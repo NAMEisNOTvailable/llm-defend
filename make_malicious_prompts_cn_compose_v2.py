@@ -170,6 +170,11 @@ def _load_dsl_core_core():
         _parse_json_blocks as _dsl_parse_json_blocks,
         _tool_param_context_mismatch,
         AttackSpec,
+        SPEECH_FAMILY,
+        REGIONS,
+        REGISTERS,
+        INDUSTRIES,
+        PERSONAS,
     )
     return {
         'generate_batch': generate_batch,
@@ -179,6 +184,11 @@ def _load_dsl_core_core():
         '_dsl_parse_json_blocks': _dsl_parse_json_blocks,
         '_tool_param_context_mismatch': _tool_param_context_mismatch,
         'AttackSpec': AttackSpec,
+        'SPEECH_FAMILY': SPEECH_FAMILY,
+        'REGIONS': REGIONS,
+        'REGISTERS': REGISTERS,
+        'INDUSTRIES': INDUSTRIES,
+        'PERSONAS': PERSONAS,
     }
 
 _dsl_core_bindings = _probe_capability('dsl_core.core', _load_dsl_core_core)
@@ -186,6 +196,11 @@ if _dsl_core_bindings is None:
     generate_batch = None
     invariant_result_slot = None
     JSON_BLOCK_RE = _re.compile(r"```(?:json|jsonc|json5|jsonl)\b(.*?)```", _re.S | _re.I)
+    SPEECH_FAMILY_CHOICES: Tuple[str, ...] = tuple()
+    REGION_CHOICES: Tuple[str, ...] = tuple()
+    REGISTER_CHOICES: Tuple[str, ...] = tuple()
+    INDUSTRY_CHOICES: Tuple[str, ...] = tuple()
+    PERSONA_CHOICES: Tuple[str, ...] = tuple()
 
     def soft_evidence_kinds(_text: str) -> set[str]:
         return set()
@@ -222,6 +237,11 @@ else:
     _dsl_parse_json_blocks = _dsl_core_bindings['_dsl_parse_json_blocks']
     _tool_param_context_mismatch = _dsl_core_bindings['_tool_param_context_mismatch']
     AttackSpec = _dsl_core_bindings['AttackSpec']
+    SPEECH_FAMILY_CHOICES: Tuple[str, ...] = tuple(_dsl_core_bindings.get('SPEECH_FAMILY', ()))
+    REGION_CHOICES: Tuple[str, ...] = tuple(_dsl_core_bindings.get('REGIONS', ()))
+    REGISTER_CHOICES: Tuple[str, ...] = tuple(_dsl_core_bindings.get('REGISTERS', ()))
+    INDUSTRY_CHOICES: Tuple[str, ...] = tuple(_dsl_core_bindings.get('INDUSTRIES', ()))
+    PERSONA_CHOICES: Tuple[str, ...] = tuple(_dsl_core_bindings.get('PERSONAS', ()))
 
     _micro_grammar = _probe_capability('micro_grammar', lambda: __import__('micro_grammar'))
     if _micro_grammar is not None:
@@ -8798,6 +8818,13 @@ DEFAULTS: Dict[str, Any] = {
 def main():
     ap = build_arg_parser()
     args = ap.parse_args()
+    # Auto-scale coverage for tiny runs to avoid hard fails in DSL coverage checks
+    try:
+        if (args.coverage_min_per_combo or 0) > 0 and args.n < 5 * args.coverage_min_per_combo:
+            print(f"[auto-config] lowering coverage_min_per_combo from {args.coverage_min_per_combo} to 1 for small n={args.n}")
+            args.coverage_min_per_combo = 1
+    except Exception:
+        pass
     if args.simhash_bits <= 32 and args.simhash_thresh > 1:
         print("[auto-config] lowering simhash_thresh to 1 for <=32-bit SimHash fingerprints")
         args.simhash_thresh = 1
@@ -9039,14 +9066,31 @@ def main():
             coverage_axes = ("mechanism_path_key",
                              "strategy","channel","carrier","delivery",
                              "ev_family","ev_bucket","anchor_free","contract_type",
-                             # style axes to avoid mono-style bias
-                             "speech_family","region","register","industry","persona",
                              # anchor_free soft evidence bucket (0/1/2+)
                              "soft_bucket")
             pin = (pin or {})
             carrier_blacklist = set(pin.get("carrier_blacklist") or [])
             carrier_blacklist.update({"pdf_form", "office_form"})
-            pin = {**pin, "min_cjk_share": args.min_cjk_share, "structural_p": args.structural_p, "structural_pos_ratio": args.structural_p, "alias_p_cn": args.alias_p_cn, "anchor_free_p": max(args.anchor_free_p, 0.85), "anchor_free_soft_min_hits": max(3, int(pin.get("anchor_free_soft_min_hits", 3))), "near_dup_thr": max(0.92, float(pin.get("near_dup_thr", 0.92))), "near_dup_vec_thr": max(0.965, float(pin.get("near_dup_vec_thr", 0.965))), "near_dup_ngram_thr": max(0.90, float(pin.get("near_dup_ngram_thr", 0.90))), "near_dup_global_sim_thr": max(0.96, float(pin.get("near_dup_global_sim_thr", 0.96))), "near_dup_global_ngram_thr": max(0.92, float(pin.get("near_dup_global_ngram_thr", 0.92))), "mechanism_jaccard_thresh": max(0.85, float(pin.get("mechanism_jaccard_thresh", 0.85))), "vec_dim_override": int(pin.get("vec_dim_override", 1024)), "tail_mix_p": max(0.20, float(pin.get("tail_mix_p", 0.20))), "carrier_blacklist": sorted(carrier_blacklist)}
+            pin = {
+                **pin,
+                "min_cjk_share": args.min_cjk_share,
+                "structural_p": args.structural_p,
+                "structural_pos_ratio": args.structural_p,
+                "alias_p_cn": args.alias_p_cn,
+                "anchor_free_p": max(args.anchor_free_p, 0.85),
+                "anchor_free_soft_min_hits": max(3, int(pin.get("anchor_free_soft_min_hits", 3))),
+                "near_dup_thr": max(0.92, float(pin.get("near_dup_thr", 0.92))),
+                "near_dup_vec_thr": max(0.965, float(pin.get("near_dup_vec_thr", 0.965))),
+                "near_dup_ngram_thr": max(0.90, float(pin.get("near_dup_ngram_thr", 0.90))),
+                "near_dup_global_sim_thr": max(0.96, float(pin.get("near_dup_global_sim_thr", 0.96))),
+                "near_dup_global_ngram_thr": max(0.92, float(pin.get("near_dup_global_ngram_thr", 0.92))),
+                "mechanism_jaccard_thresh": max(0.85, float(pin.get("mechanism_jaccard_thresh", 0.85))),
+                "vec_dim_override": int(pin.get("vec_dim_override", 1024)),
+                "tail_mix_p": max(0.20, float(pin.get("tail_mix_p", 0.20))),
+                "carrier_blacklist": sorted(carrier_blacklist),
+                "max_nohit_attempts": max(80, int(pin.get("max_nohit_attempts", 80))),
+                "combo_block_threshold": max(60, int(pin.get("combo_block_threshold", 60))),
+            }
             dsl_samples, coverage = generate_batch(
                 n=dsl_n,
                 seed=args.seed,
@@ -9129,7 +9173,271 @@ def main():
                     print(f"[warn] missing_renderer rate is high: {miss_rate:.2%} ({miss}/{tot_att})")
             except Exception as _e:
                 print("[warn] missing_renderer check failed:", _e)
-            _min = int(getattr(args, "coverage_min_per_combo", 0) or 0)
+            target_min = int(getattr(args, "coverage_min_per_combo", 0) or 0)
+            style_floor = max(1, int(getattr(args, "style_min_per_value", 2) or 2))
+            if isinstance(coverage, dict):
+                import ast
+                coverage.setdefault("num", len(dsl_samples))
+                axes_len = len(coverage_axes)
+
+                def _resolve_combo_tuple(raw):
+                    if isinstance(raw, (tuple, list)):
+                        tup = tuple(raw)
+                    else:
+                        try:
+                            tup = ast.literal_eval(str(raw))
+                        except Exception:
+                            return None
+                    if not isinstance(tup, tuple):
+                        return None
+                    if len(tup) != axes_len:
+                        return None
+                    return tup
+
+                def _tally_refill_sample(cov, sample):
+                    if not isinstance(cov, dict):
+                        return
+                    meta = sample.get("meta") or {}
+                    key_tuple = tuple(meta.get(axis, "_") for axis in coverage_axes)
+                    key_str = str(key_tuple)
+                    counts = cov.setdefault("by_combo_counts", {})
+                    counts[key_str] = counts.get(key_str, 0) + 1
+                    cov["num"] = int(cov.get("num", 0)) + 1
+                    for field, meta_key in (
+                        ("by_strategy", "strategy"),
+                        ("by_channel", "channel"),
+                        ("by_carrier", "carrier"),
+                        ("by_delivery", "delivery"),
+                        ("by_speech_family", "speech_family"),
+                        ("by_region", "region"),
+                        ("by_register", "register"),
+                        ("by_industry", "industry"),
+                        ("by_persona", "persona"),
+                    ):
+                        mapping = cov.setdefault(field, {})
+                        val = meta.get(meta_key, "_")
+                        mapping[val] = mapping.get(val, 0) + 1
+                    by_cfam = cov.setdefault("by_cfam", {})
+                    cf_key = f"{meta.get('carrier','_')}|{meta.get('ev_family','_')}"
+                    by_cfam[cf_key] = by_cfam.get(cf_key, 0) + 1
+                    mech_combo = "|".join([
+                        meta.get("contract_type", "_"),
+                        meta.get("ev_bucket", "_"),
+                        meta.get("channel", "_"),
+                        meta.get("delivery", "_"),
+                    ])
+                    by_mech = cov.setdefault("by_mechanism", {})
+                    by_mech[mech_combo] = by_mech.get(mech_combo, 0) + 1
+                    mech_label = meta.get("mechanism_combo") or meta.get("mechanism_path_key")
+                    if mech_label:
+                        mm = cov.setdefault("by_mechanism_combo", {})
+                        mm[mech_label] = mm.get(mech_label, 0) + 1
+                    mech_matrix = cov.setdefault("mechanism_matrix", {})
+                    mech_key = meta.get("mechanism_path_key")
+                    if mech_key:
+                        mech_matrix[mech_key] = mech_matrix.get(mech_key, 0) + 1
+
+                if target_min > 0:
+                    combo_counts = coverage.get("by_combo_counts") or {}
+                    deficits = {}
+                    for key_str, count in combo_counts.items():
+                        combo_tuple = _resolve_combo_tuple(key_str)
+                        if combo_tuple is None:
+                            continue
+                        need = target_min - int(count)
+                        if need > 0:
+                            deficits[key_str] = {"tuple": combo_tuple, "initial": int(count), "needed": need}
+                    for raw_key in coverage.get("blocked_combos") or []:
+                        combo_tuple = _resolve_combo_tuple(raw_key)
+                        if combo_tuple is None:
+                            continue
+                        key_str = str(combo_tuple)
+                        existing = int(combo_counts.get(key_str, 0))
+                        need = target_min - existing
+                        if need > 0:
+                            deficits.setdefault(key_str, {"tuple": combo_tuple, "initial": existing, "needed": need})
+                    if deficits:
+                        total_deficit = sum(info["needed"] for info in deficits.values())
+                        print(f"[dsl-second-stage] attempting targeted refill of {len(deficits)} combos (total deficit {total_deficit})")
+                        refill_report = {}
+                        for idx, (key_str, info) in enumerate(sorted(deficits.items(), key=lambda kv: -kv[1]["needed"])):
+                            combo_tuple = info["tuple"]
+                            baseline = info["initial"]
+                            needed = max(info["needed"], target_min - baseline)
+                            if needed <= 0:
+                                refill_report[key_str] = {"needed": 0, "added": 0}
+                                continue
+                            combo_pin = dict(pin)
+                            combo_map = {axis: value for axis, value in zip(coverage_axes, combo_tuple)}
+                            for axis_name in ("strategy", "channel", "carrier", "delivery"):
+                                val = combo_map.get(axis_name)
+                                if val not in (None, "_", "n/a"):
+                                    combo_pin[axis_name] = val
+                            ev_bucket_val = combo_map.get("ev_bucket")
+                            if ev_bucket_val not in (None, "_", "n/a"):
+                                combo_pin["ev_bucket"] = ev_bucket_val
+                            ev_family_val = combo_map.get("ev_family")
+                            if ev_family_val not in (None, "_", "n/a"):
+                                combo_pin["ev_family"] = ev_family_val
+                            anchor_raw = combo_map.get("anchor_free")
+                            anchor_forced = None
+                            if isinstance(anchor_raw, (int, float)) and int(anchor_raw) in (0, 1):
+                                anchor_forced = int(anchor_raw)
+                            elif isinstance(anchor_raw, str) and anchor_raw in {"0", "1"}:
+                                anchor_forced = int(anchor_raw)
+                            if anchor_forced is not None:
+                                combo_pin["anchor_free_forced"] = anchor_forced
+                            produced_for_combo = 0
+                            attempt = 0
+                            max_attempts = 3
+                            while produced_for_combo < needed and attempt < max_attempts:
+                                attempt += 1
+                                batch_n = max(1, needed - produced_for_combo)
+                                refill_seed = (args.seed or 0) + 1000 + idx * 37 + attempt
+                                try:
+                                    refill_samples, _ = generate_batch(
+                                        n=batch_n,
+                                        seed=refill_seed,
+                                        pin=combo_pin,
+                                        coverage_axes=coverage_axes,
+                                        min_per_combo=0,
+                                        mechanism_signal_fn=_dsl_mechanism_probe,
+                                    )
+                                except Exception as exc:
+                                    print(f"[dsl-second-stage][warn] combo {key_str} attempt {attempt} failed: {exc}")
+                                    break
+                                if not refill_samples:
+                                    continue
+                                dsl_samples.extend(refill_samples)
+                                for sample in refill_samples:
+                                    _tally_refill_sample(coverage, sample)
+                                    try:
+                                        row = _dsl_to_row(sample, cfg)
+                                        if row:
+                                            pos_cands.append(row)
+                                        else:
+                                            audit_reject("cjk_ratio_not_met", {"phase": "dsl_refill"})
+                                    except Exception as e:
+                                        audit_reject("cjk_ratio_exception", {"phase": "dsl_refill", "err": str(e)})
+                                current = int((coverage.get("by_combo_counts") or {}).get(key_str, 0))
+                                produced_for_combo = current - baseline
+                            refill_report[key_str] = {"needed": needed, "added": produced_for_combo}
+                            if produced_for_combo < needed:
+                                print(f"[dsl-second-stage][warn] combo {key_str} remained under target ({produced_for_combo}/{needed})")
+                        coverage.setdefault("second_stage_refills", {}).update(refill_report)
+                        coverage["num"] = len(dsl_samples)
+                        if coverage.get("blocked_combos"):
+                            updated_block = []
+                            for raw_key in coverage.get("blocked_combos"):
+                                combo_tuple = _resolve_combo_tuple(raw_key)
+                                if combo_tuple is None:
+                                    updated_block.append(raw_key)
+                                    continue
+                                key_str = str(combo_tuple)
+                                if int((coverage.get("by_combo_counts") or {}).get(key_str, 0)) < target_min:
+                                    updated_block.append(raw_key)
+                            coverage["blocked_combos"] = updated_block
+
+                style_axes_catalog = [
+                    ("by_speech_family", "speech_family", SPEECH_FAMILY_CHOICES),
+                    ("by_region", "region", REGION_CHOICES),
+                    ("by_register", "register", REGISTER_CHOICES),
+                    ("by_industry", "industry", INDUSTRY_CHOICES),
+                    ("by_persona", "persona", PERSONA_CHOICES),
+                ]
+                style_refill_report: Dict[str, Dict[str, Dict[str, int]]] = {}
+                if style_floor > 0:
+                    for field, meta_key, choices in style_axes_catalog:
+                        counts = coverage.get(field) or {}
+                        available_vals: list[str] = []
+                        if isinstance(choices, (tuple, list)):
+                            available_vals.extend([str(v) for v in choices if str(v) not in available_vals])
+                        available_vals.extend([str(v) for v in counts.keys() if str(v) not in available_vals])
+                        pinned_val = None
+                        if isinstance(pin, dict):
+                            pinned_val = pin.get(meta_key)
+                        if pinned_val not in (None, "", "_", "n/a"):
+                            available_vals = [str(pinned_val)]
+                        seen = set()
+                        for val in available_vals:
+                            if val in seen or val in (None, "", "_", "n/a"):
+                                continue
+                            seen.add(val)
+                            current = int(counts.get(val, 0))
+                            required = style_floor - current
+                            if required <= 0:
+                                continue
+                            initial = current
+                            produced = 0
+                            attempts = 0
+                            while produced < required and attempts < 3:
+                                attempts += 1
+                                for forced_anchor in (0, 1):
+                                    style_pin = dict(pin)
+                                    style_pin[meta_key] = val
+                                    style_pin["anchor_free_forced"] = forced_anchor
+                                    batch_n = max(1, required - produced)
+                                    refill_seed = (args.seed or 0) + 5000 + (hash((field, val, attempts, forced_anchor)) & 0xFFFF)
+                                    try:
+                                        refill_samples, _ = generate_batch(
+                                            n=batch_n,
+                                            seed=refill_seed,
+                                            pin=style_pin,
+                                            coverage_axes=coverage_axes,
+                                            min_per_combo=0,
+                                            mechanism_signal_fn=_dsl_mechanism_probe,
+                                        )
+                                    except Exception as exc:
+                                        print(f"[dsl-style-refill][warn] axis {field}:{val} attempt {attempts} anchor={forced_anchor} failed: {exc}")
+                                        continue
+                                    if not refill_samples:
+                                        continue
+                                    dsl_samples.extend(refill_samples)
+                                    for sample in refill_samples:
+                                        _tally_refill_sample(coverage, sample)
+                                        try:
+                                            row = _dsl_to_row(sample, cfg)
+                                            if row:
+                                                pos_cands.append(row)
+                                            else:
+                                                audit_reject("cjk_ratio_not_met", {"phase": "dsl_style_refill"})
+                                        except Exception as e:
+                                            audit_reject("cjk_ratio_exception", {"phase": "dsl_style_refill", "err": str(e)})
+                                    counts = coverage.get(field) or {}
+                                    current = int(counts.get(val, 0))
+                                    produced = current - initial
+                                    required = style_floor - current
+                                    if required <= 0:
+                                        break
+                                if required <= 0:
+                                    break
+                            added = max(0, (coverage.get(field) or {}).get(val, 0) - initial)
+                            style_refill_report.setdefault(field, {})[val] = {"needed": max(style_floor - initial, 0), "added": added}
+                            if (coverage.get(field) or {}).get(val, 0) < style_floor:
+                                print(f"[dsl-style-refill][warn] axis {field} value {val} remained under floor {(coverage.get(field) or {}).get(val, 0)}/{style_floor}")
+                if style_refill_report:
+                    coverage.setdefault("style_refills", {}).update(style_refill_report)
+                style_shortfalls: Dict[str, Dict[str, int]] = {}
+                if style_floor > 0:
+                    for field, meta_key, choices in style_axes_catalog:
+                        counts = coverage.get(field) or {}
+                        available_vals: list[str] = []
+                        if isinstance(choices, (tuple, list)):
+                            available_vals.extend([str(v) for v in choices if str(v) not in available_vals])
+                        available_vals.extend([str(v) for v in counts.keys() if str(v) not in available_vals])
+                        pinned_val = None
+                        if isinstance(pin, dict):
+                            pinned_val = pin.get(meta_key)
+                        if pinned_val not in (None, "", "_", "n/a"):
+                            available_vals = [str(pinned_val)]
+                        for val in available_vals:
+                            if val in (None, "", "_", "n/a"):
+                                continue
+                            if int(counts.get(val, 0)) < style_floor:
+                                style_shortfalls.setdefault(field, {})[val] = int(counts.get(val, 0))
+                if style_shortfalls:
+                    raise SystemExit(f"[coverage][fail] style floor not met (≥ {style_floor}): {style_shortfalls}")
+            _min = target_min
             if _min > 0:
                 too_low = {k: v for k, v in coverage.get("by_combo_counts", {}).items() if v < _min}
                 if too_low:
