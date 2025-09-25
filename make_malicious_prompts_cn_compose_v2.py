@@ -1423,7 +1423,7 @@ def sample_disclaimer(rng: random.Random, enable=True) -> Optional[str]:
     return (rng.choice(DISCLAIMER_BANK) if enable and rng.random() < 0.35 else None)
 
 def feature_probe_clean(s: str, *, carrier: Optional[str] = None, payload_encoding: Optional[str] = None) -> FeatureVector:
-    """Surface feature probe. // ����ṹ����̽�롣"""
+    """Surface feature probe. // 表面特征探头"""
     text = s if isinstance(s, str) else ("" if s is None else str(s))
     codef = 1 if CODE_FENCE.search(text) else 0
     xml = 1 if XML_TAG.search(text) else 0
@@ -8196,7 +8196,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     dd.add_argument(
         "--dedupe_preserve_codeblocks", action="store_true", default=False,
         help="Preserve fenced code blocks during dedupe normalization. "
-             "// ȥ��ʱ��保留代码围栏，保持结构特征"
+             "// 在重复数据删除规范化期间保留代码围栏，保持结构特征"
     )
     # ========== 8) Effect-level gating & evaluation // 效果级门控与评测 ==========
     gate = ap.add_argument_group("Effect-level Gating & Evaluation // 效果级门控与评测")
@@ -9084,7 +9084,6 @@ def main():
         import difflib as _difflib
 
         def _norm_for_sem(s: str) -> str:
-            # ʹ����ǰ��ȥ��ǹ�һ�ı���Ϊ����
             return _for_dedup_norm(
                 s,
                 preserve_carrier=args.dedupe_preserve_carrier,
