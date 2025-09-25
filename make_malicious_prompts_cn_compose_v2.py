@@ -185,7 +185,7 @@ _dsl_core_bindings = _probe_capability('dsl_core.core', _load_dsl_core_core)
 if _dsl_core_bindings is None:
     generate_batch = None
     invariant_result_slot = None
-    JSON_BLOCK_RE = _re.compile(r"`(?:json|jsonc|json5|jsonl)\b(.*?)`", _re.S | _re.I)
+    JSON_BLOCK_RE = _re.compile(r"```(?:json|jsonc|json5|jsonl)\b(.*?)```", _re.S | _re.I)
 
     def soft_evidence_kinds(_text: str) -> set[str]:
         return set()

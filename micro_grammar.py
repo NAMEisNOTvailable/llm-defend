@@ -388,9 +388,9 @@ def style_wrap(
 
     seq = [t for t in texts if t]
     try:
-        from dsl_core import apply_style, AttackSpec  # type: ignore
-
+        rebuild_soft_check(dsl_core_module)
     except Exception:
+        pass
         return [t.strip() for t in seq if t.strip()]
     rnd = rng or random.Random()
     spec = AttackSpec(
@@ -1087,8 +1087,11 @@ def attach_to_dsl_core(
     )
     for kind, arr in new_protos.items():
         refill_bank(kind, arr, max_add=0, dsl_core_module=dsl_core_module)
+    try:
+        rebuild_soft_check(dsl_core_module)
+    except Exception:
+        pass
     return new_protos
-
 if __name__ == "__main__":
     protos = generate_micro_prototypes(keys=["result_slot"], per_kind=20, seed=42)
     for s in protos["result_slot"][:10]:

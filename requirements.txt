@@ -1,9 +1,12 @@
 # Base runtime dependencies
-datasets>=2.20.0
 numpy>=1.24
-pyyaml>=6.0
 regex>=2024.5.15
+pyyaml>=6.0
+
+# Optional data sources / DSL helpers
+datasets>=2.20.0
 opencc>=1.1.6
+orjson>=3.10
 
 # Optional accelerators (used when available; falls back gracefully if missing)
 annoy>=1.17
