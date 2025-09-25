@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 DSL core utilities for Chinese prompt‑injection data generation and auditing.
 中文提示注入数据生成与审计的 DSL 核心工具集。
@@ -67,8 +67,6 @@ def _sketch_5gram_fast(s: str, buckets: int = 1 << 16) -> Dict[int, float]:
     vals /= norm
     return {int(k): float(v) for k, v in zip(uniq.tolist(), vals.tolist())}
 
-from enum import Enum
-from itertools import permutations
 
 
 @lru_cache(maxsize=4096)
@@ -640,13 +638,16 @@ _RX_OVERRIDE = _rx_any(_OVERRIDE_SYNS)
 _RX_SLOT_KEY = _re.compile(r'"\s*(result|output|answer|verdict)\s*"\s*:', _re.I)
 _RX_SLOT_MD = _re.compile(r"(?mi)^\s*\|\s*(结果|答案|结论|verdict|result)\s*\|")
 _RX_SLOT_TPL = _re.compile(r"\{\{\s*(RESULT|ANSWER|OUTPUT)[^}]*\}\}", _re.I)
+_TOOL_CONTEXT_RX = _PAT(r"(override|rewrite|overwrite|覆盖|改写|改成|改为|回填|填入|固定|锚定|result|结果|output|最终|force|强制|写入)")
+_ROLE_COMMAND_RX = _PAT(r"(切换|改用|转为|作为|视作|接管|改成|改为|switch(?:\s+to)?|redirect|assume|提升为|降级为)")
+
 
 
 RX_FORCE_RESULT_SLOT = _PAT(r"(结果|答案|结论|result|answer|verdict|final).{0,8}(填入|写入|设为|限定|仅|只|统一)")
 RX_FORCE_APPEND = _PAT(r"(附加|追加|在(结尾|末尾)|脚注|角注|表格|front-?matter|data-[-\w]+)")
-RX_STRUCT_WRAP = _PAT(r"`(json|yaml|jsonc|xml|csv|mermaid|plantuml)\b|<div[^>]+data-|---\s*\n[^-]*?:")
-RX_TOOL_HINT = _PAT(r'"?(tool|function_call|args|arguments)"?\s*[:=]|\b(exec|shell|subprocess|curl|wget)\b')
-RX_ROLE_TAKEOVER = _PAT(r"(从本回合起|将当前会话视作|切换为|视作).{0,12}(system|系统通道|管理员|审定通道|审核通道|管控通道|核心通道|系统级)|【通道：System】")
+RX_STRUCT_WRAP = _PAT(r"```(json|yaml|jsonc|xml|csv|mermaid|plantuml)\b|<div[^>]+data-|---\s*\n[^-]*?:")
+RX_TOOL_HINT = _PAT(r'"?(tool_call|tool|function_call)"?\s*[:=]|\b(exec|shell|subprocess|curl|wget)\b')
+RX_ROLE_TAKEOVER = _PAT(r"(切换|改用|转为|作为|视作|接管|改成|改为|switch(?:\s+to)?|redirect|assume).{0,16}(system|System|系统通道|管理员|审定通道|审核通道|管控通道|核心通道|developer|Developer)")
 RX_UPSTREAM_REF = _PAT(r"(上游|系统提示|developer|system\s*prompt|密钥|token|cookie|凭证|SECRET|ACCESS_TOKEN)")
 RX_PATHY = _PAT(r"(file|path|内网|内部|localhost|127\.0\.0\.1|C:\\\\|/home/|/etc/)")
 
@@ -808,35 +809,57 @@ def detect_semantic_injection(
     *,
     contract: Optional['TaskContract'] = None,
 ) -> Tuple[bool, Dict[str, int]]:
-    """
-    Anchor-free semantic injection detector combining contract conflicts and mood cues.
-
-    Args:
-        full_text: Candidate injection text (including carrier context).
-        v_signals: Behavioural signals derived from `analyze_violations` or DSL contract checks.
-        payload_hint: Optional payload surrogate; unused but kept for API compatibility.
-        contract: Optional task contract to cross-check tool parameter context.
-
-    Returns:
-        A tuple of (is_injection, category_flags) where category_flags captures
-        structural, imperative, target_slot, and takeover evidence.
-    """
+    """Anchor-free semantic injection detector combining contract conflicts and mood cues."""
     text = full_text or ""
+
+    tiers = v_signals.get("evidence_tiers") or {}
+    strong_hits = set(tiers.get("strong", []))
+    weak_hits = set(tiers.get("weak", []))
+
     takeover = bool(
         v_signals.get("privilege_conflict")
         or v_signals.get("dangerous_write")
         or v_signals.get("tool_override")
         or v_signals.get("role_takeover")
     )
-    structural = bool(v_signals.get("format_conflict") or v_signals.get("carrier_leak"))
+    if takeover:
+        strong_hits.add("takeover")
+
+    structural = bool(
+        v_signals.get("format_conflict")
+        or v_signals.get("force_result_slot")
+        or v_signals.get("struct_wrap")
+        or "structural" in strong_hits
+        or "structural" in weak_hits
+    )
 
     target_slot = False
     try:
         target_slot = bool(invariant_result_slot(text))
     except Exception as exc:
         _probe_audit("invariant_slot_error", {"phase": "detect_semantic", "err": exc})
+    if target_slot:
+        strong_hits.add("target_slot")
 
-    imperative = bool(_RX_IMP.search(text) or _RX_OVERRIDE.search(text))
+    imperative = False
+    for match in _RX_IMP.finditer(text):
+        snippet = text[max(0, match.start() - 24): match.end() + 24]
+        if (
+            _RX_SLOT_KEY.search(snippet)
+            or _RX_SLOT_MD.search(snippet)
+            or _RX_SLOT_TPL.search(snippet)
+            or _RX_OVERRIDE.search(snippet)
+        ):
+            imperative = True
+            break
+    if not imperative:
+        for match in _RX_OVERRIDE.finditer(text):
+            snippet = text[max(0, match.start() - 24): match.end() + 24]
+            if _RX_SLOT_KEY.search(snippet) or _RX_SLOT_TPL.search(snippet):
+                imperative = True
+                break
+    if imperative:
+        weak_hits.add("imperative")
 
     cats = {
         "structural": int(structural),
@@ -851,6 +874,8 @@ def detect_semantic_injection(
             tool_ctx_mismatch = _tool_param_context_mismatch(text, contract)
         except Exception as exc:
             _probe_audit("semantic_tool_ctx_error", {"phase": "detect_semantic", "err": exc})
+    if tool_ctx_mismatch:
+        strong_hits.add("tool_param_context_mismatch")
 
     contract_hits = (
         int(v_signals.get("privilege_conflict", False))
@@ -861,7 +886,6 @@ def detect_semantic_injection(
 
     ok = bool(((takeover or target_slot) and (structural or imperative)) or (contract_hits >= 2))
     return ok, cats
-
 
 def invariant_append(txt: str) -> bool:
     # 1) 随机锚点形态；2) 结构等价（JSON directives/键名、YAML键、CSV列、header字段）
