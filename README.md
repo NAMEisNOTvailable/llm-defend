@@ -1,4 +1,4 @@
-# Chinese Prompt-Injection Dataset Composer (v2)
+ï»¿# Chinese Prompt-Injection Dataset Composer (v2)
 
 This repository assembles Chinese prompt-injection datasets with hard negatives, DSL-driven renderers, and layered de-duplication. It consists of four cooperating modules:
 
@@ -7,19 +7,18 @@ This repository assembles Chinese prompt-injection datasets with hard negatives,
 | `make_malicious_prompts_cn_compose_v2.py` | End-to-end CLI: loads corpora (HF datasets or local JSON), synthesises positives/negatives, dedupes, audits, and writes stats. Capability probes cover optional packages (datasets, simhash, faiss, annoy, datasketch, etc.) and print a startup banner. |
 | `dsl_core.py` | DSL that renders injection intents, enforces invariants, and exposes coverage, anchor-free/anchor-required heuristics, soft-evidence checks, and JSON/markdown inspectors. |
 | `dedupe_core.py` | Reusable SimHash + MinHash-LSH + hashed trigram cosine deduper with optional FAISS/Annoy/Numba/xxhash acceleration. Defaults are tuned for Chinese paraphrases and style wrapping. |
-| `micro_grammar.py` | Micro-grammar bank for soft-evidence phrases, with adaptive sampling, permutation-based slot ordering, style wrapping, and helpers to refill & rebuild DSL banks safely. |
+| `micro_grammar.py` | Micro-grammar bank for soft-evidence phrases with deterministic seeding, adaptive slot permutations, DSL style wrapping, and helpers to refill & rebuild DSL banks safely. |
 
 ## Installation
-Ensure you are using **Python 3.9 or newer** before creating the virtual environment.
+Use **Python 3.9+ (3.10 recommended)** before creating the virtual environment.
 
-
-1. Use Python 3.9 or newer and create a virtualenv.
-2. Install core dependencies:
+1. Create a virtual environment.
+2. Install the baseline dependencies:
    ```bash
    pip install -r requirements.txt
    ```
-   This installs the minimal runtime (`numpy`, `regex`, `pyyaml`) plus optional helpers (`datasets`, `opencc`, `orjson`) if available. Missing optional packages degrade gracefully.
-3. (Recommended) For faster dedupe/audits install the accelerators:
+   `requirements.txt` lists the core trio (`numpy`, `regex`, `pyyaml`) plus optional helpers (`datasets`, `opencc`, `orjson`). Comment out the optional lines or install selectively if you want a lean setup.
+3. (Recommended) Install accelerators for dedupe/audit hot paths:
    ```bash
    pip install simhash datasketch annoy scikit-learn xxhash numba
    # On Linux/macOS you can also: pip install faiss-cpu
@@ -39,23 +38,28 @@ python make_malicious_prompts_cn_compose_v2.py \
   --artifact_rate 0.25 \
   --min_cjk_share_auto
 ```
+Small-run guardrails:
+- If `n` is smaller than the coverage budget, the CLI now auto-lowers `coverage_min_per_combo` to 1 and prints an `[auto-config]` notice instead of hard failing.
+- After rendering, candidates pass a coherence gate (`is_coherent_cn`) and a `mechanism_truth_record` check; anchor-free specs get a light soft-hint backfill when they miss the soft-evidence floor.
+
+Outputs:
+- `data.jsonl` - minimal training rows (`text`, `label`).
+- `data_audit.jsonl` - diagnostic metadata (intent, carrier, coverage, side-effects, anchor-free hits).
+- `data_stats.json` - aggregated audits (symmetry, anchor-free ratios, semantic neighbour percentiles, leakage scores).
+
 Key toggles:
 - `--use_dsl`, `--coverage_min_per_combo`, `--structural_p`, `--anchor_free_p` control DSL rendering and coverage.
 - `--soft_hint_rate`, `--alias_p_cn`, `--tail_mix_p` drive soft-evidence injection and style wrapping.
 - `--simhash_bits`, `--simhash_thresh`, `--minhash_n`, `--minhash_bands`, `--jaccard_thresh` tune dedup thresholds.
 - `--targets_json` lets you supply local corpora when HF datasets are unavailable; `_HAS_HF_DATASETS` controls which adapters run.
 
-Outputs:
-- `data.jsonl` ¨C minimal training rows (`text`, `label`).
-- `data_audit.jsonl` ¨C diagnostic metadata (intent, carrier, coverage, side-effects, anchor-free hits).
-- `data_stats.json` ¨C aggregated audits (symmetry, anchor-free ratios, semantic neighbour percentiles, leakage scores).
 
-## Micro-Grammar Helpers
 `micro_grammar.py` now:
 - Uses permutation-based slot orders when none are provided (up to 6 slots) for more surface diversity.
-- Adapts sampling caps/trials based on slot diversity, optional counts, and strong-value usage (see `expand_grammar` docstring for complexity bounds).
-- Normalises duplicates with strong-tone safeguards and region-specific overlays.
-- Provides `attach_to_dsl_core`, `refill_bank`, and `rebuild_soft_check` so regenerated phrases update the DSL banks and closure cache safely.
+- Seeds each grammar with a `blake2b`-derived integer so sampling is repeatable across runs and hosts.
+- Dedupes per evidence bucket, keeps closures pinned to the live DSL lists, and neutralises tone joiners when strong phrases fire.
+- Wraps candidates through `dsl_core.apply_style` when the DSL is available and falls back gracefully otherwise.
+- Provides `attach_to_dsl_core`, `refill_bank`, and `rebuild_soft_check` so regenerated phrases update the DSL banks in-place while respecting category-specific semantic thresholds.
 
 ## Deduplication
 `dedupe_core.Deduper` combines SimHash, MinHash-LSH, hashed trigram cosine, and optional ANN search. Defaults (`sim_thresh=1`, `jaccard_thresh=0.90`, `cosine_thresh=0.92`) balance Chinese paraphrase coverage with aggressive duplicate removal; adjust if style wrapping is either too strict or too permissive.
@@ -94,3 +98,5 @@ Coverage stats help you enforce anchor-free ratios, mechanism variety, and struc
 - Capability logging and auditing utilities surface any fallback paths (regex failures, DSL gaps, dedupe skips).
 - HF datasets are probed lazily; when unavailable, adapters fall back to local JSON sources.
 - Tests are limited to compile-time checks; integrate additional CI or data validation as needed.
+
+

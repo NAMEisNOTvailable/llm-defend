@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 
 """
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
 import random, re
+
 from itertools import permutations
 import hashlib
 try:
@@ -21,6 +22,9 @@ try:
 except Exception:
     Deduper = None  # graceful fallback
     DEFAULT_DEDUPER_KWARGS = {}  # type: ignore
+
+def _noop_apply_style(text: str, spec: Any, rnd: random.Random) -> str:
+    return text
 
 # ---------------------- helpers ----------------------
 
@@ -68,6 +72,8 @@ if _DSL_CORE is not None:
     SOFT_PARAPHRASE_BANK = getattr(_DSL_CORE, 'SOFT_PARAPHRASE_BANK', {})
     apply_cn_region = getattr(_DSL_CORE, 'apply_cn_region', lambda text, region=None: text)
     _sem_match = getattr(_DSL_CORE, '_sem_match', lambda text, bucket: False)
+    AttackSpec = getattr(_DSL_CORE, 'AttackSpec', None)
+    apply_style = getattr(_DSL_CORE, 'apply_style', _noop_apply_style)
 else:
     REGISTERS = []
     REGIONS = []
@@ -83,13 +89,16 @@ else:
     def _sem_match(text: str, bucket: Iterable[str]) -> bool:
         return False
 
+    AttackSpec = None
+    apply_style = _noop_apply_style
+
 def _clean(s: str) -> str:
     s = re.sub(r"\s+", " ", s or "")
-    s = re.sub(r"[，、；]\s*$", "", s)
+    s = re.sub(r"[\uFF0C\u3001\uFF1B]\s*$", "", s)
     return s.strip()
 
 def _end_punct(rng: random.Random) -> str:
-    return rng.choice(["。", "！", "？", "", ""])
+    return rng.choice(["\u3002", "\uFF01", "\uFF1F", "", ""])
 
 def _stable_h32(text: str) -> int:
     digest = hashlib.blake2b(text.encode('utf-8'), digest_size=4).digest()
@@ -160,8 +169,8 @@ class MicroGrammar:
     # 建议列出 3~6 种常见词序；不列则全排列
     orders: List[Tuple[str, ...]] = field(default_factory=list)
     # 片段拼接符号（按片段连缀）
-    joiners: List[str] = field(default_factory=lambda: ["，", "；", "，并", "，且"])
-    trailing: List[str] = field(default_factory=lambda: ["。", "。", "。", ""])
+    joiners: List[str] = field(default_factory=lambda: ["\uFF0C", "\uFF1B", "\uFF0C\u5e76", "\uFF0C\u4e14"])
+    trailing: List[str] = field(default_factory=lambda: ["\u3002", "\uFF01", "\uFF1F", ""])
     max_len: int = 28
     min_cjk_share: float = 0.70
     # 体裁化前/后缀，按 register 选择（小概率混入）
@@ -222,12 +231,12 @@ class MicroGrammar:
             return ""
         joiner = rng.choice(self.joiners) if self.joiners else ""
         if strong_used and self.joiners:
-            joiner = "，" if "，" in self.joiners else ""
+            joiner = "\uFF0C" if "\uFF0C" in self.joiners else ""
         if joiner:
             text = joiner.join(segs)
         else:
             text = "".join(segs)
-        text = re.sub(r"[，、；\s]+$", "", text)
+        text = re.sub(r"[\uFF0C\u3001\uFF1B\s]+$", "", text)
         tail = rng.choice(self.trailing) if self.trailing else _end_punct(rng)
         text = (text + tail).strip()
         pre_pool = self.prefix_by_register.get(register or "", ["", ""])
@@ -289,7 +298,7 @@ class MicroGrammar:
             )
             if not t:
                 continue
-            core = _clean(t).rstrip("。！？；.!?;")
+                core = _clean(t).rstrip("\u3002\uFF01\uFF1F\uFF1B.!?;")
             if core in seen:
                 continue
             bag.append(t)
@@ -386,12 +395,15 @@ def style_wrap(
 
     """Apply dsl_core.apply_style to free-text segments with graceful fallback."""
 
-    seq = [t for t in texts if t]
+    seq = [t.strip() for t in texts if isinstance(t, str) and t.strip()]
+    if not seq:
+        return []
+    if AttackSpec is None or _DSL_CORE is None:
+        return seq
     try:
-        rebuild_soft_check(dsl_core_module)
+        rebuild_soft_check(_DSL_CORE)
     except Exception:
         pass
-        return [t.strip() for t in seq if t.strip()]
     rnd = rng or random.Random()
     spec = AttackSpec(
         strategy="style_wrap",
@@ -409,11 +421,12 @@ def style_wrap(
     out: List[str] = []
     for t in seq:
         try:
-            out.append(apply_style(t, spec, rnd).strip())
+            styled = apply_style(t, spec, rnd) or ""
         except Exception:
-            candidate = t.strip()
-            if candidate:
-                out.append(candidate)
+            styled = t
+        styled = styled.strip()
+        if styled:
+            out.append(styled)
     return out
 
 def expand_grammar(
@@ -1053,7 +1066,10 @@ def rebuild_soft_check(dsl_core_module=None) -> None:
 
     def _soft_ev(key: str):
         rx = rx_map.get(key)
-        bucket = bank.get(key, [])
+        bucket = bank.setdefault(key, [])
+        if not isinstance(bucket, list):
+            bucket = []
+            bank[key] = bucket
         thr = thr_fn(key)
         if rx:
             return lambda t, _rx=rx, _bucket=bucket, _thr=thr: bool(_rx.search(t)) or sem_match(t, _bucket, thr=_thr)
@@ -1096,3 +1112,4 @@ if __name__ == "__main__":
     protos = generate_micro_prototypes(keys=["result_slot"], per_kind=20, seed=42)
     for s in protos["result_slot"][:10]:
         print(s)
+
