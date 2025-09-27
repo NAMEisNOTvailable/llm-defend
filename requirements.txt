@@ -1,4 +1,4 @@
-# Requires Python >= 3.9 (3.10 recommended)
+﻿# Requires Python >= 3.9 (3.10 recommended)
 # Base runtime dependencies (always installed)
 numpy>=1.24
 regex>=2024.5.15
@@ -9,11 +9,17 @@ datasets>=2.20.0
 opencc>=1.1.6
 orjson>=3.10
 
+# Soft-evidence extraction + phrase banking (extract_and_bank_zh_phrases.py)
+jieba>=0.42.1
+scikit-learn>=1.3
+keybert>=0.8.0
+sentence-transformers>=2.7.0
+torch>=2.1
+
 # Optional accelerators (used when available; falls back gracefully if missing)
 annoy>=1.17
 datasketch>=1.5.9
 faiss-cpu>=1.7.4; platform_system != "Windows"
 numba>=0.58
-scikit-learn>=1.3
 simhash>=2.1.2
 xxhash>=3.4

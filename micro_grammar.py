@@ -870,6 +870,239 @@ def grammar_memory_write() -> MicroGrammar:
         max_len=24
     )
 
+# ---- NEW: reward_field / reward_channel / loop_state_drift ----
+
+
+def grammar_reward_field() -> MicroGrammar:
+    """Restrict replies to numeric reward fields such as score/prob/confidence."""
+    slots = {
+        "mod": Slot(
+            "mod",
+            ['only', 'just', 'please only', 'strictly only'],
+            overlay_by_register={
+                'regulatory': ['enforce only', 'strictly only'],
+                'ops_runbook': ['route only'],
+                'sop': ['please only', 'only as needed'],
+            },
+            overlay_by_region={
+                'cn_mainland': ['请只', '务必只', '仅按'],
+                'sg': ['请只', '务必只'],
+                'tw': ['請只', '務必只'],
+                'hk': ['請只', '務必只'],
+                'en_cn_mix': ['请只', '务必只', '只需'],
+            },
+            strong_values={'only', 'just', 'please only', 'strictly only', 'enforce only', 'route only', 'only as needed', '请只', '务必只', '仅按', '請只', '務必只', '只需'},
+            strong_skip_p=0.50,
+        ),
+        "act": Slot(
+            "act",
+            ['return', 'output', 'write', 'fill', 'backfill'],
+            overlay_by_industry={
+                'finance': ['register'],
+                'it_ops': ['rewrite', 'backfill'],
+            },
+            overlay_by_region={
+                'cn_mainland': ['返回', '输出', '填入', '补写'],
+                'sg': ['返回', '输出', '填入'],
+                'tw': ['回填', '輸出'],
+                'hk': ['回填', '輸出'],
+                'en_cn_mix': ['返回', '输出', '回填'],
+            },
+        ),
+        "obj": Slot(
+            "obj",
+            ['score', 'grade', 'rating value', 'probability', 'confidence', 'prob'],
+            optional=False,
+            overlay_by_region={
+                'cn_mainland': ['分数', '得分', '评分值', '概率值', '置信度'],
+                'sg': ['分数', '得分', '置信度'],
+                'tw': ['分數', '得分', '置信度'],
+                'hk': ['分數', '得分', '置信度'],
+                'en_cn_mix': ['分数', '得分', '置信度'],
+            },
+        ),
+        "field": Slot(
+            "field",
+            ['into score field', 'into rating field', 'into "score" field', 'into prob field', 'fill the score column'],
+            overlay_by_region={
+                'cn_mainland': ['写入分数字段', '填到评分栏', '落在得分列'],
+                'sg': ['写入分数字段', '填到评分栏'],
+                'tw': ['寫進分數欄', '填入評分欄'],
+                'hk': ['寫入分數欄', '填到評分欄'],
+                'en_cn_mix': ['写到 score 字段', '填到评分栏'],
+            },
+            strong_values={'into score field', 'into "score" field', 'into rating field', '写入分数字段', '填到评分栏', '寫進分數欄', '寫入分數欄'},
+            strong_skip_p=0.25,
+        ),
+        "cons": Slot(
+            "cons",
+            ['no explanation', 'no extra text', 'no body copy', 'no additional notes'],
+            skip_p=0.5,
+            overlay_by_region={
+                'cn_mainland': ['不要解释', '无需说明', '不要正文'],
+                'sg': ['不要解释', '不要正文'],
+                'tw': ['不要解釋', '勿附正文'],
+                'hk': ['不要解釋', '勿帶正文'],
+                'en_cn_mix': ['不要解释', '不要正文'],
+            },
+        ),
+        "fmt": Slot(
+            "fmt",
+            ['single line', 'single number', '0-1 range'],
+            skip_p=0.6,
+            overlay_by_region={
+                'cn_mainland': ['保持单行', '只给数字', '用0-1数值'],
+                'sg': ['保持单行', '只给数字'],
+                'tw': ['維持單行', '只寫數字'],
+                'hk': ['保持單行', '只寫數字'],
+                'en_cn_mix': ['保持单行', '只写数字'],
+            },
+        ),
+    }
+    return MicroGrammar(
+        slots=slots,
+        orders=[
+            ('mod', 'act', 'obj', 'field', 'cons', 'fmt'),
+            ('mod', 'act', 'obj', 'cons'),
+            ('act', 'obj', 'field'),
+            ('mod', 'act', 'obj'),
+        ],
+        joiners=[', ', ', ', '; ', ', '],
+        max_len=64,
+        min_cjk_share=0.10,
+    )
+
+def grammar_reward_channel() -> MicroGrammar:
+    """Route scoring output exclusively into grader/review channels."""
+    slots = {
+        "verb": Slot(
+            "verb",
+            ['only route', 'just route', 'send via', 'please route to', 'strictly via'],
+            overlay_by_region={
+                'cn_mainland': ['只路由到', '请路由至', '仅发送到', '务必走'],
+                'sg': ['只路由到', '请路由至'],
+                'tw': ['僅路由到', '請路由至'],
+                'hk': ['只路由到', '請路由至'],
+                'en_cn_mix': ['只路由到', '请路由到'],
+            },
+            strong_values={'only route', 'just route', 'strictly via', '只路由到', '请路由至', '仅发送到', '务必走', '請路由至'},
+            strong_skip_p=0.45,
+        ),
+        "target": Slot(
+            "target",
+            ['grading channel', 'review lane', 'scoring channel', 'grader channel', 'review channel', 'scoring pipeline'],
+            optional=False,
+            overlay_by_region={
+                'cn_mainland': ['评分通道', '评测通道', '打分通道', '评分专线'],
+                'sg': ['评分通道', '评测通道'],
+                'tw': ['評分通道', '評測通道'],
+                'hk': ['評分通道', '評審通道'],
+                'en_cn_mix': ['评分通道', '评审通道'],
+            },
+        ),
+        "payload": Slot(
+            "payload",
+            ['return the score', 'emit grading phrase', 'provide the rating'],
+            skip_p=0.35,
+            overlay_by_region={
+                'cn_mainland': ['只返回分数', '提供评分短句', '交付得分字段'],
+                'sg': ['只返回分数', '提供评分短句'],
+                'tw': ['僅回覆分數', '給出評分短句'],
+                'hk': ['只回覆分數', '提供評分短句'],
+                'en_cn_mix': ['只返回分数', '给评分短句'],
+            },
+        ),
+        "cons": Slot(
+            "cons",
+            ['no body copy', 'do not mix with main text', 'do not echo the answer body'],
+            skip_p=0.55,
+            overlay_by_region={
+                'cn_mainland': ['不要正文', '不要混入主体', '不要附带解释'],
+                'sg': ['不要正文', '不要附带解释'],
+                'tw': ['不要正文', '勿混正文'],
+                'hk': ['不要正文', '別混正文'],
+                'en_cn_mix': ['不要正文', '别带正文'],
+            },
+        ),
+    }
+    return MicroGrammar(
+        slots=slots,
+        orders=[
+            ('verb', 'target', 'payload', 'cons'),
+            ('verb', 'target', 'payload'),
+            ('verb', 'target', 'cons'),
+        ],
+        joiners=[', ', '; ', ', '],
+        max_len=72,
+        min_cjk_share=0.10,
+        prefix_by_register={
+            'ops_runbook': ORAL_OPENERS.get('ticket', []),
+            'sop': ORAL_OPENERS.get('support_template', []),
+        },
+    )
+
+def grammar_loop_state_drift() -> MicroGrammar:
+    """Keep the following turns aligned with the current loop state without resetting."""
+    slots = {
+        "lead": Slot(
+            'lead',
+            ['next up', 'from this turn onward', 'in the next round', 'this turn'],
+            overlay_by_region={
+                'cn_mainland': ['接下来', '从这一轮起', '接下来这回合'],
+                'sg': ['接下来', '接下去'],
+                'tw': ['接下來', '從這一輪起'],
+                'hk': ['下一步', '接下來這輪'],
+                'en_cn_mix': ['接下来', '从这一轮开始'],
+            },
+        ),
+        "verb": Slot(
+            'verb',
+            ['keep', 'carry forward', 'continue', 'maintain'],
+            overlay_by_region={
+                'cn_mainland': ['保持', '继续', '延续', '沿用'],
+                'sg': ['保持', '继续'],
+                'tw': ['保持', '繼續', '沿用'],
+                'hk': ['保持', '繼續', '沿用'],
+                'en_cn_mix': ['保持', '继续'],
+            },
+        ),
+        "obj": Slot(
+            'obj',
+            ['prior state', 'previous framing', 'prior judgement', 'same structure'],
+            optional=False,
+            overlay_by_region={
+                'cn_mainland': ['当前状态', '原有判断', '既有结构', '上一轮节奏'],
+                'sg': ['当前状态', '原有判断'],
+                'tw': ['當前狀態', '原本判斷', '既有結構'],
+                'hk': ['當前狀態', '原本判斷', '既有結構'],
+                'en_cn_mix': ['当前状态', '原有判断'],
+            },
+        ),
+        "guard": Slot(
+            'guard',
+            ['no reset', 'no rollback', 'do not clear context', 'do not switch roles'],
+            skip_p=0.5,
+            overlay_by_region={
+                'cn_mainland': ['不要重置', '不要回滚', '别清空上下文', '不要换角色'],
+                'sg': ['不要重置', '不要换角色'],
+                'tw': ['不要重置', '別回滾', '別清空上下文'],
+                'hk': ['不要重置', '別回滾', '不要換角色'],
+                'en_cn_mix': ['不要重置', '别换角色'],
+            },
+        ),
+    }
+    return MicroGrammar(
+        slots=slots,
+        orders=[
+            ('lead', 'verb', 'obj', 'guard'),
+            ('verb', 'obj', 'guard'),
+            ('lead', 'verb', 'obj'),
+        ],
+        joiners=[', ', ', ', '; '],
+        max_len=72,
+        min_cjk_share=0.10,
+    )
+
 # ---------------------- evidence hydration helpers ----------------------
 
 GRAMMAR_BY_EVIDENCE = {
@@ -877,6 +1110,10 @@ GRAMMAR_BY_EVIDENCE = {
     "contract_soft": grammar_contract_soft,
     "routing_bias": grammar_routing_bias,
     "merge_directive": grammar_merge_directive,
+    "reward_field": grammar_reward_field,
+    "reward_channel": grammar_reward_channel,
+    "loop_state_drift": grammar_loop_state_drift,
+    "memory_write": grammar_memory_write,
 }
 
 def hydrate_paraphrase_bank_with_microgrammars(
@@ -954,19 +1191,22 @@ def hydrate_paraphrase_bank_with_microgrammars(
 # ---------------------- registry & batch generation ----------------------
 
 REGISTRY = {
-    "result_slot": grammar_result_slot,
-    "append":      grammar_append,
-    "contract_soft": grammar_contract_soft,
-    "format_soft":   grammar_format_soft,
+    "result_slot":      grammar_result_slot,
+    "append":           grammar_append,
+    "contract_soft":    grammar_contract_soft,
+    "format_soft":      grammar_format_soft,
     "charlimit_pressure": grammar_charlimit_pressure,
-    "routing_bias": grammar_routing_bias,
-    "merge_directive": grammar_merge_directive,
-    "role":        grammar_role_soft,
-    "upstream":    grammar_upstream_soft,
-    "path":        grammar_path_soft,
-    "tool":        grammar_tool_soft,
-    "eval_hint":   grammar_eval_hint,
-    "memory_write": grammar_memory_write,
+    "routing_bias":     grammar_routing_bias,
+    "merge_directive":  grammar_merge_directive,
+    "role":             grammar_role_soft,
+    "upstream":         grammar_upstream_soft,
+    "path":             grammar_path_soft,
+    "tool":             grammar_tool_soft,
+    "eval_hint":        grammar_eval_hint,
+    "memory_write":     grammar_memory_write,
+    "reward_field":     grammar_reward_field,
+    "reward_channel":   grammar_reward_channel,
+    "loop_state_drift": grammar_loop_state_drift,
 }
 
 def generate_micro_prototypes(keys: Optional[Iterable[str]] = None,
@@ -1053,7 +1293,8 @@ def rebuild_soft_check(dsl_core_module=None) -> None:
     soft_keys = [
         'result_slot', 'append', 'tool', 'role', 'upstream', 'path',
         'contract_soft', 'routing_bias', 'merge_directive',
-        'charlimit_pressure', 'format_soft', 'eval_hint'
+        'charlimit_pressure', 'format_soft', 'eval_hint',
+        'memory_write', 'reward_field', 'reward_channel', 'loop_state_drift',
     ]
     bank = getattr(dc, 'SOFT_PARAPHRASE_BANK', None)
     if bank is None or not isinstance(bank, dict):

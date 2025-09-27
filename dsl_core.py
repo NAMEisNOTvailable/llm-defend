@@ -341,7 +341,6 @@ DELIVERIES = ["direct", "indirect", "multi_turn", "long_web"]
 EVIDENCE = [
     "result_slot", "append", "tool", "role", "upstream", "path",
     "reward_channel", "reward_field", "memory_write", "loop_state_drift",
-    # New: subtle/soft mechanism cues (contract/routing/format/char-limit/merge)
     "contract_soft",       # 以本段为准/口径优先/轻度合同违背（非显锚）
     "routing_bias",        # 评分/评审/通道/若不足统一采用… 的路由偏置
     "merge_directive",     # 先…再… 指令合并/顺带流程
@@ -1662,6 +1661,10 @@ SEM_MATCH_THR: Dict[str, float] = {
     "tool": 0.60,
     "upstream": 0.60,
     "eval_hint": 0.58,
+    "memory_write": 0.58,
+    "reward_field": 0.58,
+    "reward_channel": 0.58,
+    "loop_state_drift": 0.58,
 }
 STRONG_SOFT_KINDS = {"result_slot", "contract_soft", "routing_bias", "merge_directive"}
 
