@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 make_malicious_prompts_cn_compose_v2.py
 Purpose // 用途:
@@ -20,13 +20,31 @@ Dependencies // 依赖:
 - pip install datasets regex
 """
 from __future__ import annotations
-import argparse, json, random, re, sys, math, hashlib, string, unicodedata
+import os
+import multiprocessing
+
+_CPU_RESERVE = 2
+_cpu_total = multiprocessing.cpu_count()
+_n_cores = max(1, _cpu_total - _CPU_RESERVE)
+for _env_key in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ[_env_key] = str(_n_cores)
+
+print(f"[info] 自适应线程数: {_n_cores}")
+
+import argparse, json, random, re, sys, math, hashlib, string, unicodedata, atexit
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Iterable, Set, Callable
 from collections.abc import Mapping
 from array import array
 import itertools
 from collections import Counter, defaultdict
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue, Empty
 from threading import Thread
@@ -35,7 +53,6 @@ import codecs
 import regex as _re
 from dataclasses import dataclass, asdict, field
 
-import os
 import numpy as np, platform
 
 load_dataset = None  # type: ignore
@@ -1322,8 +1339,98 @@ MISMATCH_CATALOG = {
   "outline":     {"robots","api_log","email_chain"}
 }
 MISMATCH_QUOTA = {"class_label":0.15,"summary":0.12,"entities":0.10,"kv":0.10,"outline":0.08}
-MISMATCH_USED = Counter()
-MISMATCH_TOTAL = Counter()
+class MismatchTracker:
+
+    def __init__(self, shared_state: Optional[Dict[str, Any]] = None):
+        self._used = Counter()
+        self._total = Counter()
+        self._lock = None
+        if shared_state:
+            self._used = shared_state.get('used') or {}
+            self._total = shared_state.get('total') or {}
+            self._lock = shared_state.get('lock')
+
+    def _get(self, mapping: Any, key: str) -> int:
+        try:
+            return int(mapping.get(key, 0))
+        except AttributeError:
+            try:
+                return int(mapping[key])
+            except Exception:
+                return 0
+        except Exception:
+            return 0
+
+    def _set(self, mapping: Any, key: str, value: int) -> None:
+        try:
+            mapping[key] = int(value)
+        except Exception:
+            try:
+                mapping.__setitem__(key, int(value))
+            except Exception:
+                pass
+
+    def choose(self, contract_mode: str, pool: list[str], chooser, rand_fn, quota: float, target_min: int) -> Optional[str]:
+        lock = self._lock
+        with (lock or nullcontext()):
+            total = self._get(self._total, contract_mode) + 1
+            self._set(self._total, contract_mode, total)
+            used = self._get(self._used, contract_mode)
+            need_min = used < target_min
+            need_quota = quota > 1e-9 and (used / max(1, total)) < quota
+            if need_min or need_quota:
+                name = chooser(pool)
+                self._set(self._used, contract_mode, used + 1)
+                return name
+        if quota > 1e-9 and rand_fn() < quota:
+            with (lock or nullcontext()):
+                used = self._get(self._used, contract_mode)
+                name = chooser(pool)
+                self._set(self._used, contract_mode, used + 1)
+                return name
+        return None
+
+
+_MISMATCH_MANAGER: Optional[MismatchTracker] = MismatchTracker()
+_MISMATCH_SHARED_STATE: Optional[Dict[str, Any]] = None
+_MISMATCH_MANAGER_HANDLE: Optional[Any] = None
+
+
+def set_mismatch_manager(manager: Optional[MismatchTracker]) -> None:
+    global _MISMATCH_MANAGER
+    _MISMATCH_MANAGER = manager or MismatchTracker()
+
+
+def get_mismatch_manager() -> MismatchTracker:
+    global _MISMATCH_MANAGER
+    if _MISMATCH_MANAGER is None:
+        _MISMATCH_MANAGER = MismatchTracker()
+    return _MISMATCH_MANAGER
+
+
+def ensure_shared_mismatch_state() -> Dict[str, Any]:
+    global _MISMATCH_SHARED_STATE, _MISMATCH_MANAGER_HANDLE
+    if _MISMATCH_SHARED_STATE is None:
+        mgr = _mp.Manager()
+        state = {'used': mgr.dict(), 'total': mgr.dict(), 'lock': mgr.Lock()}
+        _MISMATCH_MANAGER_HANDLE = mgr
+        _MISMATCH_SHARED_STATE = state
+    set_mismatch_manager(MismatchTracker(shared_state=_MISMATCH_SHARED_STATE))
+    return _MISMATCH_SHARED_STATE
+
+
+def _shutdown_mismatch_state() -> None:
+    global _MISMATCH_MANAGER_HANDLE
+    if _MISMATCH_MANAGER_HANDLE is not None:
+        try:
+            _MISMATCH_MANAGER_HANDLE.shutdown()
+        except Exception:
+            pass
+        _MISMATCH_MANAGER_HANDLE = None
+
+
+atexit.register(_shutdown_mismatch_state)
+
 
 def choose_mismatch_carrier(contract_mode: str, rng) -> str:
     pool = list(MISMATCH_CATALOG.get(contract_mode, []))
@@ -1338,21 +1445,11 @@ def choose_mismatch_carrier(contract_mode: str, rng) -> str:
         import random as _random
         rand_fn = _random.random
     quota = float(MISMATCH_QUOTA.get(contract_mode, 0.0) or 0.0)
-    MISMATCH_TOTAL[contract_mode] += 1
-    used = MISMATCH_USED[contract_mode]
-    total = MISMATCH_TOTAL[contract_mode]
     target = int(_cfg_attr(None, 'coverage_min_per_combo', 3) or 0)
-    need_min = used < max(1, target)
-    need_quota = quota > 1e-9 and (used / max(1, total)) < quota
-    if need_min or need_quota:
-        name = chooser(pool)
-        MISMATCH_USED[contract_mode] += 1
-        return name
-    if quota > 1e-9 and rand_fn() < quota:
-        name = chooser(pool)
-        MISMATCH_USED[contract_mode] += 1
-        return name
-    return "none"
+    tracker = get_mismatch_manager()
+    choice = tracker.choose(contract_mode, pool, chooser, rand_fn, quota, max(1, target))
+    return choice if choice else "none"
+
 
 def _merge_carrier_name(base: str, new: str) -> str:
     if not new or new == "none":
@@ -5593,7 +5690,7 @@ def pick_strategy(goal_hint: str | None = None) -> Strategy:
     return random.choices(items, weights=ws, k=1)[0]
 # ------------------ Compose attacks // 生成注入样本 ------------------
 
-def _attack_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=None, quota_bundle: Optional[Dict[str, Any]] = None):
+def _attack_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=None, quota_bundle: Optional[Dict[str, Any]] = None, mismatch_state: Optional[Dict[str, Any]] = None):
     """Initializer for worker processes to stash config/state."""
     global _ATTACK_PRODUCER_CFG, _ATTACK_PRODUCER_TARGETS, _ATTACK_TARGET_SLICE, MP_AUDIT_QUEUE
     MP_AUDIT_QUEUE = audit_q
@@ -5612,6 +5709,22 @@ def _attack_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=
             set_quota_manager(None)
     else:
         set_quota_manager(None)
+
+    if mismatch_state:
+        try:
+            set_mismatch_manager(MismatchTracker(shared_state=mismatch_state))
+        except Exception:
+            set_mismatch_manager(MismatchTracker())
+    else:
+        set_mismatch_manager(MismatchTracker())
+
+    if mismatch_state:
+        try:
+            set_mismatch_manager(MismatchTracker(shared_state=mismatch_state))
+        except Exception:
+            set_mismatch_manager(MismatchTracker())
+    else:
+        set_mismatch_manager(MismatchTracker())
 
 def _attack_render_core(seed: int) -> tuple[Optional[RenderPacket], list[tuple[str, dict]]]:
     cfg = _ATTACK_PRODUCER_CFG or {}
@@ -5777,7 +5890,7 @@ def _attack_producer_job(job: tuple[int, int]) -> dict:
         results.append((cand, logs))
     return {"results": results}
 
-def _hard_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=None, quota_bundle: Optional[Dict[str, Any]] = None):
+def _hard_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=None, quota_bundle: Optional[Dict[str, Any]] = None, mismatch_state: Optional[Dict[str, Any]] = None):
     global _HARD_NEG_PRODUCER_CFG, _HARD_NEG_PRODUCER_TARGETS, MP_AUDIT_QUEUE
     MP_AUDIT_QUEUE = audit_q
     _HARD_NEG_PRODUCER_CFG = cfg
@@ -5793,6 +5906,14 @@ def _hard_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_
             set_quota_manager(None)
     else:
         set_quota_manager(None)
+
+    if mismatch_state:
+        try:
+            set_mismatch_manager(MismatchTracker(shared_state=mismatch_state))
+        except Exception:
+            set_mismatch_manager(MismatchTracker())
+    else:
+        set_mismatch_manager(MismatchTracker())
 
 def _hard_neg_producer_job(job: tuple[int, int]) -> dict:
     seed, batch = job
@@ -5839,7 +5960,7 @@ def _hard_neg_producer_job(job: tuple[int, int]) -> dict:
     )
     return {"cands": cands}
 
-def _plain_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=None, quota_bundle: Optional[Dict[str, Any]] = None):
+def _plain_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=None, quota_bundle: Optional[Dict[str, Any]] = None, mismatch_state: Optional[Dict[str, Any]] = None):
     global _PLAIN_NEG_PRODUCER_CFG, _PLAIN_NEG_PRODUCER_TARGETS, _PLAIN_NEG_TARGET_SLICE, MP_AUDIT_QUEUE
     MP_AUDIT_QUEUE = audit_q
     _PLAIN_NEG_PRODUCER_CFG = cfg
@@ -5857,6 +5978,14 @@ def _plain_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit
             set_quota_manager(None)
     else:
         set_quota_manager(None)
+
+    if mismatch_state:
+        try:
+            set_mismatch_manager(MismatchTracker(shared_state=mismatch_state))
+        except Exception:
+            set_mismatch_manager(MismatchTracker())
+    else:
+        set_mismatch_manager(MismatchTracker())
 
 def _plain_neg_producer_job(job: tuple[int, int]) -> dict:
     seed, batch = job
@@ -5903,7 +6032,7 @@ def _plain_neg_producer_job(job: tuple[int, int]) -> dict:
     )
     return {"cands": cands, "stats": stats or {}}
 
-def _topic_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=None, quota_bundle: Optional[Dict[str, Any]] = None):
+def _topic_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit_q=None, quota_bundle: Optional[Dict[str, Any]] = None, mismatch_state: Optional[Dict[str, Any]] = None):
     global _TOPIC_NEG_PRODUCER_CFG, _TOPIC_NEG_PRODUCER_TARGETS, _TOPIC_NEG_TARGET_SLICE, MP_AUDIT_QUEUE
     MP_AUDIT_QUEUE = audit_q
     _TOPIC_NEG_PRODUCER_CFG = cfg
@@ -5921,6 +6050,14 @@ def _topic_neg_producer_init(target_pool: List[Dict[str, Any]], cfg: dict, audit
             set_quota_manager(None)
     else:
         set_quota_manager(None)
+
+    if mismatch_state:
+        try:
+            set_mismatch_manager(MismatchTracker(shared_state=mismatch_state))
+        except Exception:
+            set_mismatch_manager(MismatchTracker())
+    else:
+        set_mismatch_manager(MismatchTracker())
 
 def _topic_neg_producer_job(job: tuple[int, int]) -> dict:
     seed, batch = job
@@ -7071,33 +7208,41 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
     log_thread = Thread(target=_audit_consumer, name="attack-audit-consumer", daemon=True)
     log_thread.start()
     audit_q = _mp.Queue() if workers > 1 else None
-    with Pool(processes=workers, initializer=_attack_producer_init, initargs=(target_pool, cfg_dict, audit_q, quota_bundle)) as pool:
+    mismatch_state = ensure_shared_mismatch_state() if workers > 1 else None
+    pool = Pool(processes=workers, initializer=_attack_producer_init, initargs=(target_pool, cfg_dict, audit_q, quota_bundle, mismatch_state))
+    stop_requested = False
+    try:
+        for payload in pool.imap_unordered(_attack_producer_job, job_stream, chunksize=chunk_size):
+            _drain_audit_queue(audit_q)
+            for cand, logs in payload.get("results", []):
+                if logs:
+                    log_queue.put(logs)
+                attempts += 1
+                if cand is not None:
+                    selector.process(cand)
+                quota_ok = selector.constraints_met()
+                if oversample_ctl.maybe_update(attempts, len(selector.cands), quota_ok):
+                    selector.update_target(oversample_ctl.current_target())
+                    max_attempts = oversample_ctl.max_attempts()
+                if selector.done() or attempts >= max_attempts:
+                    stop_requested = True
+                    break
+            if stop_requested:
+                break
+    except Exception:
+        pool.terminate()
+        raise
+    else:
+        if stop_requested:
+            pool.terminate()
+        else:
+            pool.close()
+    finally:
         try:
-            for payload in pool.imap_unordered(_attack_producer_job, job_stream, chunksize=chunk_size):
-                _drain_audit_queue(audit_q)
-                for cand, logs in payload.get("results", []):
-                    if logs:
-                        log_queue.put(logs)
-                    attempts += 1
-                    if cand is not None:
-                        selector.process(cand)
-                    quota_ok = selector.constraints_met()
-                    if oversample_ctl.maybe_update(attempts, len(selector.cands), quota_ok):
-                        selector.update_target(oversample_ctl.current_target())
-                        max_attempts = oversample_ctl.max_attempts()
-                    if selector.done() or attempts >= max_attempts:
-                        raise StopIteration
-        except StopIteration:
-            pool.terminate()
-        except Exception:
-            pool.terminate()
-            raise
+            pool.join()
         finally:
-            try:
-                pool.join()
-            finally:
-                _finalize_audit_queue(audit_q)
-                audit_q = None
+            _finalize_audit_queue(audit_q)
+            audit_q = None
     log_queue.put(None)
     log_queue.join()
     log_thread.join(timeout=1.0)
@@ -7413,49 +7558,56 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
     attempts = 0
     max_attempts = max(wanted * 50, int(producer_batch * workers * 10))
     audit_q = _mp.Queue() if workers > 1 else None
-    with Pool(processes=workers, initializer=_hard_neg_producer_init,
-              initargs=(target_pool, cfg_dict, audit_q, quota_bundle)) as pool:
+    mismatch_state = ensure_shared_mismatch_state() if workers > 1 else None
+    pool = Pool(processes=workers, initializer=_hard_neg_producer_init,
+              initargs=(target_pool, cfg_dict, audit_q, quota_bundle, mismatch_state))
+    stop_requested = False
+    try:
+        for payload in pool.imap_unordered(_hard_neg_producer_job, job_stream, chunksize=chunk_size):
+            _drain_audit_queue(audit_q)
+            chunk = payload.get('cands', []) if isinstance(payload, dict) else []
+            for cand in chunk:
+                if not isinstance(cand, dict):
+                    continue
+                attempts += 1
+                text_val = cand.get('text', '')
+                if not text_val:
+                    continue
+                if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
+                    continue
+                fam = cand.get('family', 'hardneg')
+                if fam_count[fam] >= family_cap:
+                    continue
+                cand = dict(cand)
+                pair_id = f"HARD-{len(results)+1:07d}"
+                cand['pair_id'] = pair_id
+                try:
+                    carrier_base = (cand.get('carrier') or 'none').split('+')[0]
+                    RUNTIME_NEG_ACCEPTS_BY_CARRIER[carrier_base] += 1
+                except Exception:
+                    pass
+                results.append(cand)
+                fam_count[fam] += 1
+                if len(results) >= wanted:
+                    stop_requested = True
+                    break
+            if stop_requested or attempts >= max_attempts:
+                stop_requested = True
+                break
+    except Exception:
+        pool.terminate()
+        raise
+    else:
+        if stop_requested:
+            pool.terminate()
+        else:
+            pool.close()
+    finally:
         try:
-            for payload in pool.imap_unordered(_hard_neg_producer_job, job_stream, chunksize=chunk_size):
-                _drain_audit_queue(audit_q)
-                chunk = payload.get('cands', []) if isinstance(payload, dict) else []
-                for cand in chunk:
-                    if not isinstance(cand, dict):
-                        continue
-                    attempts += 1
-                    text_val = cand.get('text', '')
-                    if not text_val:
-                        continue
-                    if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
-                        continue
-                    fam = cand.get('family', 'hardneg')
-                    if fam_count[fam] >= family_cap:
-                        continue
-                    cand = dict(cand)
-                    pair_id = f"HARD-{len(results)+1:07d}"
-                    cand['pair_id'] = pair_id
-                    try:
-                        carrier_base = (cand.get('carrier') or 'none').split('+')[0]
-                        RUNTIME_NEG_ACCEPTS_BY_CARRIER[carrier_base] += 1
-                    except Exception:
-                        pass
-                    results.append(cand)
-                    fam_count[fam] += 1
-                    if len(results) >= wanted:
-                        raise StopIteration
-                if len(results) >= wanted or attempts >= max_attempts:
-                    raise StopIteration
-        except StopIteration:
-            pool.terminate()
-        except Exception:
-            pool.terminate()
-            raise
+            pool.join()
         finally:
-            try:
-                pool.join()
-            finally:
-                _finalize_audit_queue(audit_q)
-                audit_q = None
+            _finalize_audit_queue(audit_q)
+            audit_q = None
     try:
         print(f"[gate][hardneg] attempts={attempts} kept={len(results)} accept_rate={(len(results)/(attempts+1e-9)):.3f}")
     except Exception:
@@ -7900,47 +8052,54 @@ def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
     workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
     job_stream = ((seed + (idx * producer_batch * 8369), producer_batch) for idx in itertools.count())
     audit_q = _mp.Queue() if workers > 1 else None
+    mismatch_state = ensure_shared_mismatch_state() if workers > 1 else None
     results: List[Dict[str, Any]] = []
     agg_stats = {'suspect_neg': 0, 'total_neg_checked': 0}
     attempts = 0
     max_attempts = max(k * max(1, producer_batch) * 10, producer_batch * workers * 8)
-    with Pool(processes=workers, initializer=_plain_neg_producer_init,
-              initargs=(target_pool, cfg_dict, audit_q, quota_bundle)) as pool:
-        try:
-            for payload in pool.imap_unordered(_plain_neg_producer_job, job_stream, chunksize=chunk_size):
-                _drain_audit_queue(audit_q)
-                if not isinstance(payload, dict):
+    pool = Pool(processes=workers, initializer=_plain_neg_producer_init,
+              initargs=(target_pool, cfg_dict, audit_q, quota_bundle, mismatch_state))
+    stop_requested = False
+    try:
+        for payload in pool.imap_unordered(_plain_neg_producer_job, job_stream, chunksize=chunk_size):
+            _drain_audit_queue(audit_q)
+            if not isinstance(payload, dict):
+                continue
+            for cand in payload.get('cands', []):
+                if not isinstance(cand, dict):
                     continue
-                for cand in payload.get('cands', []):
-                    if not isinstance(cand, dict):
-                        continue
-                    attempts += 1
-                    text_val = cand.get('text', '')
-                    if not text_val:
-                        continue
-                    if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
-                        continue
-                    cand = dict(cand)
-                    pair_id = f"NPLAIN-{len(results)+1:07d}"
-                    cand['pair_id'] = pair_id
-                    results.append(cand)
-                    agg_stats['suspect_neg'] += int(cand.get('suspect_neg', 0))
-                    agg_stats['total_neg_checked'] += int(cand.get('total_neg_checked', 0))
-                    if len(results) >= k:
-                        raise StopIteration
-                if len(results) >= k or attempts >= max_attempts:
-                    raise StopIteration
-        except StopIteration:
+                attempts += 1
+                text_val = cand.get('text', '')
+                if not text_val:
+                    continue
+                if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
+                    continue
+                cand = dict(cand)
+                pair_id = f"NPLAIN-{len(results)+1:07d}"
+                cand['pair_id'] = pair_id
+                results.append(cand)
+                agg_stats['suspect_neg'] += int(cand.get('suspect_neg', 0))
+                agg_stats['total_neg_checked'] += int(cand.get('total_neg_checked', 0))
+                if len(results) >= k:
+                    stop_requested = True
+                    break
+            if stop_requested or attempts >= max_attempts:
+                stop_requested = True
+                break
+    except Exception:
+        pool.terminate()
+        raise
+    else:
+        if stop_requested:
             pool.terminate()
-        except Exception:
-            pool.terminate()
-            raise
+        else:
+            pool.close()
+    finally:
+        try:
+            pool.join()
         finally:
-            try:
-                pool.join()
-            finally:
-                _finalize_audit_queue(audit_q)
-                audit_q = None
+            _finalize_audit_queue(audit_q)
+            audit_q = None
     _finalize_audit_queue(audit_q)
     return results, agg_stats
 
@@ -8086,42 +8245,49 @@ def compose_topic_shift_negatives(target_pool, k: int, seed: int, deduper: Dedup
     workers, producer_batch, chunk_size = _tune_pool_parameters(workers, producer_batch)
     job_stream = ((seed + (idx * producer_batch * 7121), producer_batch) for idx in itertools.count())
     audit_q = _mp.Queue() if workers > 1 else None
+    mismatch_state = ensure_shared_mismatch_state() if workers > 1 else None
     results: List[Dict[str, Any]] = []
     attempts = 0
     max_attempts = max(k * max(1, producer_batch) * 10, producer_batch * workers * 8)
-    with Pool(processes=workers, initializer=_topic_neg_producer_init,
-              initargs=(target_pool, cfg_dict, audit_q, quota_bundle)) as pool:
-        try:
-            for payload in pool.imap_unordered(_topic_neg_producer_job, job_stream, chunksize=chunk_size):
-                _drain_audit_queue(audit_q)
-                if not isinstance(payload, dict):
+    pool = Pool(processes=workers, initializer=_topic_neg_producer_init,
+              initargs=(target_pool, cfg_dict, audit_q, quota_bundle, mismatch_state))
+    stop_requested = False
+    try:
+        for payload in pool.imap_unordered(_topic_neg_producer_job, job_stream, chunksize=chunk_size):
+            _drain_audit_queue(audit_q)
+            if not isinstance(payload, dict):
+                continue
+            for cand in payload.get('cands', []):
+                if not isinstance(cand, dict):
                     continue
-                for cand in payload.get('cands', []):
-                    if not isinstance(cand, dict):
-                        continue
-                    attempts += 1
-                    text_val = cand.get('text', '')
-                    if not text_val:
-                        continue
-                    if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
-                        continue
-                    cand = dict(cand)
-                    results.append(cand)
-                    if len(results) >= k:
-                        raise StopIteration
-                if len(results) >= k or attempts >= max_attempts:
-                    raise StopIteration
-        except StopIteration:
+                attempts += 1
+                text_val = cand.get('text', '')
+                if not text_val:
+                    continue
+                if not deduper_accept_normalized(deduper, text_val, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
+                    continue
+                cand = dict(cand)
+                results.append(cand)
+                if len(results) >= k:
+                    stop_requested = True
+                    break
+            if stop_requested or attempts >= max_attempts:
+                stop_requested = True
+                break
+    except Exception:
+        pool.terminate()
+        raise
+    else:
+        if stop_requested:
             pool.terminate()
-        except Exception:
-            pool.terminate()
-            raise
+        else:
+            pool.close()
+    finally:
+        try:
+            pool.join()
         finally:
-            try:
-                pool.join()
-            finally:
-                _finalize_audit_queue(audit_q)
-                audit_q = None
+            _finalize_audit_queue(audit_q)
+            audit_q = None
     _finalize_audit_queue(audit_q)
     return results
 

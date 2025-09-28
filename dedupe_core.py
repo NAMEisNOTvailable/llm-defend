@@ -13,7 +13,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Un
 
 import hashlib
 import math
+import os
+import pickle
 import re
+import threading
 
 from collections import defaultdict
 
@@ -364,6 +367,16 @@ class LSHMinhashIndex:
             self.buckets = [defaultdict(list) for _ in range(self.bands)]
             self.items: List[Tuple[Tuple[int, ...], Set[str]]] = []
 
+    def reset(self) -> None:
+        """Clear stored buckets/items so the index can be reused."""
+        if self._use_datasketch:
+            self._lsh = _DSMinHashLSH(threshold=self.threshold, num_perm=self.n_hash) if _DSMinHashLSH is not None else None
+            self._store = {}
+            self._counter = 0
+        else:
+            self.buckets = [defaultdict(list) for _ in range(self.bands)]
+            self.items = []
+
     def _band_keys(self, sig: Tuple[int, ...]) -> List[Tuple[int, ...]]:
         return [tuple(sig[i * self.rows : (i + 1) * self.rows]) for i in range(self.bands)]
 
@@ -445,6 +458,9 @@ class Deduper:
         self.cosine_thresh = float(cosine_thresh)
         self.max_vecs = int(max_vecs)
         self._normalizer = normalizer or _default_normalize
+        self._lock = threading.RLock()
+        self._vec_lock = threading.RLock()
+        self._annoy_lock = threading.RLock()
         self.sim_sigs: List[int] = []
         self._exact_hashes: Set[Tuple[int, int]] = set()
         self._bk_tree = None
@@ -503,7 +519,8 @@ class Deduper:
             fingerprint = (len(norm), _md5_u128(norm))
         except Exception:
             return True
-        return fingerprint not in self._exact_hashes
+        with self._lock:
+            return fingerprint not in self._exact_hashes
 
     def _embed(self, normalized: str) -> Optional[List[float]]:
         if self.vec_dim <= 0:
@@ -555,83 +572,111 @@ class Deduper:
             exact_len=exact_len,
         )
 
+    def _set_last_cosine_score(self, value: float) -> None:
+        with self._vec_lock:
+            self._last_cosine_score = float(value)
+
     def _cosine_near(self, vec: Optional[List[float]]) -> bool:
-        self._last_cosine_score = 0.0
         if vec is None or self.vec_dim <= 0:
+            self._set_last_cosine_score(0.0)
             return False
+        self._set_last_cosine_score(0.0)
         best = 0.0
         if self._faiss_dense is not None and self._faiss_dense.ntotal > 0:
             arr = _dense_to_np(vec)
             k = min(32, self._faiss_dense.ntotal) or 1
-            D, _ = self._faiss_dense.search(arr, k)
+            try:
+                D, _ = self._faiss_dense.search(arr, k)
+            except Exception:
+                D = ()
+            scores = ()
             if getattr(D, "size", 0):
                 try:
-                    best = max(best, float(np.max(D[0])))
+                    scores = [float(x) for x in D[0]]
                 except Exception:
-                    best = max(best, float(max((float(x) for x in D[0]), default=0.0)))
-            for score in D[0]:
+                    scores = [float(x) for x in list(D[0])]
+            for score in scores:
+                if score > best:
+                    best = score
                 if score >= self.cosine_thresh:
-                    self._last_cosine_score = float(score)
+                    self._set_last_cosine_score(score)
                     return True
-        if self._annoy is not None and self._annoy_ids > 0:
-            min_build = max(32, self._annoy_rebuild_every)
-            need_build = False
-            if not self._annoy_built and self._annoy_ids >= min_build:
-                need_build = True
-            elif self._annoy_built and self._annoy_dirty and self._annoy_pending >= self._annoy_rebuild_every and self._annoy_ids >= min_build:
-                need_build = True
-            if need_build:
-                try:
+        local_dists: Tuple[float, ...] = ()
+        if self._annoy is not None:
+            with self._annoy_lock:
+                ids = self._annoy_ids
+                if ids > 0:
+                    min_build = max(32, self._annoy_rebuild_every)
+                    need_build = False
+                    if not self._annoy_built and ids >= min_build:
+                        need_build = True
+                    elif (
+                        self._annoy_built
+                        and self._annoy_dirty
+                        and self._annoy_pending >= self._annoy_rebuild_every
+                        and ids >= min_build
+                    ):
+                        need_build = True
+                    if need_build:
+                        try:
+                            if self._annoy_built:
+                                try:
+                                    self._annoy.unbuild()
+                                except Exception:
+                                    pass
+                            self._annoy.build(self._annoy_n_trees)
+                            self._annoy_built = True
+                            self._annoy_pending = 0
+                            self._annoy_dirty = False
+                        except Exception:
+                            self._annoy_built = False
+                            self._annoy_pending = 0
+                            self._annoy_dirty = False
                     if self._annoy_built:
                         try:
-                            self._annoy.unbuild()
+                            _, dists = self._annoy.get_nns_by_vector(
+                                vec,
+                                min(32, ids),
+                                include_distances=True,
+                            )
+                            local_dists = tuple(float(d) for d in dists)
                         except Exception:
-                            pass
-                    self._annoy.build(self._annoy_n_trees)
-                    self._annoy_built = True
-                    self._annoy_pending = 0
-                    self._annoy_dirty = False
-                except Exception:
-                    self._annoy_built = False
-                    self._annoy_pending = 0
-                    self._annoy_dirty = False
-            if self._annoy_built:
+                            local_dists = ()
+        for dist in local_dists:
+            # Annoy returns angular distance for L2-normalized vectors (dist ~= sqrt(2 * (1 - cos(theta)))).
+            cos = 1.0 - (dist * dist) / 2.0
+            if cos > best:
+                best = float(cos)
+            if cos >= self.cosine_thresh:
+                self._set_last_cosine_score(cos)
+                return True
+        with self._vec_lock:
+            mat = self._vecs_mat
+            count = getattr(self, "_vecs_filled", 0)
+            if mat is not None and mat.size > 0 and count > 0:
+                query = np.asarray(vec, dtype=np.float32)
+                active = mat if count >= mat.shape[0] else mat[:count, :]
                 try:
-                    _, dists = self._annoy.get_nns_by_vector(vec, min(32, self._annoy_ids), include_distances=True)
+                    scores = active @ query
                 except Exception:
-                    dists = ()
-                for dist in dists:
-                    cos = 1.0 - (dist * dist) / 2.0
-                    if cos > best:
-                        best = float(cos)
-                    if cos >= self.cosine_thresh:
-                        self._last_cosine_score = float(cos)
+                    scores = np.dot(active, query)
+                if getattr(scores, "size", 0):
+                    try:
+                        max_score = float(np.max(scores))
+                    except Exception:
+                        max_score = float(max((float(x) for x in scores), default=0.0))
+                    if max_score > best:
+                        best = max_score
+                    if np.any(scores >= self.cosine_thresh):
+                        self._last_cosine_score = max_score
                         return True
-        mat = self._vecs_mat
-        count = getattr(self, "_vecs_filled", 0)
-        if mat is not None and mat.size > 0 and count > 0:
-            query = np.asarray(vec, dtype=np.float32)
-            active = mat if count >= mat.shape[0] else mat[:count, :]
-            try:
-                scores = active @ query
-            except Exception:
-                scores = np.dot(active, query)
-            if getattr(scores, "size", 0):
-                try:
-                    max_score = float(np.max(scores))
-                except Exception:
-                    max_score = float(max((float(x) for x in scores), default=0.0))
-                if max_score > best:
-                    best = max_score
-                if np.any(scores >= self.cosine_thresh):
-                    self._last_cosine_score = max_score
-                    return True
-        self._last_cosine_score = float(best)
+            self._last_cosine_score = float(best)
         return False
 
     @property
     def last_cosine_score(self) -> float:
-        return float(getattr(self, "_last_cosine_score", 0.0))
+        with self._vec_lock:
+            return float(getattr(self, "_last_cosine_score", 0.0))
 
     def _cosine_ext(self, vec: Optional[List[float]]) -> bool:
         if vec is None:
@@ -650,95 +695,263 @@ class Deduper:
         return False
 
     def check_record(self, record: DedupeRecord) -> Tuple[bool, Optional[str]]:
-        fingerprint = (record.exact_len, record.exact_hash)
-        if fingerprint in self._exact_hashes:
-            return False, "exact"
+        with self._lock:
+            fingerprint = (record.exact_len, record.exact_hash)
+            if fingerprint in self._exact_hashes:
+                return False, "exact"
 
-        if self._faiss_sim is not None and self._faiss_sim.ntotal > 0 and record.sig_bytes is not None:
-            k = min(64, self._faiss_sim.ntotal) or 1
-            D, _ = self._faiss_sim.search(record.sig_bytes, k)
-            for dist in D[0]:
-                if int(dist) <= self.sim_thresh:
-                    return False, "simhash"
-        elif self._bk_tree is not None and self._bk_tree.search(record.simhash, self.sim_thresh):
-            return False, "simhash"
-        elif self._faiss_sim is None and self._bk_tree is None:
-            for old in self.sim_sigs:
-                if _hamm(record.simhash, old) <= self.sim_thresh:
-                    return False, "simhash"
+            if self._faiss_sim is not None and self._faiss_sim.ntotal > 0 and record.sig_bytes is not None:
+                k = min(64, self._faiss_sim.ntotal) or 1
+                D, _ = self._faiss_sim.search(record.sig_bytes, k)
+                for dist in D[0]:
+                    if int(dist) <= self.sim_thresh:
+                        return False, "simhash"
+            elif self._bk_tree is not None and self._bk_tree.search(record.simhash, self.sim_thresh):
+                return False, "simhash"
+            elif self._faiss_sim is None and self._bk_tree is None:
+                for old in self.sim_sigs:
+                    if _hamm(record.simhash, old) <= self.sim_thresh:
+                        return False, "simhash"
 
-        if self.index.query(record.minhash, record.shingles, self.jaccard_thresh):
-            return False, "jaccard"
+            if self.index.query(record.minhash, record.shingles, self.jaccard_thresh):
+                return False, "jaccard"
 
-        if self._cosine_near(record.vector):
-            return False, "cosine"
+            if self._cosine_near(record.vector):
+                return False, "cosine"
 
-        ext_fn = getattr(Deduper, "_ext_embed_fn", None)
-        if ext_fn is not None:
-            try:
-                if record.external_vector is None:
-                    record.external_vector = ext_fn(record.normalized)
-                if isinstance(record.external_vector, list) and record.external_vector:
-                    if self._cosine_ext(record.external_vector):
-                        return False, "external"
-            except Exception:
-                pass
-        return True, None
-
-    def add_record(self, record: DedupeRecord) -> None:
-        self._exact_hashes.add((record.exact_len, record.exact_hash))
-        self.sim_sigs.append(record.simhash)
-        if self._bk_tree is not None:
-            self._bk_tree.add(record.simhash)
-        self.index.add(record.minhash, record.shingles)
-        if self.vec_dim > 0 and record.vector is not None:
-            arr = np.asarray(record.vector, dtype=np.float32).reshape(-1)
-            buf = self._vecs_mat
-            if buf is not None and self.max_vecs > 0 and buf.shape[0] == self.max_vecs and arr.size == buf.shape[1]:
-                idx = self._vecs_cursor
+            ext_fn = getattr(Deduper, "_ext_embed_fn", None)
+            if ext_fn is not None:
                 try:
-                    buf[idx, :] = arr
-                    self._vecs_cursor = (self._vecs_cursor + 1) % buf.shape[0]
-                    self._vecs_filled = min(self._vecs_filled + 1, buf.shape[0])
+                    if record.external_vector is None:
+                        record.external_vector = ext_fn(record.normalized)
+                    if isinstance(record.external_vector, list) and record.external_vector:
+                        if self._cosine_ext(record.external_vector):
+                            return False, "external"
                 except Exception:
                     pass
-            elif arr.size == self.vec_dim:
-                arr2 = arr.reshape(1, -1)
-                if buf is None:
-                    self._vecs_mat = arr2
-                else:
+            return True, None
+
+    def size(self) -> int:
+        """Return the number of exact hashes tracked by the deduper."""
+        with self._lock:
+            return len(self._exact_hashes)
+
+    def reset(self) -> None:
+        """Clear accumulated state so the deduper can be reused."""
+        with self._lock:
+            self.sim_sigs = []
+            self._exact_hashes = set()
+            try:
+                self.index.reset()
+            except AttributeError:
+                pass
+            if self._bk_tree is not None:
+                self._bk_tree = _HammingBKTree(_hamm)
+            if self._faiss_sim is not None:
+                try:
+                    self._faiss_sim.reset()
+                except Exception:
                     try:
-                        self._vecs_mat = np.vstack((buf, arr2))
+                        self._faiss_sim = faiss.IndexBinaryFlat(self.sim_bits) if faiss is not None else None
                     except Exception:
-                        return
-                    if self.max_vecs > 0 and self._vecs_mat.shape[0] > self.max_vecs:
-                        self._vecs_mat = self._vecs_mat[-self.max_vecs:]
-                self._vecs_filled = self._vecs_mat.shape[0] if self._vecs_mat is not None else 0
-                self._vecs_cursor = self._vecs_filled % max(1, self.max_vecs) if self.max_vecs > 0 else 0
-        if self._faiss_sim is not None and record.sig_bytes is not None:
+                        self._faiss_sim = None
+            if self._faiss_dense is not None:
+                try:
+                    self._faiss_dense.reset()
+                except Exception:
+                    try:
+                        self._faiss_dense = faiss.IndexFlatIP(self.vec_dim) if faiss is not None else None
+                    except Exception:
+                        self._faiss_dense = None
+        with self._annoy_lock:
+            if _AnnoyIndex is not None and self.vec_dim > 0:
+                try:
+                    self._annoy = _AnnoyIndex(self.vec_dim, "angular")
+                except Exception:
+                    self._annoy = None
+            else:
+                self._annoy = None
+            self._annoy_ids = 0
+            self._annoy_built = False
+            self._annoy_pending = 0
+            self._annoy_dirty = False
+        with self._vec_lock:
+            if self.vec_dim > 0 and self.max_vecs > 0:
+                try:
+                    self._vecs_mat = np.zeros((self.max_vecs, self.vec_dim), dtype=np.float32)
+                except Exception:
+                    self._vecs_mat = None
+            else:
+                self._vecs_mat = None
+            self._vecs_cursor = 0
+            self._vecs_filled = 0
+            self._last_cosine_score = 0.0
+
+    def dump(self, path: Optional[str] = None) -> Dict[str, Any]:
+        """Return or persist deduper state for exact hashes & cosine cache."""
+        with self._lock:
+            exact_hashes = list(self._exact_hashes)
+        with self._vec_lock:
+            vecs_cursor = self._vecs_cursor
+            vecs_filled = self._vecs_filled
+            max_vecs = self.max_vecs
+            vec_dim = self.vec_dim
+            if self._vecs_mat is not None and vecs_filled > 0:
+                vecs = self._vecs_mat[:vecs_filled].copy()
+            else:
+                vecs = None
+        state: Dict[str, Any] = {
+            "exact_hashes": exact_hashes,
+            "vecs_cursor": vecs_cursor,
+            "vecs_filled": vecs_filled,
+            "max_vecs": max_vecs,
+            "vec_dim": vec_dim,
+            "vecs": vecs,
+        }
+        if path:
+            with open(path, "wb") as fh:
+                pickle.dump(state, fh)
+        return state
+
+    def load(self, source: Union[str, Dict[str, Any]]) -> None:
+        """Restore state produced by dump(); only exact hashes and vectors are reinstated."""
+        if isinstance(source, (str, bytes, os.PathLike)):
+            with open(source, "rb") as fh:
+                state = pickle.load(fh)
+        else:
+            state = dict(source)
+        exact = state.get("exact_hashes") or []
+        with self._lock:
+            self._exact_hashes = set(
+                tuple(item) if isinstance(item, (list, tuple)) else tuple(item) for item in exact
+            )
+        vecs = state.get("vecs")
+        cursor = int(state.get("vecs_cursor", 0))
+        with self._vec_lock:
+            if vecs is not None:
+                arr = np.asarray(vecs, dtype=np.float32)
+                if arr.ndim == 2 and self.vec_dim > 0 and arr.shape[1] == self.vec_dim:
+                    if self.max_vecs > 0:
+                        cap = min(arr.shape[0], self.max_vecs)
+                        try:
+                            self._vecs_mat = np.zeros((self.max_vecs, self.vec_dim), dtype=np.float32)
+                            self._vecs_mat[:cap, :] = arr[:cap, :]
+                        except Exception:
+                            self._vecs_mat = arr[:cap, :].copy()
+                            self.max_vecs = self._vecs_mat.shape[0]
+                        self._vecs_filled = cap
+                        self._vecs_cursor = (
+                            min(cursor, cap % max(1, self.max_vecs)) if self.max_vecs > 0 else 0
+                        )
+                    else:
+                        self._vecs_mat = arr.copy()
+                        self._vecs_filled = arr.shape[0]
+                        self._vecs_cursor = min(cursor, self._vecs_filled)
+                else:
+                    self._vecs_mat = None
+                    self._vecs_filled = 0
+                    self._vecs_cursor = 0
+            else:
+                if self.vec_dim > 0 and self.max_vecs > 0:
+                    try:
+                        self._vecs_mat = np.zeros((self.max_vecs, self.vec_dim), dtype=np.float32)
+                    except Exception:
+                        self._vecs_mat = None
+                else:
+                    self._vecs_mat = None
+                self._vecs_filled = 0
+                self._vecs_cursor = 0
+            self._last_cosine_score = 0.0
+        with self._annoy_lock:
+            if _AnnoyIndex is not None and self.vec_dim > 0:
+                try:
+                    self._annoy = _AnnoyIndex(self.vec_dim, "angular")
+                except Exception:
+                    self._annoy = None
+            else:
+                self._annoy = None
+            self._annoy_ids = 0
+            self._annoy_built = False
+            self._annoy_pending = 0
+            self._annoy_dirty = False
+
+    def _append_vector_buffer(self, vec_arr: np.ndarray) -> None:
+        if vec_arr.size != self.vec_dim:
+            return
+        vec_arr = np.asarray(vec_arr, dtype=np.float32).reshape(-1)
+        with self._vec_lock:
+            buf = self._vecs_mat
+            if (
+                buf is not None
+                and self.max_vecs > 0
+                and buf.shape[0] == self.max_vecs
+                and vec_arr.size == buf.shape[1]
+            ):
+                idx = self._vecs_cursor
+                try:
+                    buf[idx, :] = vec_arr
+                except Exception:
+                    pass
+                else:
+                    self._vecs_cursor = (self._vecs_cursor + 1) % buf.shape[0]
+                    self._vecs_filled = min(self._vecs_filled + 1, buf.shape[0])
+                    return
+            arr2 = vec_arr.reshape(1, -1)
+            if buf is None:
+                self._vecs_mat = arr2.copy()
+            else:
+                try:
+                    self._vecs_mat = np.vstack((buf, arr2))
+                except Exception:
+                    return
+                if self.max_vecs > 0 and self._vecs_mat.shape[0] > self.max_vecs:
+                    self._vecs_mat = self._vecs_mat[-self.max_vecs :]
+            if self._vecs_mat is not None:
+                self._vecs_filled = self._vecs_mat.shape[0]
+                self._vecs_cursor = (
+                    self._vecs_filled % max(1, self.max_vecs) if self.max_vecs > 0 else 0
+                )
+
+    def _queue_annoy_vector(self, vector: List[float]) -> None:
+        with self._annoy_lock:
+            if self._annoy is None:
+                return
             try:
-                self._faiss_sim.add(record.sig_bytes)
-            except Exception:
-                pass
-        if self._faiss_dense is not None and record.vector is not None:
-            try:
-                self._faiss_dense.add(_dense_to_np(record.vector))
-            except Exception:
-                pass
-        if self._annoy is not None and record.vector is not None:
-            try:
-                self._annoy.add_item(self._annoy_ids, record.vector)
+                self._annoy.add_item(self._annoy_ids, vector)
                 self._annoy_ids += 1
                 self._annoy_pending += 1
                 self._annoy_dirty = True
             except Exception:
                 pass
-        ext_fn = getattr(Deduper, "_ext_embed_fn", None)
-        if ext_fn is not None and isinstance(record.external_vector, list) and record.external_vector:
-            try:
-                Deduper._ext_vecs.append(record.external_vector)
-            except Exception:
-                pass
+
+    def add_record(self, record: DedupeRecord) -> None:
+        with self._lock:
+            self._exact_hashes.add((record.exact_len, record.exact_hash))
+            self.sim_sigs.append(record.simhash)
+            if self._bk_tree is not None:
+                self._bk_tree.add(record.simhash)
+            self.index.add(record.minhash, record.shingles)
+            if self.vec_dim > 0 and record.vector is not None:
+                arr = np.asarray(record.vector, dtype=np.float32).reshape(-1)
+                self._append_vector_buffer(arr)
+            if self._faiss_sim is not None and record.sig_bytes is not None:
+                try:
+                    self._faiss_sim.add(record.sig_bytes)
+                except Exception:
+                    pass
+            if self._faiss_dense is not None and record.vector is not None:
+                try:
+                    self._faiss_dense.add(_dense_to_np(record.vector))
+                except Exception:
+                    pass
+            if record.vector is not None:
+                self._queue_annoy_vector(record.vector)
+            ext_fn = getattr(Deduper, "_ext_embed_fn", None)
+            if ext_fn is not None and isinstance(record.external_vector, list) and record.external_vector:
+                try:
+                    Deduper._ext_vecs.append(record.external_vector)
+                except Exception:
+                    pass
 
     def probe(self, text: str) -> Tuple[bool, Optional[str], DedupeRecord]:
         record = self.prepare(text)
@@ -766,5 +979,3 @@ def _hamm(a: int, b: int) -> int:
 
 
 __all__ = ["Deduper", "DedupeRecord", "LSHMinhashIndex", "simhash_weighted_text", "_h64", "_simhash_weighted_np", "_simhash_tokens"]
-
-

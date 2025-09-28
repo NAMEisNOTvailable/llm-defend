@@ -218,7 +218,7 @@ _DIALECT = {
     "yue": {"我们":"我哋","回复":"回覆","马上":"即刻","需要":"要"},
     "tw": {"效率":"效率","同步":"同步","系统":"系統","请":"請"}
 }
-CODE_BLOCK_RE = re.compile(r"```(\\w+)?\b(.*?)```", re.S)
+CODE_BLOCK_RE = re.compile(r"```(?P<lang>[A-Za-z0-9_+-]+)?\s*\n([\s\S]*?)```", re.M)
 
 def _apply_cn_eco_free(seg: str, rng: random.Random, rate: float) -> str:
     s = seg

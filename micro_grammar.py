@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
-import random, re
+import random, re, logging
 
 from itertools import permutations
 import hashlib
@@ -22,6 +22,8 @@ try:
 except Exception:
     Deduper = None  # graceful fallback
     DEFAULT_DEDUPER_KWARGS = {}  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 def _noop_apply_style(text: str, spec: Any, rnd: random.Random) -> str:
     return text
@@ -173,6 +175,7 @@ class MicroGrammar:
     trailing: List[str] = field(default_factory=lambda: ["\u3002", "\uFF01", "\uFF1F", ""])
     max_len: int = 28
     min_cjk_share: float = 0.70
+    tight_pairs: Set[Tuple[str, str]] = field(default_factory=set)
     # 体裁化前/后缀，按 register 选择（小概率混入）
     prefix_by_register: Dict[str, List[str]] = field(default_factory=dict)
     suffix_by_register: Dict[str, List[str]] = field(default_factory=dict)
@@ -197,7 +200,7 @@ class MicroGrammar:
             else:
                 order_pool = [keys]
         order = rng.choice(order_pool if order_pool else [tuple(self.slots.keys())])
-        segs: List[str] = []
+        segs: List[Tuple[str, str]] = []
         strong_used = False
         for key in order:
             slot = self.slots[key]
@@ -226,16 +229,27 @@ class MicroGrammar:
                 continue
             if slot.is_strong(seg):
                 strong_used = True
-            segs.append(seg)
+            segs.append((key, seg))
         if not segs:
             return ""
         joiner = rng.choice(self.joiners) if self.joiners else ""
         if strong_used and self.joiners:
             joiner = "\uFF0C" if "\uFF0C" in self.joiners else ""
+        tight = getattr(self, 'tight_pairs', set())
+        combined: List[str] = []
+        for idx, (key, segment) in enumerate(segs):
+            if idx == 0:
+                combined.append(segment)
+                continue
+            prev_key = segs[idx - 1][0]
+            if (prev_key, key) in tight:
+                combined[-1] += segment
+            else:
+                combined.append(segment)
         if joiner:
-            text = joiner.join(segs)
+            text = joiner.join(combined)
         else:
-            text = "".join(segs)
+            text = "".join(combined)
         text = re.sub(r"[\uFF0C\u3001\uFF1B\s]+$", "", text)
         tail = rng.choice(self.trailing) if self.trailing else _end_punct(rng)
         text = (text + tail).strip()
@@ -298,7 +312,7 @@ class MicroGrammar:
             )
             if not t:
                 continue
-                core = _clean(t).rstrip("\u3002\uFF01\uFF1F\uFF1B.!?;")
+            core = _clean(t).rstrip("\u3002\uFF01\uFF1F\uFF1B.!?;")
             if core in seen:
                 continue
             bag.append(t)
@@ -659,10 +673,12 @@ def grammar_result_slot() -> MicroGrammar:
     return MicroGrammar(
         slots=slots,
         orders=orders,
+        joiners=["", "、", " ", "，"],
         max_len=32,
         min_cjk_share=0.8,
         prefix_by_register=prefix,
         suffix_by_register=suffix,
+        tight_pairs={('act', 'obj')},
     )
 
 def grammar_append() -> MicroGrammar:
@@ -1350,7 +1366,8 @@ def attach_to_dsl_core(
         pass
     return new_protos
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     protos = generate_micro_prototypes(keys=["result_slot"], per_kind=20, seed=42)
     for s in protos["result_slot"][:10]:
-        print(s)
+        logger.info(s)
 
