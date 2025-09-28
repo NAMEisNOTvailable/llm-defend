@@ -18,7 +18,7 @@ import pickle
 import re
 import threading
 
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import numpy as np
 
@@ -35,6 +35,8 @@ DEFAULT_DEDUPER_KWARGS: Dict[str, Any] = {
     "annoy_rebuild_every": 64,
     "annoy_n_trees": 16,
 }
+
+DEFAULT_EXT_VEC_LIMIT = DEFAULT_DEDUPER_KWARGS["max_vecs"]
 
 def get_default_deduper_kwargs(**overrides: Any) -> Dict[str, Any]:
     cfg = dict(DEFAULT_DEDUPER_KWARGS)
@@ -501,13 +503,29 @@ class Deduper:
                 self._vecs_mat = None
         if not hasattr(Deduper, "_ext_embed_fn"):
             Deduper._ext_embed_fn = None
-            Deduper._ext_vecs = []
             Deduper._ext_cos = 0.90
+            Deduper._ext_vec_limit = int(DEFAULT_EXT_VEC_LIMIT)
+            Deduper._ext_vecs = deque(maxlen=Deduper._ext_vec_limit)
+            Deduper._ext_lock = threading.RLock()
 
     @classmethod
-    def set_external_embedder(cls, fn, cos_thresh: float = 0.90):
+    def set_external_embedder(cls, fn, cos_thresh: float = 0.90, cache_limit: Optional[int] = None):
         cls._ext_embed_fn = fn
         cls._ext_cos = float(cos_thresh) if cos_thresh else 0.90
+        if cache_limit is not None:
+            try:
+                limit = max(1, int(cache_limit))
+            except Exception:
+                limit = cls._ext_vec_limit if hasattr(cls, "_ext_vec_limit") else int(DEFAULT_EXT_VEC_LIMIT)
+            current = getattr(cls, "_ext_vecs", None)
+            existing = list(current) if current else []
+            cls._ext_vec_limit = limit
+            cls._ext_vecs = deque(existing[-limit:], maxlen=limit)
+        elif not isinstance(getattr(cls, "_ext_vecs", None), deque):
+            current = getattr(cls, "_ext_vecs", None)
+            cls._ext_vecs = deque(list(current) if current else [], maxlen=getattr(cls, "_ext_vec_limit", int(DEFAULT_EXT_VEC_LIMIT)))
+        if not hasattr(cls, "_ext_lock"):
+            cls._ext_lock = threading.RLock()
 
     def check_digest(self, text: str) -> bool:
         """Fast exact-duplicate check on normalized text."""
@@ -686,13 +704,24 @@ class Deduper:
         try:
             ext_vecs = getattr(Deduper, "_ext_vecs", [])
             thr = float(getattr(Deduper, "_ext_cos", 0.90))
+            lock = getattr(Deduper, "_ext_lock", None)
         except Exception:
             return False
         if not ext_vecs:
             return False
-        for existing in ext_vecs:
-            score = sum(a * b for a, b in zip(vec, existing))
-            if score >= thr:
+        if lock is not None:
+            with lock:
+                candidates = list(ext_vecs)
+                thr_local = thr
+        else:
+            candidates = list(ext_vecs)
+            thr_local = thr
+        for existing in candidates:
+            try:
+                score = sum(a * b for a, b in zip(vec, existing))
+            except Exception:
+                continue
+            if score >= thr_local:
                 return True
         return False
 
@@ -961,7 +990,27 @@ class Deduper:
             ext_fn = getattr(Deduper, "_ext_embed_fn", None)
             if ext_fn is not None and isinstance(record.external_vector, list) and record.external_vector:
                 try:
-                    Deduper._ext_vecs.append(record.external_vector)
+                    limit = max(1, int(getattr(Deduper, "_ext_vec_limit", int(DEFAULT_EXT_VEC_LIMIT))))
+                    lock = getattr(Deduper, "_ext_lock", None)
+                    if lock is not None:
+                        with lock:
+                            store = getattr(Deduper, "_ext_vecs", None)
+                            raw = list(store) if store else []
+                            if isinstance(store, deque) and store.maxlen == limit:
+                                target = store
+                            else:
+                                target = deque(raw[-limit:], maxlen=limit)
+                                Deduper._ext_vecs = target
+                            target.append(record.external_vector)
+                    else:
+                        store = getattr(Deduper, "_ext_vecs", None)
+                        raw = list(store) if store else []
+                        if isinstance(store, deque) and store.maxlen == limit:
+                            target = store
+                        else:
+                            target = deque(raw[-limit:], maxlen=limit)
+                            Deduper._ext_vecs = target
+                        target.append(record.external_vector)
                 except Exception:
                     pass
 

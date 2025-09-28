@@ -63,7 +63,12 @@ def derive_rng(rng: Optional[random.Random], *parts: object) -> random.Random:
 
 
 class RandomBinder:
-    """Bind module-level `random` helpers to a stable RNG instance."""
+    """Bind module-level `random` helpers to a stable RNG instance.
+
+    This mutates the global `random` module and is not meant for long-lived
+    bindings in multi-thread or multi-process contexts; prefer using
+    `random_module_binding(...)` as a short-lived context manager to avoid
+    concurrent bind/unbind races."""
 
     def __init__(self, namespace: str = "compose_attacks") -> None:
         self.namespace = namespace

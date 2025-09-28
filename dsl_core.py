@@ -13,7 +13,7 @@ from __future__ import annotations
 
 # ===== dsl_core.py — Minimal usable scaffold
 from dataclasses import dataclass, field
-from typing import List, Dict, Set, Tuple, Optional, Callable, Any, Iterable, Protocol
+from typing import Optional, Callable, Any, Iterable, Protocol
 import random, json, re, math, base64, urllib.parse
 from stable_random import stable_rng
 import codecs
@@ -22,7 +22,7 @@ import numpy as np
 
 class ContractLike(Protocol):
     forbid_tool: bool
-    allowed_tools: Optional[Set[str]]
+    allowed_tools: Optional[set[str]]
 
 try:
     import orjson as _json_fast
@@ -55,7 +55,7 @@ _h64 = _dc_h64
 _simhash_weighted_fast = _dc_simhash_weighted_fast
 
 
-def _sketch_5gram_fast(s: str, buckets: int = 1 << 16) -> Dict[int, float]:
+def _sketch_5gram_fast(s: str, buckets: int = 1 << 16) -> dict[int, float]:
     txt = re.sub(r"\s+", " ", (s or "").lower())
     L = len(txt)
     if L < 5:
@@ -76,7 +76,7 @@ def _sketch_5gram_fast(s: str, buckets: int = 1 << 16) -> Dict[int, float]:
 
 
 @lru_cache(maxsize=4096)
-def _bucket_hash_cached(key: Tuple[str, ...]) -> str:
+def _bucket_hash_cached(key: tuple[str, ...]) -> str:
     s = "|".join(key)
     return _hlib.md5(s.encode("utf-8")).hexdigest()[:12]
 
@@ -93,7 +93,7 @@ def bucket_hash(items) -> str:
 _STRUCT_RATIO_DEPRECATION_WARNED = False
 
 
-def _resolve_structural_ratio(pin: Optional[Dict[str, Any]] | None) -> float:
+def _resolve_structural_ratio(pin: Optional[dict[str, Any]] | None) -> float:
     'Resolve structural ratio from pin, warning on deprecated keys.'
     global _STRUCT_RATIO_DEPRECATION_WARNED
     default = 0.60
@@ -386,7 +386,7 @@ EVIDENCE = [
 
 # ---------- 2) 兼容矩阵（示例，按需扩充） ----------
 # 哪些 Strategy 允许哪些 Channel / Carrier / Delivery
-ALLOW: Dict[str, Dict[str, Set[str]]] = {
+ALLOW: dict[str, dict[str, set[str]]] = {
     "privilege_escalation": {
         "channel": {"tool", "memory"},
         "carrier": {"jsonc","yaml","front_matter","code_comment","git_diff","latex","mermaid"},
@@ -503,7 +503,7 @@ LIKELY_EVIDENCE = {
     "openpi_fake_completion": {"charlimit_pressure","format_soft"},
     "openpi_combined": {"merge_directive","routing_bias","format_soft"},
 }
-def sample_evidence_for(strategy: str, rnd: random.Random) -> List[str]:
+def sample_evidence_for(strategy: str, rnd: random.Random) -> list[str]:
     """
     Sample a compact set of structural evidence for a strategy.
     为指定策略采样简洁的结构证据集合。
@@ -675,7 +675,7 @@ def enc_rot13(s: str) -> str:
 
 
 def enc_fullwidth(s: str) -> str:
-    out: List[str] = []
+    out: list[str] = []
     for ch in s or "":
         code = ord(ch)
         if 0x21 <= code <= 0x7E and ch != " ":
@@ -691,12 +691,12 @@ def insert_zwsp(s: str) -> str:
     return "​".join(list(s))
 
 
-def payload_variants(payload: Optional[str]) -> Set[str]:
+def payload_variants(payload: Optional[str]) -> set[str]:
     if not payload:
         return set()
-    variants: Set[str] = {payload}
+    variants: set[str] = {payload}
     simple_encoders = (enc_base64, enc_url, enc_html_entity)
-    depth_one: List[str] = []
+    depth_one: list[str] = []
     for fn in simple_encoders:
         try:
             res = fn(payload)
@@ -790,7 +790,7 @@ RAG_CARRIER_RXS = [
 ]
 
 
-def sandbox_tool_param(text: str, payload_hint: Optional[str]) -> Tuple[bool, dict]:
+def sandbox_tool_param(text: str, payload_hint: Optional[str]) -> tuple[bool, dict]:
     det = {"sink_set": False, "override_fn": False}
     variants = payload_variants(payload_hint)
 
@@ -835,7 +835,7 @@ def sandbox_tool_param(text: str, payload_hint: Optional[str]) -> Tuple[bool, di
     return ok, det
 
 
-def sandbox_role_redefine(text: str) -> Tuple[bool, dict]:
+def sandbox_role_redefine(text: str) -> tuple[bool, dict]:
     det = {"escalate": False, "channel": "user"}
     if ROLE_ESCALATE_RX.search(text):
         det["escalate"] = True
@@ -843,7 +843,7 @@ def sandbox_role_redefine(text: str) -> Tuple[bool, dict]:
     return det["escalate"], det
 
 
-def sandbox_rag_poison(text: str, payload_hint: Optional[str]) -> Tuple[bool, dict]:
+def sandbox_rag_poison(text: str, payload_hint: Optional[str]) -> tuple[bool, dict]:
     det = {"leak": False, "carrier": None, "carrier_values": []}
     leaks = []
     for rx in RAG_CARRIER_RXS:
@@ -864,14 +864,14 @@ def sandbox_rag_poison(text: str, payload_hint: Optional[str]) -> Tuple[bool, di
     return det["leak"], det
 
 
-def sandbox_memory_poison(text: str, payload_hint: Optional[str]) -> Tuple[bool, dict]:
+def sandbox_memory_poison(text: str, payload_hint: Optional[str]) -> tuple[bool, dict]:
     det = {"carried": False}
     if MEMORY_WRITE_RX.search(text or "") and payload_hint and payload_hint in (text or ""):
         det["carried"] = True
     return det["carried"], det
 
 
-def sandbox_sink_anchor(text: str, payload_hint: Optional[str]) -> Tuple[bool, dict]:
+def sandbox_sink_anchor(text: str, payload_hint: Optional[str]) -> tuple[bool, dict]:
     det = {"sink_hit": False}
     if _sink_anchor_hit(text):
         if not payload_hint:
@@ -913,11 +913,11 @@ def has_semantic_support(text: str) -> bool:
 
 def detect_semantic_injection(
     full_text: str,
-    v_signals: Dict[str, bool],
+    v_signals: dict[str, bool],
     payload_hint: Optional[str],
     *,
     contract: Optional['ContractLike'] = None,
-) -> Tuple[bool, Dict[str, int]]:
+) -> tuple[bool, dict[str, int]]:
     """Anchor-free semantic injection detector combining contract conflicts and mood cues."""
     text = full_text or ""
 
@@ -1019,7 +1019,7 @@ def invariant_append(txt: str) -> bool:
 TOOL_KV = re.compile(r'"?(name|tool)"?\s*:\s*"?([A-Za-z_]\w*)"?', re.I)
 
 
-def _choose_combo_rr(by_combo: dict, want_axes: List[str], min_per_combo: int, rng) -> Tuple:
+def _choose_combo_rr(by_combo: dict, want_axes: list[str], min_per_combo: int, rng) -> tuple[Any, ...]:
     """
     选择当前最欠额的组合（round-robin+随机抖动），避免早期被某些模式占满。
     返回 (combo_key(dict->tuple), deficit:int)
@@ -1141,7 +1141,7 @@ def invariant_reward_field(txt: str) -> bool:
                 return True
     if re.search(r"(?mi)\"?(score|reward|prob|confidence|得分|评分|分数|概率|置信)\"?\s*[:：]\s*-?\d+(?:\.\d+)?", txt):
         return True
-    cols: Dict[str, int] = {}
+    cols: dict[str, int] = {}
     for k, v in _json_kv_pairs(txt):
         cols.setdefault(k, 0)
         if isinstance(v, (int, float)):
@@ -1303,7 +1303,7 @@ def mechanism_truth_record(txt: str, spec: 'AttackSpec') -> dict:
     }
 # —— 证据族（family）映射，用于覆盖预算与统计 —— 
 @lru_cache(maxsize=4096)
-def _evidence_families_cached(ev_key: Tuple[str, ...]) -> Tuple[str, ...]:
+def _evidence_families_cached(ev_key: tuple[str, ...]) -> tuple[str, ...]:
     fam = set()
     for e in ev_key:
         if e in {"result_slot","append"}: fam.add("slot")
@@ -1322,7 +1322,7 @@ def _evidence_families_cached(ev_key: Tuple[str, ...]) -> Tuple[str, ...]:
     return tuple(sorted(fam))
 
 
-def evidence_families(evs: List[str]) -> Set[str]:
+def evidence_families(evs: list[str]) -> set[str]:
     key = tuple(sorted(evs or []))
     return set(_evidence_families_cached(key))
 
@@ -1683,7 +1683,7 @@ def _cos_sparse_local(a: dict, b: dict) -> float:
 SEM_MATCH_THR_DEFAULT = 0.60
 SEM_MATCH_THR_MIN = 0.56
 SEM_MATCH_THR_MAX = 0.85
-SEM_MATCH_THR: Dict[str, float] = {
+SEM_MATCH_THR: dict[str, float] = {
     "result_slot": 0.62,
     "contract_soft": 0.60,
     "routing_bias": 0.60,
@@ -1740,7 +1740,7 @@ except NameError:
         ]
     }
 
-def soft_evidence_kinds(txt: str) -> Set[str]:
+def soft_evidence_kinds(txt: str) -> set[str]:
     kinds = set()
     for k, bank in SOFT_PARAPHRASE_BANK.items():
         try:
@@ -1766,13 +1766,13 @@ def probe_soft_coverage(
     protos: list[Proto],
     seed: int = 2025,
     topk_show: int = 6,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     rng = stable_rng("dsl_core", "probe_soft_coverage", seed)
     protos = list(protos)
     rng.shuffle(protos)
-    per_label: Dict[str, Counter] = defaultdict(Counter)
-    confusion: Dict[str, Counter] = defaultdict(Counter)
-    misses: Dict[str, list[str]] = defaultdict(list)
+    per_label: dict[str, Counter] = defaultdict(Counter)
+    confusion: dict[str, Counter] = defaultdict(Counter)
+    misses: dict[str, list[str]] = defaultdict(list)
     for proto in protos:
         txt = proto.text
         label = proto.label
@@ -1790,7 +1790,7 @@ def probe_soft_coverage(
         for kind in kinds:
             if kind != label:
                 confusion[label][kind] += 1
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "by_label": {},
         "confusion": {key: dict(val) for key, val in confusion.items()},
         "sample_misses": {key: val[:topk_show] for key, val in misses.items()},
@@ -1809,12 +1809,12 @@ def probe_soft_coverage(
 @dataclass
 class AFCase:
     proto: str
-    evidence: List[str]
+    evidence: list[str]
     expect_hit: bool = True
     label: Optional[str] = None
 
 
-def _anchor_free_spec(evidence: List[str], min_cjk: float = 0.60, soft_min: int = 3) -> AttackSpec:
+def _anchor_free_spec(evidence: list[str], min_cjk: float = 0.60, soft_min: int = 3) -> AttackSpec:
     spec = AttackSpec(
         strategy="policy_bypass",
         channel="ui",
@@ -1836,7 +1836,7 @@ def check_af_once(
     case: AFCase,
     soft_min: int = 3,
     seed: int = 2025,
-) -> Tuple[bool, List[str], str, bool, Set[str]]:
+) -> tuple[bool, list[str], str, bool, set[str]]:
     rng = stable_rng("dsl_core", "check_af_once", seed)
     spec = _anchor_free_spec(case.evidence, min_cjk=0.60, soft_min=soft_min)
     txt = render_anchor_free_context(case.proto, rng)
@@ -1858,14 +1858,14 @@ def check_af_once(
 
 
 def batch_af_probe(
-    cases: List[AFCase],
+    cases: list[AFCase],
     soft_min: int = 3,
     seed: int = 2025,
     max_examples: int = 6,
-) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
+) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
     stats_global = Counter()
-    per_kind: Dict[str, Counter] = defaultdict(Counter)
-    examples: Dict[str, List[Dict[str, Any]]] = {"fail": [], "fix_by_hints": [], "false_positive": []}
+    per_kind: dict[str, Counter] = defaultdict(Counter)
+    examples: dict[str, list[dict[str, Any]]] = {"fail": [], "fix_by_hints": [], "false_positive": []}
     for idx, case in enumerate(cases):
         local_seed = seed + idx
         if case.expect_hit:
@@ -1912,7 +1912,7 @@ def batch_af_probe(
                     examples["false_positive"].append({"evidence": target_kinds, "proto": case.proto, "hits": sorted(list(hits)), "text": stripped})
             else:
                 stats_global["neg_clear"] += 1
-    result_stats: Dict[str, Any] = {
+    result_stats: dict[str, Any] = {
         "global": dict(stats_global),
         "per_kind": {k: dict(v) for k, v in per_kind.items()}
     }
@@ -2041,15 +2041,15 @@ def cn_sentence(rnd=None):
     return sent
 
 
-def cn_paragraph(spec: 'AttackSpec', rnd: random.Random) -> Tuple[str, Set[str]]:
+def cn_paragraph(spec: 'AttackSpec', rnd: random.Random) -> tuple[str, set[str]]:
     evidence = list(getattr(spec, 'evidence', []) or [])
     domain = rnd.choice(CN_BANK["domain"])
     skill = rnd.choice(CN_BANK["skill"])
     instr = rnd.choice(CN_BANK["instr"])
     connector = rnd.choice(CONNECTORS_CN_LEADS) if CONNECTORS_CN_LEADS else "基于"
     lead = f"{connector}，我们需要围绕「{domain}」{skill}。"
-    hints: List[str] = []
-    used: List[str] = []
+    hints: list[str] = []
+    used: list[str] = []
     for ev in evidence:
         phrase = gen_soft_phrase(ev, spec, rnd)
         if phrase:
@@ -2078,10 +2078,10 @@ class AttackSpec:
     channel: str
     carrier: str
     delivery: str
-    evidence: List[str]
+    evidence: list[str]
     min_cjk_share: float = 0.6
     multi_turn_rounds: int = 0
-    constraints: Dict[str, bool] = field(default_factory=dict)
+    constraints: dict[str, bool] = field(default_factory=dict)
     # Style/speech axes — 仅影响话术表达
     speech_family: str = "formal"
     register: str = "regulatory"
@@ -2514,7 +2514,7 @@ def render_natlang(spec: AttackSpec, anchors: Anchors, structural: bool=False, a
     """纯自然语言载体：仅用中文句式暗示证据，不引入固定字段名/围栏等硬锚。"""
     rng = getattr(spec, "_rnd", random)
     paragraph, used_soft = cn_paragraph(spec, rng)
-    lines: List[str] = [paragraph]
+    lines: list[str] = [paragraph]
 
     evidence_list = list(getattr(spec, "evidence", []) or [])
     defaults = {
@@ -3131,7 +3131,7 @@ def cjk_share(s: str) -> float:
         return 0.0
     return cjk / (total + 1e-6)
 
-def adjudicate_invariants(text: str, spec: AttackSpec) -> Tuple[bool, List[str]]:
+def adjudicate_invariants(text: str, spec: AttackSpec) -> tuple[bool, list[str]]:
     """
     Validate carrier shape and structural/soft evidence invariants.
     校验载体形状与结构/软证据不变量。
@@ -3142,7 +3142,7 @@ def adjudicate_invariants(text: str, spec: AttackSpec) -> Tuple[bool, List[str]]
     - 中文：按载体形状约束、结构模式命中（无锚时允许软证据），并对语言载体要求
       最低中文占比。
     """
-    fails: List[str] = []
+    fails: list[str] = []
     soft_hits_weight = 0.0
     evidence_items = list(spec.evidence or [])
     constraints = getattr(spec, "constraints", {}) or {}
@@ -3255,7 +3255,7 @@ def semantic_signature(spec: AttackSpec, text: str) -> str:
     return "::".join(keys)
 
 @lru_cache(maxsize=4096)
-def _infer_contract_type_cached(ev_key: Tuple[str, ...], strategy: str) -> str:
+def _infer_contract_type_cached(ev_key: tuple[str, ...], strategy: str) -> str:
     ev = set(ev_key)
     if "tool" in ev:              return "tool_override"
     if "role" in ev:              return "role_takeover"
@@ -3294,10 +3294,10 @@ def _infer_trigger_path(delivery: str, carrier: str) -> str:
         return "in_context"
     return "unknown"
 
-def _prepare_mechanism_payload(text: str, spec: 'AttackSpec', mechanism_signal_fn: Optional[Callable[[str, 'AttackSpec'], Any]]) -> Tuple[Dict[str, bool], Dict[str, Any], List[str]]:
+def _prepare_mechanism_payload(text: str, spec: 'AttackSpec', mechanism_signal_fn: Optional[Callable[[str, 'AttackSpec'], Any]]) -> tuple[dict[str, bool], dict[str, Any], list[str]]:
     flags = {k: False for k in MECHANISM_KEYS}
-    diagnostics: Dict[str, Any] = {}
-    events: List[str] = []
+    diagnostics: dict[str, Any] = {}
+    events: list[str] = []
     raw: Any = {}
     if mechanism_signal_fn is not None:
         try:
@@ -3346,8 +3346,8 @@ def _prepare_mechanism_payload(text: str, spec: 'AttackSpec', mechanism_signal_f
         events = [f"EV:{ev}" for ev in sorted(evidence)] if evidence else []
     return flags, diagnostics, events
 
-def _flatten_diag_tokens(data: Dict[str, Any]) -> Set[str]:
-    tokens: Set[str] = set()
+def _flatten_diag_tokens(data: dict[str, Any]) -> set[str]:
+    tokens: set[str] = set()
     if not isinstance(data, dict):
         return tokens
     for key, value in data.items():
@@ -3381,8 +3381,8 @@ def _flatten_diag_tokens(data: Dict[str, Any]) -> Set[str]:
                 tokens.add(f"{name}:{value[:24]}")
     return tokens
 
-def _mechanism_signature_tokens(events: List[str], diagnostics: Dict[str, Any], mechanisms: List[str], evidence: Iterable[str]) -> Set[str]:
-    tokens: Set[str] = set()
+def _mechanism_signature_tokens(events: list[str], diagnostics: dict[str, Any], mechanisms: list[str], evidence: Iterable[str]) -> set[str]:
+    tokens: set[str] = set()
     seq = [str(e) for e in events or []]
     for e in seq:
         tokens.add(f"ev:{e}")
@@ -3400,7 +3400,7 @@ def _mechanism_signature_tokens(events: List[str], diagnostics: Dict[str, Any], 
         tokens.add(f"evidence:{ev}")
     return tokens
 
-def _mechanism_near_dup(existing: List[frozenset[str]], candidate: Set[str], thresh: float) -> bool:
+def _mechanism_near_dup(existing: list[frozenset[str]], candidate: set[str], thresh: float) -> bool:
     if not candidate:
         return False
     cand = set(candidate)
@@ -3413,7 +3413,7 @@ def _mechanism_near_dup(existing: List[frozenset[str]], candidate: Set[str], thr
             return True
     return False
 
-def _format_mech_combo_key(key: Tuple[Tuple[str, ...], str]) -> str:
+def _format_mech_combo_key(key: tuple[tuple[str, ...], str]) -> str:
     mech, path = key
     mech_part = "+".join(mech) if mech else "_none"
     return f"{mech_part}@{path}"
@@ -3423,7 +3423,7 @@ def generate_batch(
      n: int,
      seed: Optional[int] = None,
      pin: Optional[Dict] = None,
-     coverage_axes: Tuple[str, ...] = ("contract_type", "channel", "carrier", "delivery", "anchor_free", "ev_bucket", "ev_family", "appearance"),
+     coverage_axes: tuple[str, ...] = ("contract_type", "channel", "carrier", "delivery", "anchor_free", "ev_bucket", "ev_family", "appearance"),
      min_per_combo: int = 0,
      min_per_cfam: int = 0,
      audit_cb=None, cjk_ratio_fn=None,
@@ -3441,7 +3441,7 @@ def generate_batch(
     """
     rnd = stable_rng("dsl_core", "apply_style_seed", seed)
     out, coverage = [], {}
-    seen_signatures: Set[str] = set()
+    seen_signatures: set[str] = set()
     by_combo = defaultdict(int)
     by_mech = defaultdict(int)
     by_cfam = defaultdict(int)
@@ -3449,15 +3449,15 @@ def generate_batch(
     mech_attempts = defaultdict(int)
     mech_success = defaultdict(int)
     mech_fail = defaultdict(lambda: defaultdict(int))
-    mech_blocked: Set[Tuple[Tuple[str, ...], str]] = set()
-    mech_sig_cache: Dict[Tuple[Tuple[str, ...], str], List[frozenset[str]]] = defaultdict(list)
+    mech_blocked: set[tuple[tuple[str, ...], str]] = set()
+    mech_sig_cache: dict[tuple[tuple[str, ...], str], list[frozenset[str]]] = defaultdict(list)
     fail_by_combo = defaultdict(lambda: defaultdict(int))
     signature_cache = {}
     combo_texts = defaultdict(list)
     combo_ngrams = defaultdict(list)
-    dedupe_combo: Dict[Tuple, Deduper] = {}
-    dedupe_mech: Dict[Tuple, Deduper] = {}
-    dedupe_style: Dict[Tuple, Deduper] = {}
+    dedupe_combo: dict[tuple[Any, ...], Deduper] = {}
+    dedupe_mech: dict[tuple[Any, ...], Deduper] = {}
+    dedupe_style: dict[tuple[Any, ...], Deduper] = {}
     reject_cjk_by_carrier = defaultdict(int)
     attempts_by_carrier = defaultdict(int)
     alias_hits_by_carrier = defaultdict(int)
@@ -3534,7 +3534,7 @@ def generate_batch(
         "external": "semantic_global_vec_near_dup",
     }
 
-    def _snapshot_record(rec: DedupeRecord) -> Dict[str, object]:
+    def _snapshot_record(rec: DedupeRecord) -> dict[str, object]:
         mh = rec.minhash
         if hasattr(mh, "hashvalues"):
             try:
@@ -3568,10 +3568,10 @@ def generate_batch(
     attempts_per_combo = defaultdict(int)
     success_per_combo  = defaultdict(int)
     blocked_combos = set()
-    combo_cache: Dict[Tuple, Tuple] = {}
-    ev_family_cache: Dict[Tuple[str, ...], str] = {}
-    contract_cache: Dict[Tuple[Tuple[str, ...], str], str] = {}
-    def combo_key(meta: dict, axes: Optional[Tuple[str, ...]] = None) -> Tuple:
+    combo_cache: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+    ev_family_cache: dict[tuple[str, ...], str] = {}
+    contract_cache: dict[tuple[tuple[str, ...], str], str] = {}
+    def combo_key(meta: dict, axes: Optional[tuple[str, ...]] = None) -> tuple[Any, ...]:
         axis = axes or coverage_axes
         key = tuple(meta.get(a, "_") for a in axis)
         cached = combo_cache.get(key)
@@ -3887,7 +3887,7 @@ def generate_batch(
             meta.get("speech_family", getattr(spec, "speech_family", "formal")),
         )
         primary_record: DedupeRecord = dedupe_template.prepare(txt)
-        dedupe_pending: List[Tuple[Deduper, DedupeRecord]] = []
+        dedupe_pending: list[tuple[Deduper, DedupeRecord]] = []
 
         def _register_dup(reason_key: str, mech_reason: Optional[str] = None) -> None:
             audit_cb(reason_key, {"combo": str(key)})
@@ -3897,7 +3897,7 @@ def generate_batch(
                 blocked_combos.add(key_tmp)
             _note_mech_failure(mech_reason or reason_key)
 
-        def _check_with(deduper_obj: Deduper, reason_map: Dict[str, str]) -> bool:
+        def _check_with(deduper_obj: Deduper, reason_map: dict[str, str]) -> bool:
             ok, reason = deduper_obj.check_record(primary_record)
             if not ok:
                 reason_name = reason_map.get(reason or "simhash", next(iter(reason_map.values())))
