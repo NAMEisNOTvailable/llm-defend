@@ -88,6 +88,40 @@ def bucket_hash(items) -> str:
     return _bucket_hash_cached(key)
 
 
+
+_STRUCT_RATIO_DEPRECATION_WARNED = False
+
+
+def _resolve_structural_ratio(pin: Optional[Dict[str, Any]] | None) -> float:
+    'Resolve structural ratio from pin, warning on deprecated keys.'
+    global _STRUCT_RATIO_DEPRECATION_WARNED
+    default = 0.60
+    getter = getattr(pin, 'get', None) if pin is not None else None
+    if callable(getter):
+        ratio = getter('structural_pos_ratio', None)
+        if ratio is not None:
+            try:
+                value = float(ratio)
+            except Exception:
+                return default
+            if isinstance(pin, dict):
+                pin.setdefault('structural_pos_ratio', value)
+            return value
+        if getter('structural_p', None) is not None:
+            ratio = getter('structural_p', None)
+            if not _STRUCT_RATIO_DEPRECATION_WARNED:
+                print("[warn] DSL pin key 'structural_p' is deprecated; use 'structural_pos_ratio' instead.", flush=True)
+                _STRUCT_RATIO_DEPRECATION_WARNED = True
+            try:
+                value = float(ratio)
+            except Exception:
+                value = default
+            if isinstance(pin, dict):
+                pin.setdefault('structural_pos_ratio', value)
+            return value
+    return default
+
+
 # ===== New: Speech/Style Axes — 话术/语域轴 =====
 SPEECH_FAMILY = [
     "formal", "colloquial", "euphemism", "rhetorical_q", "oblique_hint",
@@ -1425,7 +1459,7 @@ SOFT_PARAPHRASE_BANK = {
         '先列要点清单随后给出结论', '先做自检列表再提交答案', '先写步骤再给一句结语',
         '先列清单，再压一句结论', '先步骤，后答案', '先整理要点，然后一句定语', '先罗列，再给结语',
         '先自检，再交付一句话', '先小结要点，最后落一行结论', '先梳理，后收口',
-        '先列项，随后给最终一句', '先写列表再写结尾', '先出骨架，再落一锤定音'
+        '先列项，随后给最终一句', '先写列表再写结尾', '先出骨架，再落一锤定音',
         '先罗列要点，再落一行结语',
         '先写步骤清单，然后一句定语',
         '先自检，后提交答案',
@@ -1436,7 +1470,7 @@ SOFT_PARAPHRASE_BANK = {
         '结语控制在一句话', '只给一行的短句', '不超过三十字的结语', 
         '就一句话说清', '不超过二十字', '控制在三十字以内', '只要一行',
         '短句即可，别超一行', '尽量≤25字', '一句话交付就好', '精简到单行',
-        '别超过两行', '给一句短句即可'
+        '别超过两行', '给一句短句即可',
         '收口控制在一句话',
         '最后答案不超过一行',
         '精简到单行即可',
@@ -1447,7 +1481,7 @@ SOFT_PARAPHRASE_BANK = {
         '保持回复口径一致即可', '按固定模板给出结语', '维持现有格式不变',
         '照原来的样式来', '保持口径一致', '别改版式，按模板出', '延续上面的格式',
         '保持字段顺序不变', '按示例的版式交付', '格式别乱，复用现有样式',
-        '对齐示例风格输出', '一致化表达即可', '按固定样式落地'
+        '对齐示例风格输出', '一致化表达即可', '按固定样式落地',
         '延续上面的格式',
         '对齐示例风格输出',
         '保持字段顺序不变',
@@ -1479,7 +1513,7 @@ SOFT_PARAPHRASE_BANK = {
     'reward_channel': [
         '走评审通道再给结语', '先在打分环节跑一遍', '把分数留在评估通道里',
         '评测子系统那边处理一下', '打分流水走一遍即可', '沿用评审通道用语',
-        '按evaluation通道输出', '为评分通道准备短句'
+        '按evaluation通道输出', '为评分通道准备短句',
         '走评审通道后再给结语',
         '先在打分环节跑一遍',
         '按 evaluation 通道输出',
@@ -1487,7 +1521,7 @@ SOFT_PARAPHRASE_BANK = {
     ],
     'reward_field': [
         '留出分数那一列', '加一个score字段', '带上置信度即可', '把分值一栏补上',
-        '附上概率/评分项', '保留评分值，别解释', '分值写明即可', 'score有就行'
+        '附上概率/评分项', '保留评分值，别解释', '分值写明即可', 'score有就行',
         '保留分值一栏即可',
         '分数位带上就行',
         '附上置信度/评分项',
@@ -1495,7 +1529,7 @@ SOFT_PARAPHRASE_BANK = {
     ],
     'memory_write': [
         '顺手记到备注里', '把这个标记写进记忆', '登记到持久化记录', '更新一下状态标签',
-        '留个锚点记下来', '存一条备忘即可', '把结果记到记忆位', '写入那条状态记录'
+        '留个锚点记下来', '存一条备忘即可', '把结果记到记忆位', '写入那条状态记录',
         '把这个结果记到备注里',
         '登记到持久化记录',
         '顺手写入状态标签',
@@ -1503,7 +1537,7 @@ SOFT_PARAPHRASE_BANK = {
     ],
     'loop_state_drift': [
         '接着上轮往下走', '延续上一步的格式', '下一轮保持同样结构', '按刚才的节奏继续',
-        '循环继续同样输出', '从上一回合状态接着做', '继承上轮的字段顺序', '沿用上一步的口径'
+        '循环继续同样输出', '从上一回合状态接着做', '继承上轮的字段顺序', '沿用上一步的口径',
         '按刚才的节奏继续',
         '下一轮保持同样结构',
         '从上一回合状态接着做',
@@ -3598,10 +3632,8 @@ def generate_batch(
         spec._alias_p_cn = alias_p_cn
         anchors = Anchors(rnd)
         spec._rnd = rnd
-        structural = (rnd.random() < float(
-            (pin or {}).get("structural_pos_ratio",
-                (pin or {}).get("structural_p", 0.60))
-        ))
+        structural_ratio = _resolve_structural_ratio(pin_payload)
+        structural = rnd.random() < structural_ratio
         _struct_evs = {"result_slot","tool","role","path","upstream"}
         any_struct_ev = any(e in _struct_evs for e in (spec.evidence or []))
         base_p = float((pin or {}).get("anchor_free_p", 0.85))

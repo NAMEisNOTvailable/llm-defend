@@ -1,4 +1,4 @@
-﻿# extract_and_bank_zh_phrases.py
+# extract_and_bank_zh_phrases.py
 # -*- coding: utf-8 -*-
 import os
 import multiprocessing
@@ -55,7 +55,10 @@ except Exception:
     pass
 
 torch.set_grad_enabled(False)
-torch.set_float32_matmul_precision("high")
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
 
 from dedupe_core import Deduper, get_default_deduper_kwargs
 from micro_grammar import (
@@ -173,8 +176,8 @@ def patched_encode(st_model, *, bs_try=4096):
         is_cuda = torch.cuda.is_available()
 
         env_bs = int(os.environ.get('ENCODE_BS', str(batch_size)))
-        num_workers = int(os.environ.get('ENCODE_WORKERS', '0'))
-        kwargs.setdefault('num_workers', num_workers)
+
+        kwargs.pop('num_workers', None)
         kwargs.setdefault('show_progress_bar', False)
 
         candidates: list[int] = []
@@ -192,30 +195,27 @@ def patched_encode(st_model, *, bs_try=4096):
                 _add(size)
 
         for bs in candidates:
-            ctx = _amp_autocast('cuda' if is_cuda else 'cpu')
             try:
-                with torch.inference_mode():
-                    with ctx:
-                        return orig(
-                            texts,
-                            batch_size=bs,
-                            convert_to_tensor=convert_to_tensor,
-                            normalize_embeddings=normalize_embeddings,
-                            **kwargs,
-                        )
+                with torch.inference_mode(), _amp_autocast('cuda' if is_cuda else 'cpu'):
+                    return orig(
+                        texts,
+                        batch_size=bs,
+                        convert_to_tensor=convert_to_tensor,
+                        normalize_embeddings=normalize_embeddings,
+                        **kwargs,
+                    )
             except RuntimeError:
                 continue
 
         fallback_bs = 128 if is_cuda else min(256, env_bs or 256)
-        with torch.inference_mode():
-            with _amp_autocast('cuda' if is_cuda else 'cpu'):
-                return orig(
-                    texts,
-                    batch_size=fallback_bs,
-                    convert_to_tensor=convert_to_tensor,
-                    normalize_embeddings=normalize_embeddings,
-                    **kwargs,
-                )
+        with torch.inference_mode(), _amp_autocast('cuda' if is_cuda else 'cpu'):
+            return orig(
+                texts,
+                batch_size=fallback_bs,
+                convert_to_tensor=convert_to_tensor,
+                normalize_embeddings=normalize_embeddings,
+                **kwargs,
+            )
 
     st_model.encode = _encode_patched
     try:
@@ -659,33 +659,19 @@ def _amp_autocast(device_hint: Any):
         elif isinstance(device_hint, str):
             device_type = device_hint
         else:
-            dev_attr = getattr(device_hint, 'device', None)
-            if isinstance(dev_attr, torch.device):
-                device_type = dev_attr.type
-            else:
-                device_type = getattr(dev_attr, 'type', None)
+            dev = getattr(device_hint, 'device', None)
+            if isinstance(dev, torch.device):
+                device_type = dev.type
     except Exception:
         device_type = None
+
     if device_type != 'cuda' or not torch.cuda.is_available():
         yield
         return
-    dtype_candidates: list[Any] = []
-    bf16_checker = getattr(torch.cuda, 'is_bf16_supported', None)
-    if callable(bf16_checker):
-        try:
-            if bf16_checker():
-                dtype_candidates.append(torch.bfloat16)
-        except Exception:
-            pass
-    dtype_candidates.append(torch.float16)
-    for dtype in dtype_candidates:
-        try:
-            with torch.autocast(device_type='cuda', dtype=dtype):
-                yield
-                return
-        except Exception:
-            continue
-    yield
+
+    dtype = torch.bfloat16 if getattr(torch.cuda, 'is_bf16_supported', lambda: False)() else torch.float16
+    with torch.autocast(device_type='cuda', dtype=dtype):
+        yield
 
 
 
@@ -868,6 +854,7 @@ def main(args):
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
     st_model = SentenceTransformer("BAAI/bge-small-zh-v1.5", device=device)
+    print(f"[info] model=BAAI/bge-small-zh-v1.5 device={st_model.device}", flush=True)
 
     rebuild_bank_sketches()
     rebuild_bank_embeddings(st_model)
@@ -956,12 +943,12 @@ def main(args):
     if args.kind:
         routing_mode = "manual"
         reps = list(dict.fromkeys(rep for rep, _, _ in clusters))
-        refill_bank(args.kind, reps, max_add=0)
+        refill_bank(args.kind, reps, max_add=None)
         if args.bank_all:
             all_members = []
             for _, members, _ in clusters:
                 all_members.extend(members)
-            refill_bank(args.kind, list(dict.fromkeys(all_members)), max_add=0)
+            refill_bank(args.kind, list(dict.fromkeys(all_members)), max_add=None)
         routing_summary = {
             "kind": args.kind,
             "reps": len(reps),
@@ -982,11 +969,11 @@ def main(args):
 
         for kind, reps in bucketed_reps.items():
             unique_reps = list(dict.fromkeys(reps))
-            refill_bank(kind, unique_reps, max_add=0)
+            refill_bank(kind, unique_reps, max_add=None)
             coverage_inputs.extend(dc.Proto(text=rep, label=kind) for rep in unique_reps)
         if args.bank_all:
             for kind, members in bucketed_members.items():
-                refill_bank(kind, list(dict.fromkeys(members)), max_add=0)
+                refill_bank(kind, list(dict.fromkeys(members)), max_add=None)
 
         routing_summary = {
             "routed_kinds": {kind: len(list(dict.fromkeys(reps))) for kind, reps in bucketed_reps.items()},
@@ -1076,4 +1063,5 @@ if __name__ == "__main__":
     p.add_argument("--bank_snapshot", type=str, default=None,
                    help="Path to write bank snapshot JSON; defaults to per-input name.")
     main(p.parse_args())
+
 

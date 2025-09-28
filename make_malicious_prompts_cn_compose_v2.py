@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 make_malicious_prompts_cn_compose_v2.py
 Purpose // 用途:
@@ -5595,7 +5595,8 @@ def gate_by_contract_from_dsl(contract: TaskContract, dsl: PIDSL, full_text: str
     support = v["format_conflict"] or v["carrier_leak"] or has_semantic_support(full_text)
     return gate_by_contract_only(substantive, support, require_support=require_support), v
 # ------------------ Strategy Registry // 策略注册表 ------------------
-Strategy = callable  # (task_txt, contract) -> AttackPlan
+# Strategy functions accept task text and contract, returning an AttackPlan
+Strategy = Callable[[str, TaskContract], AttackPlan]
 
 def strat_tool_abuse(task_txt, contract) -> AttackPlan:
     mech = "force a specific tool call with hijacked args // 劫持工具参数"
@@ -9171,7 +9172,7 @@ DEFAULTS: Dict[str, Any] = {
     'stack_prob': 0.15,
     'strip_common_boilerplate': True,
     'struct_evidence_rate': 0.15,
-    'structural_p': 0.5,
+    'structural_pos_ratio': 0.5,
     'target_workers': -1,
     'targets_json': None,
     'use_dsl': False,
@@ -9457,7 +9458,7 @@ def main():
                     if SOFT_PARAPHRASE_BANK_DELTA:
                         for delta_key, delta_bag in SOFT_PARAPHRASE_BANK_DELTA.items():
                             try:
-                                refill_bank(delta_key, delta_bag, max_add=0)
+                                refill_bank(delta_key, delta_bag, max_add=None)
                             except Exception as delta_exc:
                                 audit_soft("soft_bank_delta_refill_fail", delta_exc, {"kind": delta_key})
                     try:
@@ -9479,7 +9480,6 @@ def main():
             pin = {
                 **pin,
                 "min_cjk_share": args.min_cjk_share,
-                "structural_p": args.structural_p,
                 "structural_pos_ratio": args.structural_p,
                 "alias_p_cn": args.alias_p_cn,
                 "anchor_free_p": max(args.anchor_free_p, 0.85),
@@ -10959,3 +10959,5 @@ def main():
 if __name__ == "__main__":
     _emit_capability_report()
     main()
+
+

@@ -1271,9 +1271,13 @@ def generate_micro_prototypes(keys: Optional[Iterable[str]] = None,
 
 # ---------------------- bridge to your DSL ----------------------
 
-def refill_bank(kind: str, protos: Iterable[str], *, max_add: int = 400, dsl_core_module=None) -> int:
+def refill_bank(kind: str, protos: Iterable[str], *, max_add: Optional[int] = 400, dsl_core_module=None) -> int:
 
-    """Append new prototypes to SOFT_PARAPHRASE_BANK[kind] in-place."""
+    """Append new prototypes to SOFT_PARAPHRASE_BANK[kind] in-place.
+
+    Args:
+        max_add: None keeps all incoming prototypes; an integer caps additions.
+    """
 
     try:
         dc = dsl_core_module or __import__('dsl_core')
@@ -1294,7 +1298,7 @@ def refill_bank(kind: str, protos: Iterable[str], *, max_add: int = 400, dsl_cor
         bucket.append(txt)
         existed.add(txt)
         added += 1
-        if max_add and added >= max_add:
+        if max_add is not None and added >= max_add:
             break
     return added
 
@@ -1359,7 +1363,7 @@ def attach_to_dsl_core(
         include_neutral=include_neutral,
     )
     for kind, arr in new_protos.items():
-        refill_bank(kind, arr, max_add=0, dsl_core_module=dsl_core_module)
+        refill_bank(kind, arr, max_add=None, dsl_core_module=dsl_core_module)
     try:
         rebuild_soft_check(dsl_core_module)
     except Exception:

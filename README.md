@@ -5,7 +5,7 @@ This repository assembles Chinese prompt-injection datasets with hard negatives,
 | File | Purpose |
 | --- | --- |
 | `make_malicious_prompts_cn_compose_v2.py` | End-to-end CLI: loads corpora (HF datasets or local JSON), synthesises positives/negatives, dedupes, audits, and writes stats. Capability probes cover optional packages (datasets, simhash, faiss, annoy, datasketch, etc.) and print a startup banner. |
-| `extract_and_bank_zh_phrases.py` | KeyBERT + BGE-based candidate miner for Chinese corpora; filters, dedupes, clusters, and feeds phrases back into the DSL soft-evidence banks (with optional manual overrides). |
+| `extract_and_bank_zh_phrases.py` | KeyBERT-style (SentenceTransformer-based) candidate miner for Chinese corpora; filters, dedupes, clusters, and feeds phrases back into the DSL soft-evidence banks (with optional manual overrides). |
 | `dsl_core.py` | DSL that renders injection intents, enforces invariants, and exposes coverage, anchor-free/anchor-required heuristics, soft-evidence checks, and JSON/markdown inspectors. |
 | `dedupe_core.py` | Reusable SimHash + MinHash-LSH + hashed trigram cosine deduper with optional FAISS/Annoy/Numba/xxhash acceleration. Defaults are tuned for Chinese paraphrases and style wrapping. |
 | `micro_grammar.py` | Micro-grammar bank for soft-evidence phrases with deterministic seeding, adaptive slot permutations, DSL style wrapping, and helpers to refill & rebuild DSL banks safely. |
@@ -19,9 +19,10 @@ Use **Python 3.9+ (3.10 recommended)** before creating the virtual environment.
    pip install -r requirements.txt
    ```
    `requirements.txt` groups dependencies by feature set:
-   - Base runtime: `numpy`, `regex`, `pyyaml`.
-   - Optional data sources / DSL helpers: `datasets`, `opencc`, `orjson`.
-   - Soft-evidence extraction + banking: `jieba`, `scikit-learn`, `keybert`, `sentence-transformers`, `torch`. Install this block when you run `extract_and_bank_zh_phrases.py`; comment the lines out if you only need the composer.
+   - Core runtime: `numpy`, `regex`.
+   - Optional helpers detected at runtime: `orjson`, `datasets`, `opencc`.
+   - Optional dedupe / ANN accelerators: `simhash`, `datasketch`, `annoy`, `numba`, `xxhash`, `faiss-cpu` (Linux/macOS).
+   - Soft-evidence extraction + banking: `jieba` (install `jieba-fast` as a drop-in accelerator when wheels are available), `sentence-transformers`, `scikit-learn`, `torch`. Install this block when you run `extract_and_bank_zh_phrases.py`; comment the lines out if you only need the composer.
 3. (Recommended) Install accelerators for dedupe/audit hot paths:
    ```bash
    pip install simhash datasketch annoy xxhash numba
@@ -39,7 +40,7 @@ GPU users should match the `torch` wheel to their CUDA runtime (or stay on CPU b
 
 Pipeline highlights:
 - Pre-warms and optionally hydrates micro-grammars so the DSL's soft-evidence buckets contain fresh prototypes before scoring.
-- Uses KeyBERT (with `BAAI/bge-small-zh-v1.5` embeddings) to surface multi-token Chinese phrases while enforcing a CJK share floor.
+- Uses a KeyBERT-style extractor (SentenceTransformer `BAAI/bge-small-zh-v1.5` embeddings) to surface multi-token Chinese phrases while enforcing a CJK share floor.
 - Keeps only action-like phrases that clear the `_softish_score` gate, then applies the shared `Deduper` for SimHash + MinHash + cosine filtering.
 - Clusters surviving phrases with SentenceTransformer community detection and auto-routes each cluster to the highest priority soft-evidence kind (or a `--kind` override).
 - Optionally re-banks every cluster member (`--bank_all`) and emits coverage probes via `dsl_core.probe_soft_coverage`.
@@ -75,7 +76,7 @@ Outputs:
 - `data_stats.json` - aggregated audits (symmetry, anchor-free ratios, semantic neighbour percentiles, leakage scores).
 
 Key toggles:
-- `--use_dsl`, `--coverage_min_per_combo`, `--structural_p`, `--anchor_free_p` control DSL rendering and coverage.
+- `--use_dsl`, `--coverage_min_per_combo`, `--structural_p`, `--anchor_free_p` control DSL rendering and coverage. (When passing pin overrides directly, prefer the `structural_pos_ratio` key; using `structural_p` emits a deprecation warning.)
 - `--soft_hint_rate`, `--alias_p_cn`, `--tail_mix_p` drive soft-evidence injection and style wrapping.
 - `--simhash_bits`, `--simhash_thresh`, `--minhash_n`, `--minhash_bands`, `--jaccard_thresh` tune dedup thresholds.
 - `--targets_json` lets you supply local corpora when HF datasets are unavailable; `_HAS_HF_DATASETS` controls which adapters run.
@@ -113,7 +114,7 @@ from dsl_core import generate_batch
 samples, coverage = generate_batch(
     n=1000,
     seed=42,
-    pin={"min_cjk_share": 0.65, "structural_p": 0.55},
+    pin={"min_cjk_share": 0.65, "structural_pos_ratio": 0.55},
     coverage_axes=("strategy","channel","carrier","delivery"),
     min_per_combo=2,
 )
@@ -124,3 +125,4 @@ Coverage stats help you enforce anchor-free ratios, mechanism variety, and struc
 - Capability logging and auditing utilities surface any fallback paths (regex failures, DSL gaps, dedupe skips).
 - HF datasets are probed lazily; when unavailable, adapters fall back to local JSON sources.
 - Tests are limited to compile-time checks; integrate additional CI or data validation as needed.
+
