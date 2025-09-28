@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Stable RNG helpers shared across data generation modules."""
 from __future__ import annotations
 
