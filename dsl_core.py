@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Tuple, Optional, Callable, Any, Iterable, Protocol
 import random, json, re, math, base64, urllib.parse
+from stable_random import stable_rng
 import codecs
 import numpy as np
 
@@ -1766,7 +1767,7 @@ def probe_soft_coverage(
     seed: int = 2025,
     topk_show: int = 6,
 ) -> Dict[str, Any]:
-    rng = random.Random(seed)
+    rng = stable_rng("dsl_core", "probe_soft_coverage", seed)
     protos = list(protos)
     rng.shuffle(protos)
     per_label: Dict[str, Counter] = defaultdict(Counter)
@@ -1827,7 +1828,7 @@ def _anchor_free_spec(evidence: List[str], min_cjk: float = 0.60, soft_min: int 
 
 
 def render_anchor_free_context(proto: str, rng: Optional[random.Random] = None) -> str:
-    rnd = rng or random.Random()
+    rnd = rng or stable_rng("dsl_core", "anchor_context", proto[:24])
     ctx = cn_sentence(rnd)
     return "{0}\n{1}".format(ctx, proto)
 
@@ -1836,7 +1837,7 @@ def check_af_once(
     soft_min: int = 3,
     seed: int = 2025,
 ) -> Tuple[bool, List[str], str, bool, Set[str]]:
-    rng = random.Random(seed)
+    rng = stable_rng("dsl_core", "check_af_once", seed)
     spec = _anchor_free_spec(case.evidence, min_cjk=0.60, soft_min=soft_min)
     txt = render_anchor_free_context(case.proto, rng)
     stripped = strip_anchors(txt)
@@ -1893,7 +1894,7 @@ def batch_af_probe(
                     bucket["pass_after_hints"] += 1
         else:
             stats_global["negative_cases"] += 1
-            local_rng = random.Random(local_seed)
+            local_rng = stable_rng("dsl_core", "local_anchor", local_seed)
             ctx = render_anchor_free_context(case.proto, local_rng)
             stripped = strip_anchors(ctx)
             hits = soft_evidence_kinds(stripped)
@@ -2089,7 +2090,7 @@ class AttackSpec:
     persona: str = "qa_reviewer"
 
 def sample_spec(seed=None, pin: Optional[Dict]=None) -> AttackSpec:
-    rnd = random.Random(seed)
+    rnd = stable_rng("dsl_core", "render_anchor", seed)
     pin = pin or {}
     carrier_blacklist = set(pin.get("carrier_blacklist") or [])
     s = pin.get("strategy") or rnd.choice(STRATEGIES)
@@ -3438,7 +3439,7 @@ def generate_batch(
     - 中文：迭代采样规格、渲染载体、封装交付、在无锚模式下去锚，校验不变量，并
       执行覆盖配额与近重复过滤。
     """
-    rnd = random.Random(seed)
+    rnd = stable_rng("dsl_core", "apply_style_seed", seed)
     out, coverage = [], {}
     seen_signatures: Set[str] = set()
     by_combo = defaultdict(int)

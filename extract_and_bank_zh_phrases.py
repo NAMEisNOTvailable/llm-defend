@@ -23,16 +23,54 @@ try:
 except Exception:
     pass
 
-print(f"[info] 自适应线程数: {_n_cores}")
 
-import json, re, gc, math, argparse, random
+import json, re, gc, math, argparse, random, hashlib, inspect
+from contextlib import contextmanager
+try:
+    from stable_random import random_module_binding as _seed_ctx
+except Exception:
+
+    @contextmanager
+    def _seed_ctx(tag, seed):
+        import random
+        try:
+            import numpy as np
+        except Exception:
+            np = None
+        state_py = random.getstate()
+        np_state = None
+        if np is not None:
+            try:
+                np_state = np.random.get_state()
+            except Exception:
+                np_state = None
+        random.seed(seed)
+        if np is not None:
+            try:
+                np.random.seed(seed % (2**32 - 1))
+            except Exception:
+                pass
+        try:
+            import torch as _torch_seed
+            _torch_seed.manual_seed(seed)
+        except Exception:
+            pass
+        try:
+            yield
+        finally:
+            random.setstate(state_py)
+            if np is not None and np_state is not None:
+                try:
+                    np.random.set_state(np_state)
+                except Exception:
+                    pass
 import pickle
 import gzip
-from contextlib import nullcontext, contextmanager
 from functools import lru_cache
 from pathlib import Path
 from collections import defaultdict
 from typing import Optional, Iterable, List, Any, Dict
+from threading import Lock
 
 try:
     import jieba_fast as jieba
@@ -45,6 +83,26 @@ except Exception:
     import jieba.posseg as pseg
 
 from sklearn.feature_extraction.text import CountVectorizer
+
+_JIEBA_READY = False
+_JIEBA_INIT_LOCK = Lock()
+
+
+def _ensure_jieba_initialized() -> None:
+    global _JIEBA_READY
+    if _JIEBA_READY:
+        return
+    with _JIEBA_INIT_LOCK:
+        if _JIEBA_READY:
+            return
+        try:
+            initializer = getattr(jieba, "initialize", None)
+            if callable(initializer):
+                initializer()
+        except Exception:
+            pass
+        _JIEBA_READY = True
+
 
 from sentence_transformers import SentenceTransformer, util
 
@@ -69,16 +127,25 @@ from micro_grammar import (
 )
 import dsl_core as dc
 
+# --- Performance knobs (auto-tuned in main) ---
+AMP_ENABLED: bool = True
+ENCODE_NUM_WORKERS: int = 0
+GPU_RESERVE_BYTES: int = 6 * 1024**3
+CPU_MEM_RESERVE_PCT: float = 0.20
+CAND_CHUNK_MAX_CAP: int | None = None
+ALLOW_EXTERNAL_CACHE: bool = False
+
+
 SOFT_HINT_TOKENS = (
     "请只", "务必", "不超过", "控制在", "最后一句", "末尾", "结尾", "尾部", "追加", "附上", "补充",
-    "忽略", "不参考", "上文", "先前", "系统信息", "路径", "目录", "写入", "保存", "落盘",
-    "调用", "函数", "工具", "参数", "args", "score", "分数", "置信", "概率", "得分", "评分",
-    "系统通道", "system 角色", "管理端", "审定通道", "记忆", "状态", "回合", "继续", "下一轮",
-    "一句话", "单行", "保持", "仅"
+    "忽略", "不参考", "上文", "先前", "系统信息", "路径", "目录", "写入", "保存", "落盘", "调用",
+    "函数", "工具", "参数", "args", "score", "分数", "置信", "概率", "得分", "评分", "系统通道",
+    "system 角色", "管理端", "审定通道", "记忆", "状态", "回合", "继续", "下一轮", "一句话", "单行", "保持",
+    "仅"
 )
 
 ACTIONISH_POS_TAGS = {
-    "v", "vd", "vn", "vshi", "vyou", "vf", "vx", "vi", "vl", "vg", "f"
+    "v", "vd", "vn", "vshi", "vyou", "vf", "vx", "vi", "vl", "vg",
 }
 
 CJK_CODE_RANGES = (
@@ -97,12 +164,38 @@ CJK_CODE_RANGES = (
 
 
 
+_PUNCT_ONLY = re.compile(r'^[\W_]+$', re.UNICODE)
+STOPWORDS = {"然后", "那么", "其实", "就是", "以及", "关于", "如果", "需要", "由于", "因此", "此外", "同时", "可以", "进行", "有关", "问题", "情况", "方面", "不会", "不是", "没有", "为了", "这个", "那个"}
+
+NUMERIC_MEASURE_RX = re.compile(
+    r'^\d+(?:\.\d+)?(?:[~\-–—]\d+(?:\.\d+)?)?[\u4e00-\u9fff]{1,4}$'
+)
+
+
+
+
 def _is_cjk_char(ch: str) -> bool:
     code = ord(ch)
     for start, end in CJK_CODE_RANGES:
         if start <= code <= end:
             return True
     return False
+
+
+def _keep_phrase(s: str) -> bool:
+    s2 = re.sub(r'\s+', '', s or '')
+    if len(s2) < 2 or len(s2) > 24:
+        return False
+    if _PUNCT_ONLY.fullmatch(s2):
+        return False
+    if not NUMERIC_MEASURE_RX.fullmatch(s2) and s2.isdigit():
+        return False
+    cjk = sum(1 for ch in s2 if _is_cjk_char(ch))
+    if (cjk / max(1, len(s2))) < 0.4:
+        return False
+    if s2 in STOPWORDS:
+        return False
+    return True
 
 
 def _softish_score(text: str) -> float:
@@ -125,7 +218,7 @@ def _softish_score(text: str) -> float:
             except Exception:
                 continue
         if hits > 0:
-            return 1.0 + 0.1 * min(4, hits)  # >1 indicates strong semantic evidence via bank matches / >1 指强语义证据
+            return 1.0 + 0.1 * min(4, hits)  # >1 indicates strong semantic evidence via bank matches / >1 表示强语义证据
     except Exception:
         pass
     return 0.0
@@ -147,6 +240,7 @@ def _has_actionish_pos(text: str) -> bool:
 
 def build_vectorizer(ngram=(2,4), stopwords=None, analyzer="char_wb", use_jieba=False):
     if use_jieba:
+        _ensure_jieba_initialized()
         def tokenize_zh(text: str):
             return jieba.lcut(text or "")
         return CountVectorizer(tokenizer=tokenize_zh,
@@ -172,13 +266,29 @@ def patched_encode(st_model, *, bs_try=4096):
     ):
         import os
         torch.set_grad_enabled(False)
-        torch.set_float32_matmul_precision('high')
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+
         is_cuda = torch.cuda.is_available()
+        raw_env = os.environ.get('ENCODE_BS')
+        try:
+            env_bs = int(raw_env) if (raw_env is not None) else int(batch_size)
+        except Exception:
+            env_bs = int(batch_size)
 
-        env_bs = int(os.environ.get('ENCODE_BS', str(batch_size)))
+        try:
+            sig = inspect.signature(orig)
+            params = set(sig.parameters.keys())
+        except Exception:
+            params = set()
 
-        kwargs.pop('num_workers', None)
+        if 'num_workers' in params:
+            kwargs['num_workers'] = max(0, int(ENCODE_NUM_WORKERS))
         kwargs.setdefault('show_progress_bar', False)
+        if 'device' in params:
+            kwargs.setdefault('device', st_model.device)
 
         candidates: list[int] = []
 
@@ -187,11 +297,11 @@ def patched_encode(st_model, *, bs_try=4096):
                 candidates.append(size)
 
         if is_cuda:
-            for size in (env_bs, 6144, 4096, 3072, 2048, 1536, 1024, 768, 512, 256):
+            for size in (env_bs, 8192, 6144, 4096, 3072, 2048, 1536, 1024, 768, 512, 256):
                 _add(size)
         else:
             cpu_seed = env_bs if isinstance(env_bs, int) and env_bs > 0 else 256
-            for size in (min(cpu_seed, 512), 256):
+            for size in (min(cpu_seed, 512), 256, 128):
                 _add(size)
 
         for bs in candidates:
@@ -204,9 +314,18 @@ def patched_encode(st_model, *, bs_try=4096):
                         normalize_embeddings=normalize_embeddings,
                         **kwargs,
                     )
-            except RuntimeError:
+            except (RuntimeError, TypeError, ValueError) as exc:
+                msg = str(exc)
+                if 'additional keyword arguments' in msg or 'got an unexpected keyword argument' in msg:
+                    m = re.search(r"\[(.*?)\]", msg)
+                    unknowns: list[str] = []
+                    if m:
+                        unknowns = [t.strip().strip("'\"") for t in m.group(1).split(',') if t.strip()]
+                    for k in (unknowns or ['num_workers', 'device', 'show_progress_bar']):
+                        if k in kwargs:
+                            kwargs.pop(k, None)
+                    continue
                 continue
-
         fallback_bs = 128 if is_cuda else min(256, env_bs or 256)
         with torch.inference_mode(), _amp_autocast('cuda' if is_cuda else 'cpu'):
             return orig(
@@ -222,7 +341,6 @@ def patched_encode(st_model, *, bs_try=4096):
         yield st_model
     finally:
         st_model.encode = orig
-
 
 def encode_gpu(
     st_model,
@@ -272,12 +390,13 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
         w = [re.sub(r"\s+", "", t) for t in an_word(doc)]
         c = [re.sub(r"\s+", "", t) for t in an_char(doc)]
         w = list(dict.fromkeys([t for t in w if t]))
+        w = [t for t in w if _keep_phrase(t)]
         c = list(dict.fromkeys([t for t in c if t]))
+        c = [t for t in c if _keep_phrase(t)]
         if not c:
             c_plain = [re.sub(r"\s+", "", t) for t in an_char_plain(doc)]
             c = list(dict.fromkeys([t for t in c_plain if t]))
-        if not c:
-            c = list(dict.fromkeys([tok for tok in doc if tok and not tok.isspace()]))
+            c = [t for t in c if _keep_phrase(t)]
 
         start_idx = len(flat_cands)
         flat_cands.extend(list(dict.fromkeys(w + c)))
@@ -291,8 +410,13 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
     target_device = getattr(st_model, "device", torch.device("cpu"))
     print(f"[stage] encode docs on {st_model.device} | n={len(docs)}", flush=True)
     doc_embs = encode_gpu(st_model, docs, bs_try=4096) if docs else torch.empty((0,), device=target_device)
+    if doc_embs.numel() and doc_embs.device != target_device:
+        try:
+            doc_embs = doc_embs.to(target_device)
+        except Exception:
+            pass
     embedding_dim = _infer_embedding_dim(st_model, doc_embs if doc_embs.numel() else None)
-    bytes_per_value = doc_embs.element_size() if hasattr(doc_embs, 'element_size') and doc_embs.numel() else 4
+    bytes_per_value = doc_embs.element_size() if hasattr(doc_embs, "element_size") and doc_embs.numel() else 4
     approx_bytes_per_vec = max(1, embedding_dim) * max(1, bytes_per_value)
 
     def mmr_select(doc_vec, cand_vecs, cand_texts, k, div):
@@ -316,7 +440,7 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
 
     word_candidates: list[str] = []
     char_candidates: list[str] = []
-    TOP_HARD = min(top_n, 15)
+    TOP_HARD = max(1, top_n)
 
     total_docs = len(docs)
     processed = [False] * total_docs
@@ -327,23 +451,58 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
 
     total_cands = len(flat_cands)
     if total_cands:
-        chunk_size = 200_000
-        if torch.cuda.is_available():
-            try:
-                free_mem, _ = torch.cuda.mem_get_info()
-                headroom = free_mem - 6 * 1024**3
-                if headroom > 0 and approx_bytes_per_vec > 0:
-                    budget = max(2, headroom // approx_bytes_per_vec)
-                    chunk_size = min(chunk_size, int(budget))
-            except Exception:
-                pass
-        chunk_size = max(10_000, min(chunk_size, total_cands))
+        # initial large cap; refine based on available resources
+        chunk_size = 800_000
+        chunk_budget_source = None
+        is_cuda = torch.cuda.is_available()
+        cap = CAND_CHUNK_MAX_CAP if CAND_CHUNK_MAX_CAP is not None else (20000 if is_cuda else 10000)
+
+        def _memory_budget() -> tuple[Optional[int], Optional[str]]:
+            if approx_bytes_per_vec <= 0:
+                return None, None
+            if is_cuda:
+                try:
+                    free_mem, _ = torch.cuda.mem_get_info()
+                    headroom = max(0, int(free_mem) - int(GPU_RESERVE_BYTES))
+                    if headroom > 0:
+                        return max(2, headroom // approx_bytes_per_vec), 'cuda'
+                except Exception:
+                    pass
+            else:
+                try:
+                    import psutil
+                    mem = psutil.virtual_memory()
+                    reserve = max(384 * 1024**2, int(CPU_MEM_RESERVE_PCT * mem.total))
+                    headroom = max(0, mem.available - reserve)
+                    if headroom > 0:
+                        return max(2, headroom // approx_bytes_per_vec), 'cpu'
+                except Exception:
+                    pass
+            return None, None
+
+        def _rebudget_chunk(desired: int, current: int) -> tuple[int, str]:
+            desired = max(1, min(int(desired), total_cands))
+            desired = min(desired, cap)
+            budget, source = _memory_budget()
+            if budget is not None:
+                desired = min(desired, budget)
+            if desired < current:
+                return current, 'prev'
+            return desired, (source or 'cap')
+
+        chunk_size, chunk_budget_source = _rebudget_chunk(chunk_size, 1)
+        print(f"[perf] candidate encode chunk_size={chunk_size} source={chunk_budget_source}", flush=True)
+
         chunk_start = 0
         while chunk_start < total_cands:
             chunk_end = min(chunk_start + chunk_size, total_cands)
             cand_slice = flat_cands[chunk_start:chunk_end]
             print(f"[stage] encode candidates chunk [{chunk_start}:{chunk_end}) on {st_model.device}", flush=True)
             cand_embs_chunk = encode_gpu(st_model, cand_slice, bs_try=4096)
+            if doc_embs.device.type != cand_embs_chunk.device.type:
+                cand_embs_chunk = cand_embs_chunk.to(doc_embs.device)
+                if cand_embs_chunk.device.type == "cpu" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             processed_all = True
             while pos < total_docs:
                 ds, de = offsets[pos]
@@ -362,13 +521,16 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
                     break
                 local_vecs = cand_embs_chunk[ds - chunk_start:de - chunk_start]
                 local_texts = flat_cands[ds:de]
+                doc_vec = doc_embs[pos:pos + 1]
+                if doc_vec.device != local_vecs.device:
+                    doc_vec = doc_vec.to(local_vecs.device)
                 if use_mmr:
-                    picked = mmr_select(doc_embs[pos:pos + 1], local_vecs, local_texts, TOP_HARD, diversity)
+                    picked = mmr_select(doc_vec, local_vecs, local_texts, TOP_HARD, diversity)
                 else:
-                    ctx = _amp_autocast(doc_embs)
+                    ctx = _amp_autocast(doc_vec)
                     with torch.inference_mode():
                         with ctx:
-                            sims = util.cos_sim(doc_embs[pos:pos + 1], local_vecs)[0]
+                            sims = util.cos_sim(doc_vec, local_vecs)[0]
                             topk = torch.topk(sims, k=min(TOP_HARD, len(local_texts))).indices.tolist()
                     picked = [local_texts[j] for j in topk]
                 for p in picked:
@@ -383,8 +545,14 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
                 torch.cuda.empty_cache()
             if not processed_all and pos < total_docs:
                 ds_pending, de_pending = offsets[pos]
+                # 如该文档跨度很大，尝试放大 chunk
                 if de_pending - ds_pending > chunk_size:
-                    chunk_size = max(10_000, min(total_cands, de_pending - ds_pending))
+                    new_chunk_size, new_source = _rebudget_chunk(de_pending - ds_pending, chunk_size)
+                    if new_chunk_size != chunk_size:
+                        print(f"[perf] rebudget chunk_size={new_chunk_size} (pending={de_pending - ds_pending}) source={new_source}", flush=True)
+                        chunk_size = new_chunk_size
+                        chunk_budget_source = new_source
+                # 关键：下一轮从这个文档真正的起点开始，避免跳过
                 chunk_start = ds_pending
             else:
                 chunk_start = chunk_end
@@ -403,13 +571,20 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
             continue
         local_texts = flat_cands[ds:de]
         local_vecs = encode_gpu(st_model, local_texts, bs_try=4096)
+        if doc_embs.device.type != local_vecs.device.type:
+            local_vecs = local_vecs.to(doc_embs.device)
+            if local_vecs.device.type == "cpu" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        doc_vec = doc_embs[idx:idx + 1]
+        if doc_vec.device != local_vecs.device:
+            doc_vec = doc_vec.to(local_vecs.device)
         if use_mmr:
-            picked = mmr_select(doc_embs[idx:idx + 1], local_vecs, local_texts, TOP_HARD, diversity)
+            picked = mmr_select(doc_vec, local_vecs, local_texts, TOP_HARD, diversity)
         else:
-            ctx = _amp_autocast(doc_embs)
+            ctx = _amp_autocast(doc_vec)
             with torch.inference_mode():
                 with ctx:
-                    sims = util.cos_sim(doc_embs[idx:idx + 1], local_vecs)[0]
+                    sims = util.cos_sim(doc_vec, local_vecs)[0]
                     topk = torch.topk(sims, k=min(TOP_HARD, len(local_texts))).indices.tolist()
             picked = [local_texts[j] for j in topk]
         for p in picked:
@@ -452,31 +627,30 @@ def cluster_by_semantics(phrases, st_model, thr=0.85, min_size=2, precomputed_em
         return []
 
     embs = precomputed_embs if precomputed_embs is not None else encode_gpu(st_model, phrases)
+    embs_cpu = embs.detach().to('cpu') if isinstance(embs, torch.Tensor) else embs
+    if not isinstance(embs_cpu, torch.Tensor):
+        embs_cpu = torch.as_tensor(embs_cpu)
 
     with torch.inference_mode():
-        ctx = _amp_autocast(embs)
-        with ctx:
-            clusters = util.community_detection(embs, threshold=thr, min_community_size=min_size)
+        clusters = util.community_detection(embs_cpu, threshold=thr, min_community_size=min_size)
 
     results = []
     with torch.inference_mode():
-        ctx = _amp_autocast(embs)
-        with ctx:
-            for idxs in clusters:
-                members = [phrases[i] for i in idxs]
-                sub = embs[idxs].float()
-                sim = util.cos_sim(sub, sub).mean(dim=1)
-                rep_idx = int(sim.argmax())
-                rep = members[rep_idx]
-                rep_vec = sub[rep_idx].clone()
-                results.append((rep, members, rep_vec))
+        for idxs in clusters:
+            members = [phrases[i] for i in idxs]
+            sub = embs_cpu[idxs].float()
+            sim = util.cos_sim(sub, sub).mean(dim=1)
+            rep_idx = int(sim.argmax())
+            rep = members[rep_idx]
+            rep_vec = sub[rep_idx].clone()
+            results.append((rep, members, rep_vec))
 
     if min_size > 1:
         clustered = set(i for c in clusters for i in c)
         for i, ph in enumerate(phrases):
             if i not in clustered:
-                results.append((ph, [ph], embs[i].float().clone()))
-    del embs
+                results.append((ph, [ph], embs_cpu[i].float().clone()))
+    del embs, embs_cpu
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -496,8 +670,8 @@ _PRIORITY_RANK = {k: i for i, k in enumerate(PRIORITY)}
 HYDRATE_DEFAULT_KEYS = ["result_slot", "contract_soft", "routing_bias", "merge_directive"]
 PREWARM_DEFAULT_KEYS = PRIORITY
 KEYBERT_MAX_DOC_CHARS = 768
-SOFT_GATE_VERB_FALLBACK = 0.30
-MIN_BANK_SIM = 0.42
+SOFT_GATE_VERB_FALLBACK = 0.45
+MIN_BANK_SIM = 0.57
 BANK_SKETCHES: dict[str, list] = {}
 BANK_EMBS: dict[str, torch.Tensor] = {}
 CAND_CACHE = "chk_candidates.json"
@@ -519,11 +693,12 @@ def _safe_cache_path(path_str: Optional[str]) -> Optional[Path]:
         resolved = resolved.resolve()
     except Exception:
         return None
-    try:
-        resolved.relative_to(TRUSTED_CACHE_ROOT)
-    except ValueError:
-        print(f"[cache][skip] {resolved} is outside trusted root {TRUSTED_CACHE_ROOT}; ignoring.", flush=True)
-        return None
+    if not ALLOW_EXTERNAL_CACHE:
+        try:
+            resolved.relative_to(TRUSTED_CACHE_ROOT)
+        except ValueError:
+            print(f"[cache][skip] {resolved} is outside trusted root {TRUSTED_CACHE_ROOT}; ignoring.", flush=True)
+            return None
     return resolved
 
 
@@ -640,6 +815,15 @@ def _model_signature(st_model) -> str:
 
 
 
+def _list_fingerprint(lst: list[str]) -> str:
+    h = hashlib.sha1()
+    items = [s if isinstance(s, str) else str(s) for s in lst]
+    for entry in sorted(items):
+        h.update(entry.encode('utf-8', 'ignore'))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 def _embedding_cache_meta(st_model, *, normalize_embeddings: bool, emb_tensor: Optional[torch.Tensor] = None) -> Dict[str, Any]:
     return {
         'model': _model_signature(st_model),
@@ -650,6 +834,9 @@ def _embedding_cache_meta(st_model, *, normalize_embeddings: bool, emb_tensor: O
 
 @contextmanager
 def _amp_autocast(device_hint: Any):
+    if not AMP_ENABLED:
+        yield
+        return
     device_type = None
     try:
         if isinstance(device_hint, torch.Tensor):
@@ -664,11 +851,9 @@ def _amp_autocast(device_hint: Any):
                 device_type = dev.type
     except Exception:
         device_type = None
-
     if device_type != 'cuda' or not torch.cuda.is_available():
         yield
         return
-
     dtype = torch.bfloat16 if getattr(torch.cuda, 'is_bf16_supported', lambda: False)() else torch.float16
     with torch.autocast(device_type='cuda', dtype=dtype):
         yield
@@ -772,9 +957,13 @@ def _auto_route_kind_once(phrase: str) -> Optional[str]:
     if not kinds:
         return None
     ordered = _prioritize_kinds(kinds)
+    if not ordered:
+        return None
     if len(ordered) > 1:
         return best_kind_by_bank_sim(phrase, ordered)
-    return ordered[0]
+    single_kind = ordered[0]
+    routed = best_kind_by_bank_sim(phrase, [single_kind])
+    return routed
 
 
 def auto_route_kind(phrase: str) -> Optional[str]:
@@ -805,31 +994,78 @@ def label_cluster(rep: str, members: list[str], rep_emb: torch.Tensor) -> Option
         return tied[0]
     return best_kind_by_bank_sim_gpu(rep, rep_emb, tied)
 
-def main(args):
+def _main_impl(args):
     kind_override = (args.kind or "").strip() or None
     if kind_override and kind_override.lower() == "auto":
         kind_override = None
     args.kind = kind_override
 
-    random.seed(args.seed)
+    # --- set perf knobs from args ---
+    global AMP_ENABLED, ENCODE_NUM_WORKERS, GPU_RESERVE_BYTES
+    global CPU_MEM_RESERVE_PCT, CAND_CHUNK_MAX_CAP, ALLOW_EXTERNAL_CACHE
+
+    AMP_ENABLED = not args.no_amp
+    ALLOW_EXTERNAL_CACHE = bool(args.allow_external_cache)
+
+    try:
+        import psutil
+        n_cores = psutil.cpu_count(logical=True) or os.cpu_count() or 4
+    except Exception:
+        n_cores = os.cpu_count() or 4
+
+    reserve_cores = max(int(args.cpu_core_reserve), int(math.ceil(0.10 * n_cores)))
+    use_cores = max(1, n_cores - reserve_cores)
+    try:
+        torch.set_num_threads(use_cores)
+        torch.set_num_interop_threads(max(1, use_cores // 2))
+    except Exception:
+        pass
+    for _env_key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[_env_key] = str(use_cores)
+
+    print(f"[perf] final threads: num_threads={use_cores}, interop={max(1, use_cores // 2)}", flush=True)
+
+    def _auto_encode_workers_from_system():
+        try:
+            import psutil
+            cores = psutil.cpu_count(logical=True) or os.cpu_count() or 4
+            keep_idle = max(args.cpu_core_reserve, int(math.ceil(0.20 * cores)))
+            return max(0, min(8, cores - keep_idle))
+        except Exception:
+            cores = os.cpu_count() or 4
+            return max(0, min(4, cores - args.cpu_core_reserve))
+
+    if isinstance(args.encode_workers, str) and args.encode_workers.lower() == "auto":
+        ENCODE_NUM_WORKERS = _auto_encode_workers_from_system()
+    else:
+        try:
+            ENCODE_NUM_WORKERS = max(0, int(args.encode_workers))
+        except Exception:
+            ENCODE_NUM_WORKERS = 0
+
+    GPU_RESERVE_BYTES = int(max(0.5, float(args.gpu_mem_reserve_gb)) * (1024 ** 3))
+    CPU_MEM_RESERVE_PCT = float(args.cpu_mem_reserve_pct)
+    CAND_CHUNK_MAX_CAP = int(args.cand_chunk_max) if args.cand_chunk_max is not None else None
+
+    print(f"[perf] cpu cores={n_cores}, use={use_cores}, encode_workers={ENCODE_NUM_WORKERS}", flush=True)
+    print(f"[perf] gpu reserve={GPU_RESERVE_BYTES/(1024**3):.1f}GB, ram reserve={CPU_MEM_RESERVE_PCT*100:.0f}%, chunk_cap={CAND_CHUNK_MAX_CAP}", flush=True)
+
     base = os.path.splitext(os.path.basename(args.input or ""))[0] or "input"
     global CAND_CACHE, PH_EMB_CACHE, BANK_SNAPSHOT
     CAND_CACHE = args.cand_cache or f"chk_candidates_{base}.pkl"
     PH_EMB_CACHE = args.emb_cache or f"chk_phrase_emb_{base}.pt"
     BANK_SNAPSHOT = args.bank_snapshot or f"bank_snapshot_{base}.json"
 
-    prewarm_stats = None
-    if not args.skip_prewarm_microgrammars:
-        prewarm_keys = PREWARM_DEFAULT_KEYS
-        if args.prewarm_keys:
-            prewarm_keys = [k.strip() for k in args.prewarm_keys.split(",") if k.strip()]
-        prewarm_stats = attach_to_dsl_core(
-            dc,
-            keys=prewarm_keys,
-            per_kind=args.prewarm_per_kind,
-            seed=args.prewarm_seed,
-            dedupe=not args.prewarm_allow_dupes,
-        )
+    prewarm_keys = PREWARM_DEFAULT_KEYS
+    if args.prewarm_keys:
+        prewarm_keys = [k.strip() for k in args.prewarm_keys.split(",") if k.strip()]
+    prewarm_stats = attach_to_dsl_core(
+        dc,
+        keys=prewarm_keys,
+        per_kind=args.prewarm_per_kind,
+        seed=args.prewarm_seed,
+        dedupe=not args.prewarm_allow_dupes,
+    )
 
     hydration_stats = None
     if args.hydrate_microgrammars:
@@ -844,17 +1080,37 @@ def main(args):
         )
         rebuild_bank_sketches()
     docs_raw = read_lines(args.input)
+    def chunk_cn(text: str, size=KEYBERT_MAX_DOC_CHARS, stride=None):
+        s = (text or "").strip()
+        if not s:
+            return []
+        if stride is None:
+            stride = max(128, size // 2)
+        stride = max(1, stride)
+        out: list[str] = []
+        idx = 0
+        while idx < len(s):
+            seg = s[idx:idx + size]
+            if not seg:
+                break
+            out.append(seg)
+            if idx + size >= len(s):
+                break
+            idx += stride
+        return out
+
     docs = []
     for doc in docs_raw:
         stripped = dc.strip_anchors(doc)
-        if stripped:
-            if len(stripped) > KEYBERT_MAX_DOC_CHARS:
-                stripped = stripped[:KEYBERT_MAX_DOC_CHARS]
-            docs.append(stripped)
+        if not stripped:
+            continue
+        for seg in chunk_cn(stripped, size=KEYBERT_MAX_DOC_CHARS, stride=KEYBERT_MAX_DOC_CHARS // 2):
+            docs.append(seg)
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-    st_model = SentenceTransformer("BAAI/bge-small-zh-v1.5", device=device)
-    print(f"[info] model=BAAI/bge-small-zh-v1.5 device={st_model.device}", flush=True)
+    st_model = SentenceTransformer("BAAI/bge-large-zh-v1.5", device=device)
+    st_model.eval()
+    print(f"[info] model=BAAI/bge-large-zh-v1.5 device={st_model.device}", flush=True)
 
     rebuild_bank_sketches()
     rebuild_bank_embeddings(st_model)
@@ -880,7 +1136,10 @@ def main(args):
             min_cjk=args.min_cjk,
         )
         _save_candidate_cache(CAND_CACHE, cand_raw, cand_word, cand_char)
-    cand_after_pos = cand_word
+    cand_word_filtered = cand_word
+
+    # Refresh soft-evidence checks so hydrated banks influence gating early.
+    rebuild_soft_check()
 
     combined_candidates = cand_word + cand_char
 
@@ -895,40 +1154,69 @@ def main(args):
     # 在 strong_dedupe 之前
     cand_after_gate = list(dict.fromkeys(cand_after_gate))
 
+    phrase_embs = None
+    vec_dim = _infer_embedding_dim(st_model, phrase_embs if isinstance(phrase_embs, torch.Tensor) else None)
     cand = strong_dedupe(cand_after_gate,
                          simhash_bits=64, simhash_thresh=1,
                          k=5, n_hash=64, bands=16, jaccard_thresh=0.90,
-                         vec_dim=1024, cosine_thresh=0.92)
+                         vec_dim=vec_dim, cosine_thresh=0.92)
 
     phrases_for_cluster = cand
-    phrase_embs = None
+    phrases_fp = _list_fingerprint(phrases_for_cluster)
     expected_meta = _embedding_cache_meta(st_model, normalize_embeddings=True)
-    if os.path.exists(PH_EMB_CACHE):
+    emb_path = _safe_cache_path(PH_EMB_CACHE)
+    if emb_path and emb_path.exists():
         try:
-            data = torch.load(PH_EMB_CACHE, map_location=st_model.device)
+            data = torch.load(emb_path, map_location=st_model.device)
             meta = data.get('meta') if isinstance(data, dict) else None
             cached_phrases = data.get('phrases') if isinstance(data, dict) else None
             cached_embs = data.get('embs') if isinstance(data, dict) else None
-            if meta and isinstance(meta, dict) and meta.get('model') == expected_meta['model'] and int(meta.get('dim', 0)) == expected_meta['dim'] and bool(meta.get('normalize_embeddings', True)) == expected_meta['normalize_embeddings'] and isinstance(cached_phrases, list) and cached_phrases == phrases_for_cluster and isinstance(cached_embs, torch.Tensor):
-                phrase_embs = cached_embs.to(st_model.device)
-                print(f"[cache] loaded phrase embeddings from {PH_EMB_CACHE}", flush=True)
+            cached_fp = None
+            if isinstance(meta, dict):
+                cached_fp = meta.get('phrases_fp')
+            if cached_fp is None and isinstance(data, dict):
+                cached_fp = data.get('phrases_fp')
+            meta_ok = (
+                meta
+                and isinstance(meta, dict)
+                and meta.get('model') == expected_meta['model']
+                and int(meta.get('dim', 0)) == expected_meta['dim']
+                and bool(meta.get('normalize_embeddings', True)) == expected_meta['normalize_embeddings']
+            )
+            if meta_ok and isinstance(cached_embs, torch.Tensor):
+                exact_match = isinstance(cached_phrases, list) and cached_phrases == phrases_for_cluster
+                fp_match = bool(cached_fp) and cached_fp == phrases_fp
+                if exact_match or fp_match:
+                    phrase_embs = cached_embs.to(st_model.device)
+                    reason = 'exact' if exact_match else 'fingerprint'
+                    print(f"[cache] loaded phrase embeddings from {emb_path} (match={reason})", flush=True)
+                else:
+                    print(f"[cache][skip] phrase embedding cache at {emb_path} ignored due to phrase mismatch", flush=True)
             else:
-                print(f"[cache][skip] ignored phrase embedding cache at {PH_EMB_CACHE} due to metadata mismatch", flush=True)
+                print(f"[cache][skip] ignored phrase embedding cache at {emb_path} due to metadata mismatch", flush=True)
         except Exception:
             phrase_embs = None
+    elif PH_EMB_CACHE:
+        print(f"[cache][skip] {PH_EMB_CACHE} rejected by cache policy", flush=True)
     if phrase_embs is None:
         phrase_embs = encode_gpu(st_model, phrases_for_cluster, bs_try=4096)
-        try:
-            cache_payload = {
-                'phrases': phrases_for_cluster,
-                'embs': phrase_embs.cpu(),
-                'meta': _embedding_cache_meta(st_model, normalize_embeddings=True, emb_tensor=phrase_embs),
-            }
-            torch.save(cache_payload, PH_EMB_CACHE)
-            print(f"[cache] saved phrase embeddings to {PH_EMB_CACHE}", flush=True)
-        except Exception:
-            pass
-
+        emb_path = _safe_cache_path(PH_EMB_CACHE)
+        if emb_path:
+            try:
+                cache_meta = _embedding_cache_meta(st_model, normalize_embeddings=True, emb_tensor=phrase_embs)
+                cache_meta['phrases_fp'] = phrases_fp
+                cache_payload = {
+                    'phrases': phrases_for_cluster,
+                    'phrases_fp': phrases_fp,
+                    'embs': phrase_embs.cpu(),
+                    'meta': cache_meta,
+                }
+                torch.save(cache_payload, emb_path)
+                print(f"[cache] saved phrase embeddings to {emb_path}", flush=True)
+            except Exception:
+                pass
+        elif PH_EMB_CACHE:
+            print(f"[cache][skip] {PH_EMB_CACHE} rejected by cache policy", flush=True)
     clusters = cluster_by_semantics(cand, st_model,
                                     thr=args.cluster_thr,
                                     min_size=args.cluster_min,
@@ -981,7 +1269,7 @@ def main(args):
             "bank_all": bool(args.bank_all),
         }
 
-    # 重建软证据检测（基于 bank + 语义匹配）
+    # 閲嶅缓杞瘉鎹娴嬶紙鍩轰簬 bank + 璇箟鍖归厤锛?
     rebuild_soft_check()
     rebuild_bank_embeddings(st_model)
     rebuild_bank_sketches()
@@ -989,31 +1277,60 @@ def main(args):
     if coverage_inputs:
         coverage_report = dc.probe_soft_coverage(coverage_inputs, seed=args.seed, topk_show=3)
 
-    # 杈撳嚭绠€鍗曠粺璁?
+    singletons = sum(1 for _, members, _ in clusters if len(members) == 1)
+
+    def _json_safe(o):
+        try:
+            import numpy as _np
+            if isinstance(o, (_np.integer,)):
+                return int(o)
+            if isinstance(o, (_np.floating,)):
+                return float(o)
+            if isinstance(o, (_np.ndarray,)):
+                return o.tolist()
+        except Exception:
+            pass
+        if isinstance(o, (set, tuple)):
+            return list(o)
+        if isinstance(o, dict):
+            return {str(k): _json_safe(v) for k, v in o.items()}
+        return str(o)
+
+    # 鏉堟挸鍤粻鈧崡鏇犵埠鐠?
     print(json.dumps({
         "prewarm_stats": {k: len(v) for k, v in prewarm_stats.items()} if isinstance(prewarm_stats, dict) else prewarm_stats,
         "hydration_stats": hydration_stats,
         "docs_raw": len(docs_raw),
         "docs_after_strip": len(docs),
         "candidates_from_keybert": len(cand_raw),
-        "candidates_after_pos_filter": len(cand_after_pos),
+        "candidates_word_route": len(cand_word_filtered),
         "candidates_char_route": len(cand_char),
         "candidates_before_soft_gate": len(combined_candidates),
         "candidates_after_soft_gate": len(cand_after_gate),
         "soft_gate_threshold": args.soft_gate_thresh,
         "candidates_after_dedupe": len(cand),
         "clusters": len(clusters),
+        "cluster_singleton_ratio": singletons / max(1, len(clusters)),
         "routing_mode": routing_mode,
         "routing_summary": routing_summary,
         "coverage_report": coverage_report
-    }, ensure_ascii=False, indent=2))
+    }, ensure_ascii=False, indent=2, default=_json_safe))
 
-    try:
-        with open(BANK_SNAPSHOT, "w", encoding="utf-8") as f:
-            json.dump({k: list(dict.fromkeys(dc.SOFT_PARAPHRASE_BANK.get(k, []) or [])) for k in PRIORITY}, f, ensure_ascii=False, indent=2)
-        print(f"[snapshot] saved bank to {BANK_SNAPSHOT}", flush=True)
-    except Exception:
-        pass
+    snap_path = _safe_cache_path(BANK_SNAPSHOT) if BANK_SNAPSHOT else None
+    if snap_path:
+        try:
+            with snap_path.open("w", encoding="utf-8") as f:
+                json.dump({k: list(dict.fromkeys(dc.SOFT_PARAPHRASE_BANK.get(k, []) or [])) for k in PRIORITY}, f, ensure_ascii=False, indent=2)
+            print(f"[snapshot] saved bank to {snap_path}", flush=True)
+        except Exception:
+            pass
+    else:
+        if BANK_SNAPSHOT:
+            print(f"[snapshot][skip] {BANK_SNAPSHOT} rejected by cache policy", flush=True)
+
+def main(args):
+    with _seed_ctx("extract_and_bank", args.seed):
+        return _main_impl(args)
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
@@ -1023,16 +1340,13 @@ if __name__ == "__main__":
     p.add_argument("--top_n", type=int, default=25)
     p.add_argument("--ngram_min", type=int, default=2)
     p.add_argument("--ngram_max", type=int, default=6)
-    p.add_argument(
-        "--diversity",
-        type=float,
-        default=0.5,
+    p.add_argument("--diversity", type=float, default=0.5,
         help="KeyBERT MMR diversity; 0.4-0.6 suits most cases, bump to ~0.65 for forum/colloquial corpora."
     )   # MMR
-    p.add_argument("--min_cjk", type=float, default=0.30)
-    p.add_argument("--cluster_thr", type=float, default=0.84)
+    p.add_argument("--min_cjk", type=float, default=0.6)
+    p.add_argument("--cluster_thr", type=float, default=0.85)
     p.add_argument("--cluster_min", type=int, default=2)
-    p.add_argument("--soft_gate_thresh", type=float, default=0.6,
+    p.add_argument("--soft_gate_thresh", type=float, default=0.65,
                    help="Minimum softish score for KeyBERT phrases to pass into clustering.")
     p.add_argument(
         "--kind",
@@ -1041,27 +1355,49 @@ if __name__ == "__main__":
         help="Force all phrases into the specified soft-evidence bucket; omit or set to 'auto' for auto-routing."
     )
     p.add_argument("--bank_all", action="store_true")
-    p.add_argument("--skip_prewarm_microgrammars", action="store_true",
-                   help="Skip seeding soft-evidence buckets with micro-grammar prototypes before extraction.")
     p.add_argument("--prewarm_keys", type=str, default=None,
                    help="Comma-separated soft evidence kinds to prewarm; defaults to the priority list.")
     p.add_argument("--prewarm_per_kind", type=int, default=300)
     p.add_argument("--prewarm_seed", type=int, default=2025)
     p.add_argument("--prewarm_allow_dupes", action="store_true",
                    help="Disable dedupe when prewarming (dedupe is on by default).")
-    p.add_argument("--hydrate_microgrammars", action="store_true",
-                   help="Pre-expand soft evidence prototypes via micro-grammars before routing.")
+    hydrate_group = p.add_mutually_exclusive_group()
+    hydrate_group.add_argument(
+        "--hydrate_microgrammars",
+        action="store_true",
+        dest="hydrate_microgrammars",
+        default=True,
+        help="Pre-expand soft evidence prototypes via micro-grammars before routing (default: enabled).",
+    )
+    hydrate_group.add_argument(
+        "--no_hydrate_microgrammars",
+        action="store_false",
+        dest="hydrate_microgrammars",
+        help="Skip micro-grammar hydration (default: enabled).",
+    )
     p.add_argument("--hydrate_keys", type=str, default=None,
                    help="Comma-separated soft evidence kinds to hydrate; defaults to core contract/routing kinds.")
     p.add_argument("--hydrate_per_axis", type=int, default=3)
     p.add_argument("--hydrate_max_per_ev", type=int, default=400)
     p.add_argument("--hydrate_seed", type=int, default=20250924)
+    p.add_argument("--gpu_mem_reserve_gb", type=float, default=1.5,
+                   help="GPU memory reserve in GB to avoid exhausting the device (default: 1.5).")
+    p.add_argument("--cpu_mem_reserve_pct", type=float, default=0.15,
+                   help="Fraction of system RAM to keep as reserve (default: 0.15).")
+    p.add_argument("--cpu_core_reserve", type=int, default=2,
+                   help="Logical CPU cores to keep idle for the system (default: 2).")
+    p.add_argument("--encode_workers", type=str, default="auto",
+                   help="'auto' or an integer; tokenizer DataLoader workers (default: auto).")
+    p.add_argument("--cand_chunk_max", type=int, default=None,
+                   help="Maximum candidate encode chunk size; defaults to 20k (GPU) or 10k (CPU).")
+    p.add_argument("--no_amp", action="store_true",
+                   help="Disable autocast/AMP during encoding.")
+    p.add_argument("--allow_external_cache", action="store_true",
+                   help="Allow caches to be written outside the script directory.")
     p.add_argument("--cand_cache", type=str, default=None,
                    help="Path to cache KeyBERT candidates; defaults to per-input name.")
     p.add_argument("--emb_cache", type=str, default=None,
                    help="Path to cache phrase embeddings; defaults to per-input name.")
     p.add_argument("--bank_snapshot", type=str, default=None,
-                   help="Path to write bank snapshot JSON; defaults to per-input name.")
+                   help="Path to write a snapshot of the soft paraphrase bank; defaults to per-input name.")
     main(p.parse_args())
-
-

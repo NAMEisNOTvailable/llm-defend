@@ -5,7 +5,7 @@ This repository assembles Chinese prompt-injection datasets with hard negatives,
 | File | Purpose |
 | --- | --- |
 | `make_malicious_prompts_cn_compose_v2.py` | End-to-end CLI: loads corpora (HF datasets or local JSON), synthesises positives/negatives, dedupes, audits, and writes stats. Capability probes cover optional packages (datasets, simhash, faiss, annoy, datasketch, etc.) and print a startup banner. |
-| `extract_and_bank_zh_phrases.py` | KeyBERT-style (SentenceTransformer-based) candidate miner for Chinese corpora; filters, dedupes, clusters, and feeds phrases back into the DSL soft-evidence banks (with optional manual overrides). |
+| `extract_and_bank_zh_phrases.py` | GPU-friendly KeyBERT-style (SentenceTransformer-based) candidate miner for Chinese corpora; filters, dedupes, clusters, and feeds phrases back into the DSL soft-evidence banks with order-insensitive embedding caching and optional manual overrides. |
 | `dsl_core.py` | DSL that renders injection intents, enforces invariants, and exposes coverage, anchor-free/anchor-required heuristics, soft-evidence checks, and JSON/markdown inspectors. |
 | `dedupe_core.py` | Reusable SimHash + MinHash-LSH + hashed trigram cosine deduper with optional FAISS/Annoy/Numba/xxhash acceleration. Defaults are tuned for Chinese paraphrases and style wrapping. |
 | `micro_grammar.py` | Micro-grammar bank for soft-evidence phrases with deterministic seeding, adaptive slot permutations, DSL style wrapping, and helpers to refill & rebuild DSL banks safely. |
@@ -41,7 +41,9 @@ GPU users should match the `torch` wheel to their CUDA runtime (or stay on CPU b
 Pipeline highlights:
 - Pre-warms and optionally hydrates micro-grammars so the DSL's soft-evidence buckets contain fresh prototypes before scoring.
 - Uses a KeyBERT-style extractor (SentenceTransformer `BAAI/bge-small-zh-v1.5` embeddings) to surface multi-token Chinese phrases while enforcing a CJK share floor.
+- Streams embeddings in adaptive GPU-sized chunks, re-budgeting when documents straddle chunk boundaries so doc/candidate tensors stay co-located on the target device.
 - Keeps only action-like phrases that clear the `_softish_score` gate, then applies the shared `Deduper` for SimHash + MinHash + cosine filtering.
+- Persists phrase embedding caches keyed by SHA-1 fingerprints so reruns hit even when phrase order drifts, with logs indicating exact vs. fingerprint matches.
 - Clusters surviving phrases with SentenceTransformer community detection and auto-routes each cluster to the highest priority soft-evidence kind (or a `--kind` override).
 - Optionally re-banks every cluster member (`--bank_all`) and emits coverage probes via `dsl_core.probe_soft_coverage`.
 
@@ -53,7 +55,7 @@ python extract_and_bank_zh_phrases.py \
   --bank_all \
   --cuda
 ```
-The script prints a JSON summary (candidate counts, routing stats, coverage deltas) so you can capture the run in logs. It updates the in-memory DSL, making the newly banked phrases immediately available to the composer and auditors.
+The script prints a JSON summary (candidate counts, routing stats, coverage deltas, `cluster_singleton_ratio` diagnostics) so you can capture the run in logs and judge whether the clustering threshold needs adjustment. Cache hits are reported as `match=exact` or `match=fingerprint` so you know when the order-insensitive fingerprint kicked in. It updates the in-memory DSL, making the newly banked phrases immediately available to the composer and auditors.
 
 ## Running the Composer
 Typical CLI usage:
@@ -80,6 +82,7 @@ Key toggles:
 - `--soft_hint_rate`, `--alias_p_cn`, `--tail_mix_p` drive soft-evidence injection and style wrapping.
 - `--simhash_bits`, `--simhash_thresh`, `--minhash_n`, `--minhash_bands`, `--jaccard_thresh` tune dedup thresholds.
 - `--targets_json` lets you supply local corpora when HF datasets are unavailable; `_HAS_HF_DATASETS` controls which adapters run.
+- `--workers` controls how many CPU processes handle soft-gate filtering in parallel (set to 1 to disable multiprocessing).
 
 `micro_grammar.py` now:
 - Uses permutation-based slot orders when none are provided (up to 6 slots) for more surface diversity.
@@ -106,6 +109,13 @@ for txt in texts:
     else:
         print('dropped', reason)
 ```
+
+## Deterministic RNG
+`stable_random.py` centralises reproducible seeding helpers used across the composer, extractor, and grammars.
+
+- `stable_seed_hex` / `stable_seed_int` hash arbitrary context into deterministic seeds.
+- `stable_rng` and `derive_rng` hand out `random.Random` instances that match across hosts.
+- `RandomBinder` and its `random_module_binding` context manager temporarily bind Python's module-level `random` helpers to those deterministic RNGs, ensuring thread workers and helper modules respect the same seed.
 
 ## DSL Batch API
 Use `dsl_core.generate_batch` to render intent-level injections programmatically:

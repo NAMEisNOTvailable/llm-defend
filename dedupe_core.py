@@ -622,13 +622,14 @@ class Deduper:
                             if self._annoy_built:
                                 try:
                                     self._annoy.unbuild()
-                                except Exception:
-                                    pass
+                                except Exception as exc_unbuild:
+                                    self._log_annoy_failure("unbuild", exc_unbuild, ids=ids, built=self._annoy_built)
                             self._annoy.build(self._annoy_n_trees)
                             self._annoy_built = True
                             self._annoy_pending = 0
                             self._annoy_dirty = False
-                        except Exception:
+                        except Exception as exc_build:
+                            self._log_annoy_failure("build", exc_build, ids=ids, pending=self._annoy_pending, trees=self._annoy_n_trees, rebuilt=need_build)
                             self._annoy_built = False
                             self._annoy_pending = 0
                             self._annoy_dirty = False
@@ -640,7 +641,8 @@ class Deduper:
                                 include_distances=True,
                             )
                             local_dists = tuple(float(d) for d in dists)
-                        except Exception:
+                        except Exception as exc_query:
+                            self._log_annoy_failure("query", exc_query, ids=ids, k=min(32, ids), built=self._annoy_built)
                             local_dists = ()
         for dist in local_dists:
             # Annoy returns angular distance for L2-normalized vectors (dist ~= sqrt(2 * (1 - cos(theta)))).
@@ -875,6 +877,16 @@ class Deduper:
             self._annoy_pending = 0
             self._annoy_dirty = False
 
+    def _log_annoy_failure(self, stage: str, exc: Exception, **extra: object) -> None:
+        try:
+            context = ' '.join(f"{k}={v}" for k, v in extra.items() if v is not None)
+        except Exception:
+            context = ''
+        msg = f"[annoy][warn] stage={stage} err={exc}"
+        if context:
+            msg = f"{msg} {context}"
+        print(msg, flush=True)
+
     def _append_vector_buffer(self, vec_arr: np.ndarray) -> None:
         if vec_arr.size != self.vec_dim:
             return
@@ -921,8 +933,8 @@ class Deduper:
                 self._annoy_ids += 1
                 self._annoy_pending += 1
                 self._annoy_dirty = True
-            except Exception:
-                pass
+            except Exception as exc_add:
+                self._log_annoy_failure("add_item", exc_add, idx=self._annoy_ids)
 
     def add_record(self, record: DedupeRecord) -> None:
         with self._lock:

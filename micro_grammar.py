@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
 import random, re, logging
 
+from stable_random import stable_rng
+
 from itertools import permutations
 import hashlib
 try:
@@ -272,7 +274,7 @@ class MicroGrammar:
         industry: Optional[str] = None,
         region: Optional[str] = None,
     ) -> str:
-        rng = rng or random.Random()
+        rng = rng or stable_rng("micro_grammar", "slot_realize", getattr(self, "name", "_"))
         for _ in range(80):
             t = self.realize_once(
                 rng,
@@ -299,7 +301,7 @@ class MicroGrammar:
         industry: Optional[str] = None,
         region: Optional[str] = None,
     ) -> List[str]:
-        rng = random.Random(seed)
+        rng = stable_rng("micro_grammar", "slot_sample", getattr(self, "name", "_"), seed)
         bag: List[str] = []
         seen: Set[str] = set()
         trials = max(n * 30, 600)
@@ -418,7 +420,7 @@ def style_wrap(
         rebuild_soft_check(_DSL_CORE)
     except Exception:
         pass
-    rnd = rng or random.Random()
+    rnd = rng or stable_rng("micro_grammar", "style_apply", persona or "_", register or "_", industry or "_", region or "_", speech_family or "_")
     spec = AttackSpec(
         strategy="style_wrap",
         channel="style",
@@ -459,7 +461,7 @@ def expand_grammar(
     """
 
 
-    rng = random.Random(seed)
+    rng = stable_rng("micro_grammar", "sample_generate", seed)
     seen: Set[str] = set()
     out: List[str] = []
     slots = list(mg.slots.values())
@@ -1141,7 +1143,7 @@ def hydrate_paraphrase_bank_with_microgrammars(
 ) -> Dict[str, int]:
     """为每个软证据类别，用小语法 + 语域/行业/地区轴采样，生成一批“无锚点短句”，
     通过 Deduper 去重后，追加进 SOFT_PARAPHRASE_BANK[ev] 作为动态原型。"""
-    rng = random.Random(seed)
+    rng = stable_rng("micro_grammar", "prototype_seed", seed)
     keys = list(ev_keys) if ev_keys else list(GRAMMAR_BY_EVIDENCE)
     stats: Dict[str, int] = {}
     register_axis = REGISTERS or [None]
@@ -1244,7 +1246,7 @@ def generate_micro_prototypes(keys: Optional[Iterable[str]] = None,
             candidates.extend(base)
         if profiles:
             for profile in profiles:
-                style_rng = random.Random((sub_seed ^ profile.seed_hint()) & 0x7FFFFFFF)
+                style_rng = stable_rng("micro_grammar", "style_profile", sub_seed, profile.seed_hint())
                 styled = style_wrap(
                     base,
                     style_rng,

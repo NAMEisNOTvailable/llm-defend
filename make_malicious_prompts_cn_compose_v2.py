@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 make_malicious_prompts_cn_compose_v2.py
 Purpose // 用途:
@@ -24,18 +24,23 @@ import os
 import multiprocessing
 
 _CPU_RESERVE = 2
-_cpu_total = multiprocessing.cpu_count()
-_n_cores = max(1, _cpu_total - _CPU_RESERVE)
-for _env_key in (
+_THREAD_ENV_VARS = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "MKL_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
     "NUMEXPR_NUM_THREADS",
-):
-    os.environ[_env_key] = str(_n_cores)
+)
 
-print(f"[info] 自适应线程数: {_n_cores}")
+
+def _configure_thread_env(verbose: bool = True) -> int:
+    cpu_total = multiprocessing.cpu_count()
+    n_cores = max(1, cpu_total - _CPU_RESERVE)
+    for env_key in _THREAD_ENV_VARS:
+        os.environ[env_key] = str(n_cores)
+    if verbose:
+        print(f"[info] 自适应线程数: {n_cores}")
+    return n_cores
 
 import argparse, json, random, re, sys, math, hashlib, string, unicodedata, atexit
 from pathlib import Path
@@ -54,6 +59,8 @@ import regex as _re
 from dataclasses import dataclass, asdict, field
 
 import numpy as np, platform
+
+from stable_random import stable_seed_hex, stable_seed_int, stable_rng, RandomBinder, bind_random_module, random_module_binding
 
 load_dataset = None  # type: ignore
 DatasetDict = None  # type: ignore
@@ -287,6 +294,9 @@ def _load_dsl_core_core():
     }
 
 _dsl_core_bindings = _probe_capability('dsl_core.core', _load_dsl_core_core)
+def _soft_evidence_kinds_fallback(_text: str) -> set[str]:
+    return set()
+
 if _dsl_core_bindings is None:
     generate_batch = None
     invariant_result_slot = None
@@ -297,8 +307,7 @@ if _dsl_core_bindings is None:
     INDUSTRY_CHOICES: Tuple[str, ...] = tuple()
     PERSONA_CHOICES: Tuple[str, ...] = tuple()
 
-    def soft_evidence_kinds(_text: str) -> set[str]:
-        return set()
+    soft_evidence_kinds = _soft_evidence_kinds_fallback
 
     def cjk_share(s: str) -> float:
         if not s:
@@ -351,7 +360,7 @@ else:
     _tool_param_context_mismatch = _dsl_core_bindings['_tool_param_context_mismatch']
     AttackSpec = _dsl_core_bindings['AttackSpec']
     mechanism_truth_record = _dsl_core_bindings['mechanism_truth_record']
-    soft_evidence_kinds = _dsl_core_bindings.get('soft_evidence_kinds', soft_evidence_kinds)
+    soft_evidence_kinds = _dsl_core_bindings.get('soft_evidence_kinds', _soft_evidence_kinds_fallback)
     inject_soft_hints = _dsl_core_bindings.get('inject_soft_hints')
     MECHANISM_TRUTH_RECORD = mechanism_truth_record
     SOFT_EVIDENCE_KINDS_FN = soft_evidence_kinds
@@ -818,7 +827,7 @@ def refresh_micro_grammar_bank(seed: int) -> Optional[Dict[str, Any]]:
     required = [expand_fn, dedupe_fn, refill_fn]
     if not all(callable(fn) for fn in required):
         return None
-    rng = random.Random(seed)
+    rng = compose_rng("micro_refresh", seed=seed)
     refresh_plan = [
         ('result_slot', refs.get('grammar_result_slot'), 1000, 400),
         ('contract_soft', refs.get('grammar_contract_soft'), 800, 300),
@@ -1800,15 +1809,40 @@ class BehaviorContract:
     validate_hint: dict         # 校验时需要的参数（正则/有序字段/计数等）
     meta: dict                  # 追踪随机键、采样到的同义表达等
 
-def _stable_seed(*parts: object) -> str:
-    joined = "||".join("" if p is None else str(p) for p in parts)
-    return hashlib.blake2b(joined.encode("utf-8"), digest_size=16).hexdigest()
+_stable_seed = stable_seed_hex
 
-def stable_seed_int(*parts: object) -> int:
-    return int(_stable_seed(*parts), 16)
+_RANDOM_BINDER: RandomBinder | None = None
+_COMPOSE_BASE_SEED: int | None = None
 
-def stable_rng(*parts: object) -> random.Random:
-    return random.Random(_stable_seed(*parts))
+def configure_compose_rng(seed: int) -> random.Random:
+    global _RANDOM_BINDER, _COMPOSE_BASE_SEED
+    _COMPOSE_BASE_SEED = int(seed)
+    binder = bind_random_module("compose_attacks", seed)
+    _RANDOM_BINDER = binder
+    if binder.rng is None:
+        raise RuntimeError("failed to bind compose RNG")
+    return binder.rng
+
+def _global_rng() -> random.Random:
+    if _RANDOM_BINDER is None or _RANDOM_BINDER.rng is None:
+        raise RuntimeError("compose RNG not configured")
+    return _RANDOM_BINDER.rng
+
+def compose_rng(tag: str, *parts: object, seed: int | None = None) -> random.Random:
+    if seed is not None:
+        base_seed = int(seed)
+    elif _COMPOSE_BASE_SEED is not None:
+        base_seed = _COMPOSE_BASE_SEED
+    else:
+        raise RuntimeError("compose RNG not configured")
+    return stable_rng("compose_attacks", base_seed, tag, *parts)
+
+def ensure_rng(rng: random.Random | None, tag: str | None = None, *parts: object, seed: int | None = None) -> random.Random:
+    if rng is not None:
+        return rng
+    if tag is None:
+        return _global_rng()
+    return compose_rng(tag, *parts, seed=seed)
 
 @dataclass
 
@@ -2985,7 +3019,7 @@ def _load_many_datasets(specs: List[Tuple[str, Dict[str, Any]]], hf_rev: Optiona
 def _sample_rows(rows, limit: int, seed: int) -> List[Any]:
     if limit <= 0:
         return []
-    rng = random.Random(seed)
+    rng = stable_rng("compose_attacks", "sample_rows", seed)
     try:
         length = len(rows)  # type: ignore
     except Exception:
@@ -3203,120 +3237,121 @@ def build_target_pool(seed: int, max_per_task: int = 4000, hf_rev: Optional[str]
                       workers: int = -1) -> List[Dict[str, Any]]:
     """Random benign tasks from diverse CN corpora. Supports optional concurrent loading.
     // 从多中文语料随机构建良性任务池，可选择并行加载。"""
-    random.seed(seed)
-    pool: List[Dict[str, Any]] = []
-    try:
-        loader_workers = int(workers if workers is not None else -1)
-    except Exception:
-        loader_workers = -1
-    if loader_workers < 0:
-        loader_workers = _auto_io_workers()
-
-    def _iter_dataset(ds, tag: str):
-        if ds is None:
-            return
+    ctx_seed = stable_seed_int("compose_attacks", "build_target_pool", seed)
+    with random_module_binding("compose_attacks", ctx_seed):
+        pool: List[Dict[str, Any]] = []
         try:
-            splits = list(ds.keys())
+            loader_workers = int(workers if workers is not None else -1)
         except Exception:
-            splits = []
-        for split in splits:
-            rows = ds[split]
-            sample_seed = stable_seed_int("dataset", tag, split, seed)
-            for row in _sample_rows(rows, max_per_task, sample_seed):
-                yield row, split
-    # --- Classic CLUE style tasks // 经典 CLUE 任务 ---
-    classic_specs = [("C-MTEB/LCQMC", {}), ("C-MTEB/AFQMC", {})]
-    for (name, kw), ds in _load_many_datasets(classic_specs, hf_rev, loader_workers):
-        if ds is None and name == "C-MTEB/LCQMC":
-            ds = try_load("mteb/LCQMC", {}, hf_rev=hf_rev)
-        if ds is None and name == "C-MTEB/AFQMC":
-            ds = try_load("clue", {"name": "afqmc"}, hf_rev=hf_rev)
-        if not ds:
-            continue
-        for r, _ in _iter_dataset(ds, f"classic-{name}"):
-            a = r.get("sentence1") or r.get("text1") or r.get("query1") or r.get("sentence")
-            b = r.get("sentence2") or r.get("text2") or r.get("query2")
-            if not (isinstance(a, str) and isinstance(b, str)):
+            loader_workers = -1
+        if loader_workers < 0:
+            loader_workers = _auto_io_workers()
+    
+        def _iter_dataset(ds, tag: str):
+            if ds is None:
+                return
+            try:
+                splits = list(ds.keys())
+            except Exception:
+                splits = []
+            for split in splits:
+                rows = ds[split]
+                sample_seed = stable_seed_int("dataset", tag, split, seed)
+                for row in _sample_rows(rows, max_per_task, sample_seed):
+                    yield row, split
+        # --- Classic CLUE style tasks // 经典 CLUE 任务 ---
+        classic_specs = [("C-MTEB/LCQMC", {}), ("C-MTEB/AFQMC", {})]
+        for (name, kw), ds in _load_many_datasets(classic_specs, hf_rev, loader_workers):
+            if ds is None and name == "C-MTEB/LCQMC":
+                ds = try_load("mteb/LCQMC", {}, hf_rev=hf_rev)
+            if ds is None and name == "C-MTEB/AFQMC":
+                ds = try_load("clue", {"name": "afqmc"}, hf_rev=hf_rev)
+            if not ds:
                 continue
-            a, b = normalize(a), normalize(b)
-            if len(a) < 4 or len(b) < 4:
+            for r, _ in _iter_dataset(ds, f"classic-{name}"):
+                a = r.get("sentence1") or r.get("text1") or r.get("query1") or r.get("sentence")
+                b = r.get("sentence2") or r.get("text2") or r.get("query2")
+                if not (isinstance(a, str) and isinstance(b, str)):
+                    continue
+                a, b = normalize(a), normalize(b)
+                if len(a) < 4 or len(b) < 4:
+                    continue
+                pool.append({"task":"similarity","prompt":f"判断两句话是否表达同一含义，仅答“是/否”。\n句子A：{a}\n句子B：{b}"})
+        for sub in ["ocnli","cmnli"]:
+            ds = try_load("clue", {"name": sub}, hf_rev=hf_rev)
+            if not ds:
                 continue
-            pool.append({"task":"similarity","prompt":f"判断两句话是否表达同一含义，仅答“是/否”。\n句子A：{a}\n句子B：{b}"})
-    for sub in ["ocnli","cmnli"]:
-        ds = try_load("clue", {"name": sub}, hf_rev=hf_rev)
-        if not ds:
-            continue
-        for r, _ in _iter_dataset(ds, f"nli-{sub}"):
-            p = r.get("sentence1") or r.get("premise")
-            h = r.get("sentence2") or r.get("hypothesis")
-            if not (isinstance(p, str) and isinstance(h, str)):
+            for r, _ in _iter_dataset(ds, f"nli-{sub}"):
+                p = r.get("sentence1") or r.get("premise")
+                h = r.get("sentence2") or r.get("hypothesis")
+                if not (isinstance(p, str) and isinstance(h, str)):
+                    continue
+                p, h = normalize(p), normalize(h)
+                if len(p) < 4 or len(h) < 4:
+                    continue
+                pool.append({"task":"nli","prompt":f"判定前提与假设的关系：只答“蕴含/矛盾/中立”。\n前提：{p}\n假设：{h}"})
+        # Sentiment (ChnSentiCorp): avoid script loaders; prefer parquet mirrors
+        sentiment_specs = [("lansinuote/ChnSentiCorp", {})]
+        for (name, kw), ds in _load_many_datasets(sentiment_specs, hf_rev, loader_workers):
+            if not ds:
                 continue
-            p, h = normalize(p), normalize(h)
-            if len(p) < 4 or len(h) < 4:
-                continue
-            pool.append({"task":"nli","prompt":f"判定前提与假设的关系：只答“蕴含/矛盾/中立”。\n前提：{p}\n假设：{h}"})
-    # Sentiment (ChnSentiCorp): avoid script loaders; prefer parquet mirrors
-    sentiment_specs = [("lansinuote/ChnSentiCorp", {})]
-    for (name, kw), ds in _load_many_datasets(sentiment_specs, hf_rev, loader_workers):
-        if not ds:
-            continue
-        for r, _ in _iter_dataset(ds, f"sentiment-{name}"):
-            x = r.get("text") or r.get("sentence") or r.get("content")
-            if not isinstance(x, str):
-                continue
-            x = normalize(x)
-            if len(x) < 8:
-                continue
-            pool.append({"task":"sentiment","prompt":f"判断情感倾向，仅答“正/负”。\n{x}"})
-    # LCSTS summarization
-    lcsts_specs = [("hugcyp/LCSTS", {}), ("suolyer/lcsts", {})]
-    for (name, kw), ds in _load_many_datasets(lcsts_specs, hf_rev, loader_workers):
-        if not ds:
-            continue
-        for r, _ in _iter_dataset(ds, f"lcsts-{name}"):
-            x = r.get("text") or r.get("content") or r.get("passage") or r.get("summary") or r.get("Document")
-            if not isinstance(x, str):
-                continue
-            x = normalize(x)
-            if len(x) < 20:
-                continue
-            pool.append({"task":"summarization","prompt":f"请概括下文，生成≤30字摘要：\n{x}"})
-    # --- Expanded domains // 扩展域 ---
-    wiki_specs = [("wikimedia/wikipedia", {"name":"20231101.zh"}), ("shaowenchen/wiki_zh", {})]
-    for (name, kw), ds in _load_many_datasets(wiki_specs, hf_rev, loader_workers):
-        if not ds:
-            continue
-        for r, split in _iter_dataset(ds, f"wiki-{name}"):
-            text_fields = list(_yield_text_fields(r))
-            if not text_fields:
-                continue
-            x = normalize("。".join(text_fields)[:800])
-            if len(x) < 60:
-                continue
-            pool.append({"task":"wiki_summarize","prompt":f"阅读片段并给出50字内要点：\n{x}"})
-            pool.append({"task":"wiki_ents","prompt":f"从片段中抽取专有名词并以逗号分隔：\n{x}"})
-    # Chinese tech/news/forum style corpora
-    news_specs = [("SirlyDreamer/THUCNews", {})]
-    for (name, kw), ds in _load_many_datasets(news_specs, hf_rev=None, workers=loader_workers):
-        if not ds:
-            continue
-        for r, _ in _iter_dataset(ds, f"news-{name}"):
-            for x in _yield_text_fields(r):
+            for r, _ in _iter_dataset(ds, f"sentiment-{name}"):
+                x = r.get("text") or r.get("sentence") or r.get("content")
+                if not isinstance(x, str):
+                    continue
                 x = normalize(x)
+                if len(x) < 8:
+                    continue
+                pool.append({"task":"sentiment","prompt":f"判断情感倾向，仅答“正/负”。\n{x}"})
+        # LCSTS summarization
+        lcsts_specs = [("hugcyp/LCSTS", {}), ("suolyer/lcsts", {})]
+        for (name, kw), ds in _load_many_datasets(lcsts_specs, hf_rev, loader_workers):
+            if not ds:
+                continue
+            for r, _ in _iter_dataset(ds, f"lcsts-{name}"):
+                x = r.get("text") or r.get("content") or r.get("passage") or r.get("summary") or r.get("Document")
+                if not isinstance(x, str):
+                    continue
+                x = normalize(x)
+                if len(x) < 20:
+                    continue
+                pool.append({"task":"summarization","prompt":f"请概括下文，生成≤30字摘要：\n{x}"})
+        # --- Expanded domains // 扩展域 ---
+        wiki_specs = [("wikimedia/wikipedia", {"name":"20231101.zh"}), ("shaowenchen/wiki_zh", {})]
+        for (name, kw), ds in _load_many_datasets(wiki_specs, hf_rev, loader_workers):
+            if not ds:
+                continue
+            for r, split in _iter_dataset(ds, f"wiki-{name}"):
+                text_fields = list(_yield_text_fields(r))
+                if not text_fields:
+                    continue
+                x = normalize("。".join(text_fields)[:800])
                 if len(x) < 60:
                     continue
-                task = random.choice(["extract_kv","classify_topic","clean_markup","make_outline"])
-                if task == "extract_kv":
-                    pool.append({"task":task,"prompt":f"抽取段落中的关键实体（人/地/组织），JSON返回：\n{x}"})
-                elif task == "classify_topic":
-                    pool.append({"task":task,"prompt":f"判断该段是“新闻/博客/论坛/说明/评论”中的一类，给出一项\n{x}"})
-                elif task == "clean_markup":
-                    pool.append({"task":task,"prompt":f"去除段落中的标记/括注并输出整洁文本\n{x}"})
-                else:
-                    pool.append({"task":task,"prompt":f"根据段落生成提纲，1-3条要点\n{x}"})
-                break  # one field per row
-    random.shuffle(pool)
-    return pool
+                pool.append({"task":"wiki_summarize","prompt":f"阅读片段并给出50字内要点：\n{x}"})
+                pool.append({"task":"wiki_ents","prompt":f"从片段中抽取专有名词并以逗号分隔：\n{x}"})
+        # Chinese tech/news/forum style corpora
+        news_specs = [("SirlyDreamer/THUCNews", {})]
+        for (name, kw), ds in _load_many_datasets(news_specs, hf_rev=None, workers=loader_workers):
+            if not ds:
+                continue
+            for r, _ in _iter_dataset(ds, f"news-{name}"):
+                for x in _yield_text_fields(r):
+                    x = normalize(x)
+                    if len(x) < 60:
+                        continue
+                    task = random.choice(["extract_kv","classify_topic","clean_markup","make_outline"])
+                    if task == "extract_kv":
+                        pool.append({"task":task,"prompt":f"抽取段落中的关键实体（人/地/组织），JSON返回：\n{x}"})
+                    elif task == "classify_topic":
+                        pool.append({"task":task,"prompt":f"判断该段是“新闻/博客/论坛/说明/评论”中的一类，给出一项\n{x}"})
+                    elif task == "clean_markup":
+                        pool.append({"task":task,"prompt":f"去除段落中的标记/括注并输出整洁文本\n{x}"})
+                    else:
+                        pool.append({"task":task,"prompt":f"根据段落生成提纲，1-3条要点\n{x}"})
+                    break  # one field per row
+        random.shuffle(pool)
+        return pool
 
 def load_targets_offline(path: str) -> List[Dict[str,Any]]:
     """Load tasks from a local JSON/JSONL file. Expect objects with fields {task,prompt}."""
@@ -5741,7 +5776,7 @@ def _attack_render_core(seed: int) -> tuple[Optional[RenderPacket], list[tuple[s
             targets = tuple(base)
     if not targets:
         return None, []
-    rng = random.Random(seed)
+    rng = compose_rng("attack_render_core", seed=seed)
     logs: list[tuple[str, dict]] = []
     try:
         target_idx = rng.randrange(len(targets))
@@ -5882,7 +5917,7 @@ def _attack_producer_job(job: tuple[int, int]) -> dict:
         cand_seed = base_seed + idx
         cand, logs = _attack_render_core(cand_seed)
         if logs and log_cap > 0 and len(logs) > log_cap:
-            rng = random.Random(cand_seed ^ seed)
+            rng = stable_rng("compose_attacks", "attack_candidate", cand_seed, seed)
             try:
                 pick = rng.sample(range(len(logs)), log_cap)
                 logs = [logs[i] for i in sorted(pick)]
@@ -6255,7 +6290,7 @@ class AttackSelector:
         self.q_tool_override = 0
         self.q_stealth_high = 0
         self.q_artifact = 0
-        self.rng_global = random.Random(seed)
+        self.rng_global = compose_rng("producer_global", seed=seed)
         self.quota_tool_override_min = 0
         self.quota_stealth_high_min = 0
         self.quota_artifact_max = 0
@@ -6339,7 +6374,7 @@ class AttackSelector:
         mode = packet.mode
         art_flag = packet.art_flag
         rng_pair_seed = stable_seed_int("packet", packet.seed, fam_name, mapped_intent)
-        rng_local = random.Random(int(hashlib.blake2b(str(rng_pair_seed).encode('utf-8'), digest_size=8).hexdigest(), 16))
+        rng_local = stable_rng("compose_attacks", "pair_local", rng_pair_seed)
         # ==== Begin mirrored logic from serial pathway (post-render) ====
         is_dup, sim = near_duplicate(text, thr=0.90)
         if is_dup:
@@ -6640,432 +6675,434 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     coverage_min_per_combo: int = 0,
                     soft_hint_rate: float | None = None,
                     cfg: Optional[Config] = None) -> List[Dict[str,Any]]:
-    random.seed(seed)
-    # unify effective knobs with CLI defaults
-    disc_rate = _effective_disc_rate(disc_rate, cfg)
-    artifact_free_pos_ratio = _effective_artifact_free_pos_ratio(artifact_free_pos_ratio, cfg)
-    base_multiplier, auto_oversample = _resolve_oversample_multiplier(n, oversample_mult)
-    oversample_ctl = AdaptiveOversample(target=n, base_multiplier=base_multiplier, auto=auto_oversample)
-    wanted = oversample_ctl.current_target()
-    cands = []; fam_count = Counter()
-    # 覆盖控制：(intent, delivery, carrier) 的最小覆盖数
-    min_cov = max(0, int(coverage_min_per_combo or 0))
-    cover = Counter()
-    attempts = 0
-    max_attempts = oversample_ctl.max_attempts()
-    goal_keys  = list(GOAL_WEIGHTS.keys())
-    # Quota hints (approximate target counts)
-    quota_tool_override_min = int(max(1, 0.10 * n))
-    quota_stealth_high_min  = int(max(1, 0.40 * n))
-    quota_artifact_max      = int(max(1, 0.18 * n))
-    q_tool_override = 0
-    q_stealth_high  = 0
-    q_artifact      = 0
-    soft_hint_rate = float(soft_hint_rate if soft_hint_rate is not None else 0.18)
-    while target_pool and attempts < max_attempts:
-        if len(cands) >= wanted:
-            if not auto_oversample or quotas_met():
-                break
-        if oversample_ctl.maybe_update(attempts, len(cands), quotas_met()):
-            wanted = oversample_ctl.current_target()
-            max_attempts = oversample_ctl.max_attempts()
-            continue
-        attempts += 1
-        t = random.choice(target_pool)
-        contract = derive_task_contract(t["task"])
-        # 1) 使用 DSL 采样注入意图并渲染
-        dsl_intents = list(INTENT_GOALS)
-        intent_weights = []
-        for it in dsl_intents:
-            key = INTENT_TO_GOAL_KEY.get(it, "policy_bypass")
-            intent_weights.append(GOAL_WEIGHTS.get(key, 0.10))
-        ssum = sum(intent_weights) or 1.0
-        intent_weights = [w/ssum for w in intent_weights]
-        intent = random.choices(dsl_intents, weights=intent_weights, k=1)[0]
-        channel = random.choice(["in_context","format_carrier","rag_doc","multi_turn"])
-        position = random.choice(["prefix","suffix","inline","metadata"])
-        scope = random.choice(["result_slot","tool_args","upstream","retriever","memory"])
-        mismatch_carrier = choose_mismatch_carrier(contract.mode, random)
-        if mismatch_carrier != 'none':
-            carrier = mismatch_carrier
-        else:
-            carrier = choose_carrier_name(include_none=False)
-        payload_hint = sample_payload(structured=False).get("payload")
-        payload_encoding = None
-        payload = payload_hint
-        if payload:
-            payload, payload_encoding = select_payload_encoding(payload, random)
-        dsl = PIDSL(intent=intent, channel=channel, position=position, scope=scope, carrier=carrier, payload_hint=payload)
-        tpl_text, _car = render_from_dsl(dsl, t["prompt"])  # already includes carrier
-        fam_name = intent
-        mapped_intent = intent
-        need_anchor = False
-        inj_text = tpl_text
-        # 可选：仅在用户显式开启模型评测时，尝试用模型进化模板
-        if evolve_variants and use_model_eval and random.random() < 0.20:
-            try:
-                tpl2, _ = evolve_injection(t["prompt"], tpl_text, contract, payload or "", steps=2)
-                if isinstance(tpl2, str) and len(tpl2) > 0:
-                    tpl_text = tpl2
-            except Exception as e:
-                audit_reject("hist_len_error", {"phase":"compose_pos", "err": e, "pair_id": base_pos.get("pair_id") if "base_pos" in locals() else None})
-        if payload:
-            inj_text = materialize_payload_with_anchor(tpl_text, payload, force_anchor=need_anchor)
-        else:
-            inj_text = tpl_text
-        # 补充：对正类也进行占位符替换与委婉/显词控制，避免 {PRIOR}/{IGNORE} 等残留
-        art_flag = (random.random() < artifact_rate)
-        try:
-            inj_text = art_or_euphemism(inj_text, use_art=art_flag)
-        except Exception as e:
-            audit_reject("stats_print_error", {"phase":"compose_pos", "err": e})
-        # 2) 载体包装（不改变恶意语义）
-        carrier_name = "none"
-        forced_carrier = choose_mismatch_carrier(contract.mode, random)
-        if forced_carrier and forced_carrier != "none":
-            tpl = CARRIER_TEMPLATES.get(forced_carrier)
-            if tpl is not None:
-                try:
-                    inj_text = tpl(inj_text)
-                    carrier_name = forced_carrier
-                except Exception as exc:
-                    audit_soft('forced_carrier_render_error', exc, {"carrier": forced_carrier})
+    ctx_seed = stable_seed_int("compose_attacks", "compose_attacks_serial", seed)
+    with random_module_binding("compose_attacks", ctx_seed):
+        random.seed(seed)
+        # unify effective knobs with CLI defaults
+        disc_rate = _effective_disc_rate(disc_rate, cfg)
+        artifact_free_pos_ratio = _effective_artifact_free_pos_ratio(artifact_free_pos_ratio, cfg)
+        base_multiplier, auto_oversample = _resolve_oversample_multiplier(n, oversample_mult)
+        oversample_ctl = AdaptiveOversample(target=n, base_multiplier=base_multiplier, auto=auto_oversample)
+        wanted = oversample_ctl.current_target()
+        cands = []; fam_count = Counter()
+        # 覆盖控制：(intent, delivery, carrier) 的最小覆盖数
+        min_cov = max(0, int(coverage_min_per_combo or 0))
+        cover = Counter()
+        attempts = 0
+        max_attempts = oversample_ctl.max_attempts()
+        goal_keys  = list(GOAL_WEIGHTS.keys())
+        # Quota hints (approximate target counts)
+        quota_tool_override_min = int(max(1, 0.10 * n))
+        quota_stealth_high_min  = int(max(1, 0.40 * n))
+        quota_artifact_max      = int(max(1, 0.18 * n))
+        q_tool_override = 0
+        q_stealth_high  = 0
+        q_artifact      = 0
+        soft_hint_rate = float(soft_hint_rate if soft_hint_rate is not None else 0.18)
+        while target_pool and attempts < max_attempts:
+            if len(cands) >= wanted:
+                if not auto_oversample or quotas_met():
+                    break
+            if oversample_ctl.maybe_update(attempts, len(cands), quotas_met()):
+                wanted = oversample_ctl.current_target()
+                max_attempts = oversample_ctl.max_attempts()
+                continue
+            attempts += 1
+            t = random.choice(target_pool)
+            contract = derive_task_contract(t["task"])
+            # 1) 使用 DSL 采样注入意图并渲染
+            dsl_intents = list(INTENT_GOALS)
+            intent_weights = []
+            for it in dsl_intents:
+                key = INTENT_TO_GOAL_KEY.get(it, "policy_bypass")
+                intent_weights.append(GOAL_WEIGHTS.get(key, 0.10))
+            ssum = sum(intent_weights) or 1.0
+            intent_weights = [w/ssum for w in intent_weights]
+            intent = random.choices(dsl_intents, weights=intent_weights, k=1)[0]
+            channel = random.choice(["in_context","format_carrier","rag_doc","multi_turn"])
+            position = random.choice(["prefix","suffix","inline","metadata"])
+            scope = random.choice(["result_slot","tool_args","upstream","retriever","memory"])
+            mismatch_carrier = choose_mismatch_carrier(contract.mode, random)
+            if mismatch_carrier != 'none':
+                carrier = mismatch_carrier
             else:
-                forced_carrier = "none"
-        if random.random() < carrier_mix_prob:
-            cn, inj_text = maybe_wrap_again_named(inj_text)
-            carrier_name = _merge_carrier_name(carrier_name, cn)
-            if random.random() < stack_prob:
-                cn2, inj_text = maybe_wrap_again_named(inj_text)
-                carrier_name = _merge_carrier_name(carrier_name, cn2)
-        if random.random() < code_switch_prob:
-            inj_text = code_switch_light(inj_text, p=0.20)
-        # Optionally build progressive conversation attack
-        force_multi = (random.random() < 0.18)
-        if (channel == "multi_turn" or force_multi) and random.random() < 0.40:
-            inj_text_prog = compose_conversation_attacks_sample(t['prompt'], payload)
-            base, mode = build_delivery(t['prompt'], inj_text_prog, force_mode="multi_turn", cfg=cfg)
-        else:
-            base, mode = build_delivery(t['prompt'], inj_text, force_mode=("multi_turn" if force_multi else None), cfg=cfg)
-        raw  = inject_unicode_noise(inject_noise_light(base), p=NOISE_P)
-        text = normalize(raw)
-        # —— 1) Optional adversarial hill‑climb to reduce artifacty evidence while preserving effect ——
-        try:
-            if bool(_cfg_attr(cfg, 'adv_mutate', False)):
-                text = adversarial_search(text, contract, payload, max_iters=int(_cfg_attr(cfg, 'adv_iters', 6)), seed=seed, cfg=cfg)
-        except Exception as e:
-            audit_reject("adv_mutate_error", {"phase":"compose_pos", "err": str(e)})
-        # 近邻软拒（放在 normalize/对抗搜索 后、CJK 检查前）
-        is_dup, sim = near_duplicate(text, thr=0.90)
-        if is_dup:
-            audit_reject("near_duplicate", {"phase":"compose_pos", "sim": round(sim, 3), "pair_id": f"POS-{len(cands)+1:07d}", "text": text})
-            # 降低放行率以减少“语义团簇”堆叠（原 10% → 2%）
-            if random.random() > 0.02:
-                continue
-        # 接受后登记
-        neighbor_admit(text)
-        # 3) CJK share policy: hard / tiered / audit
-        has_struct = bool(CODE_BLOCK_RE.search(text) or JSON_BLOCK_RE.search(text))
-        base_cjk = (random.choice([0.6,0.7,0.85,0.9]) if min_cjk_share_auto else min_cjk_share)
-        bucket_min = (0.70 if mode == 'multi_turn' else (0.50 if has_struct else 0.60))
-        target_min_cjk = max(bucket_min, base_cjk)
-        cur_share = cjk_share(text)
-        policy = _cfg_attr(cfg, 'cjk_policy', 'tiered')
-        if policy == 'hard':
-            if cur_share < target_min_cjk:
-                audit_reject("cjk_ratio", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-                continue
-        elif policy == 'tiered':
-            if cur_share < 0.35:
-                audit_reject("cjk_ratio_low", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-                continue
-            # else: accept but do not force repairs
-        else:  # audit only
-            pass
-        if artifact_free_pos_ratio > 1e-9 and random.random() < artifact_free_pos_ratio:
-            # 去除 <APPEND_*> / TOOL_CALL(...) / #p=... / UPSTREAM_DOC_ID:... 等结构锚点
-            text = placeholderless_mirror(text)
-        # 4) （可选）为正类补“良性结构证据”，不返祖到显词
-        text = add_struct_evidence(fam_name, text, secret="S-"+str(random.randint(100000,999999)), p=struct_evidence_rate)
-        # 5) 诊断门（语义/结构）：基于 DSL×契约（强门控时需要支撑证据）
-        _ok_diag, vio = gate_by_contract_from_dsl(contract, dsl, text, require_support=bool(gate_semantic_injection))
-        # 6) （可选）副作用证据一致性投票：工具/通道/上游/检索/记忆 任一命中
-
-        def _passes_side_effects(text_eval: str) -> bool:
-            total = max(1, int(_cfg_attr(cfg, 'se_votes', 1)))
-            votes = 0
-            for i in range(total):
-                te = re.sub("[\u200b\u200c\u2060]", "", text_eval) if (i % 2 == 0) else re.sub(r"\s+", " ", text_eval)
+                carrier = choose_carrier_name(include_none=False)
+            payload_hint = sample_payload(structured=False).get("payload")
+            payload_encoding = None
+            payload = payload_hint
+            if payload:
+                payload, payload_encoding = select_payload_encoding(payload, random)
+            dsl = PIDSL(intent=intent, channel=channel, position=position, scope=scope, carrier=carrier, payload_hint=payload)
+            tpl_text, _car = render_from_dsl(dsl, t["prompt"])  # already includes carrier
+            fam_name = intent
+            mapped_intent = intent
+            need_anchor = False
+            inj_text = tpl_text
+            # 可选：仅在用户显式开启模型评测时，尝试用模型进化模板
+            if evolve_variants and use_model_eval and random.random() < 0.20:
                 try:
-                    se = run_sim_agent(t["task"], te, contract)
+                    tpl2, _ = evolve_injection(t["prompt"], tpl_text, contract, payload or "", steps=2)
+                    if isinstance(tpl2, str) and len(tpl2) > 0:
+                        tpl_text = tpl2
                 except Exception as e:
-                    audit_reject("side_effects_engine_missing", {"err": str(e)})
-                    return False
-                if _side_effects_violate_contract(contract, se):
-                    votes += 1
-            return votes >= max(1, (total+1)//2)
-        if bool(_cfg_attr(cfg, 'require_side_effects', False)):
-            if not _passes_side_effects(text):
-                audit_reject("side_effects_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-                continue
-        # 6.5) 语义注入检测（强门控时硬过滤）
-        if gate_semantic_injection:
+                    audit_reject("hist_len_error", {"phase":"compose_pos", "err": e, "pair_id": base_pos.get("pair_id") if "base_pos" in locals() else None})
+            if payload:
+                inj_text = materialize_payload_with_anchor(tpl_text, payload, force_anchor=need_anchor)
+            else:
+                inj_text = tpl_text
+            # 补充：对正类也进行占位符替换与委婉/显词控制，避免 {PRIOR}/{IGNORE} 等残留
+            art_flag = (random.random() < artifact_rate)
             try:
-                ok_aud, v_aud = gate_injection_sample(text, mapped_intent, mapped_intent, contract, text, payload)
-                if not ok_aud:
-                    audit_reject("semantic_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-                    continue
+                inj_text = art_or_euphemism(inj_text, use_art=art_flag)
             except Exception as e:
-                audit_reject("semantic_gate_error", {
-                    "err": str(e), "task": t.get("task","_"),
-                    "family": fam_name, "intent": mapped_intent
-                })
-                continue
-        # 7) 去重/配额（对“去外壳/去围栏/去占位”后的文本去重）
-        if not deduper_accept_normalized(deduper, text, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
-            audit_reject("dedup", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-            continue
-        if fam_count[fam_name] >= family_cap:
-            audit_reject("family_cap", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-            continue
-        # 若开启硬门控：不达标的正类直接剔除
-        if gate_semantic_injection and not _ok_diag:
-            audit_reject("semantic_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
-            continue
-        # 8) 先生成 pair_id / rng_pair，再做表面增强（要用到 rng_pair）
-        pair_id = f"P{len(cands)+1:07d}"
-        rng_pair = stable_rng("plain_pair", seed, pair_id)
-        pos_cjk_target = max(0.60, (0.7 if min_cjk_share_auto else min_cjk_share))
-        forced_surface = choose_mismatch_carrier(contract.mode, rng_pair)
-        text, carrier_name = apply_surface_augments(
-            text, rng_pair, struct_p=struct_evidence_rate, cjk_target=pos_cjk_target, cfg=cfg,
-            forced_carrier=forced_surface
-        )
-        # 对称注入“软话术”（不增加结构锚点）
-        artifact_free_applied = False
-        apply_soft_hints = True
-        if artifact_free_pos_ratio > 1e-9:
-            if rng_pair.random() < artifact_free_pos_ratio:
-                artifact_free_applied = True
-                apply_soft_hints = False
-                # 先去除结构锚点（TOOL_CALL/APPEND/UPSTREAM/PATH/模板槽等）
-                text = placeholderless_mirror(text)
-                # 再中和显词锚点/口号式语句
-                text = neutralize_anchors(text)
-                for w in ARTIFACT_WORDS:
-                    text = re.sub(re.escape(w), "", text, flags=re.IGNORECASE)
-        _soft_applied = False
-        if apply_soft_hints:
-            text, _soft_applied = maybe_apply_soft_hints(
-                text,
-                rng_pair,
-                soft_hint_rate,
-                audit_ctx={"phase": "soft_hint", "pair_id": locals().get("pair_id")},
-            )
-            if _soft_applied:
-                neg_diag_audit = (neg_diag_audit or {})
-                neg_diag_audit["soft_hint_applied"] = True
-        # 9) 语义诊断 → 硬门控（⚠️在 artifact-free 后重新门控）
-        if gate_semantic_injection:
+                audit_reject("stats_print_error", {"phase":"compose_pos", "err": e})
+            # 2) 载体包装（不改变恶意语义）
+            carrier_name = "none"
+            forced_carrier = choose_mismatch_carrier(contract.mode, random)
+            if forced_carrier and forced_carrier != "none":
+                tpl = CARRIER_TEMPLATES.get(forced_carrier)
+                if tpl is not None:
+                    try:
+                        inj_text = tpl(inj_text)
+                        carrier_name = forced_carrier
+                    except Exception as exc:
+                        audit_soft('forced_carrier_render_error', exc, {"carrier": forced_carrier})
+                else:
+                    forced_carrier = "none"
+            if random.random() < carrier_mix_prob:
+                cn, inj_text = maybe_wrap_again_named(inj_text)
+                carrier_name = _merge_carrier_name(carrier_name, cn)
+                if random.random() < stack_prob:
+                    cn2, inj_text = maybe_wrap_again_named(inj_text)
+                    carrier_name = _merge_carrier_name(carrier_name, cn2)
+            if random.random() < code_switch_prob:
+                inj_text = code_switch_light(inj_text, p=0.20)
+            # Optionally build progressive conversation attack
+            force_multi = (random.random() < 0.18)
+            if (channel == "multi_turn" or force_multi) and random.random() < 0.40:
+                inj_text_prog = compose_conversation_attacks_sample(t['prompt'], payload)
+                base, mode = build_delivery(t['prompt'], inj_text_prog, force_mode="multi_turn", cfg=cfg)
+            else:
+                base, mode = build_delivery(t['prompt'], inj_text, force_mode=("multi_turn" if force_multi else None), cfg=cfg)
+            raw  = inject_unicode_noise(inject_noise_light(base), p=NOISE_P)
+            text = normalize(raw)
+            # —— 1) Optional adversarial hill‑climb to reduce artifacty evidence while preserving effect ——
             try:
-                _ok_diag2, _v2 = gate_injection_sample(text, mapped_intent, mapped_intent, contract, text, payload, artifact_free_applied=artifact_free_applied)
-                _ok_contract2 = gate_by_contract_from_dsl(
-                    contract, PIDSL("policy_bypass","in_context","inline","result_slot","html_comment"),
-                    text, require_support=True
-                )
-                if not (_ok_diag2 and _ok_contract2):
-                    audit_reject("semantic_gate_after_artifact", {
-                        "task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": pair_id
+                if bool(_cfg_attr(cfg, 'adv_mutate', False)):
+                    text = adversarial_search(text, contract, payload, max_iters=int(_cfg_attr(cfg, 'adv_iters', 6)), seed=seed, cfg=cfg)
+            except Exception as e:
+                audit_reject("adv_mutate_error", {"phase":"compose_pos", "err": str(e)})
+            # 近邻软拒（放在 normalize/对抗搜索 后、CJK 检查前）
+            is_dup, sim = near_duplicate(text, thr=0.90)
+            if is_dup:
+                audit_reject("near_duplicate", {"phase":"compose_pos", "sim": round(sim, 3), "pair_id": f"POS-{len(cands)+1:07d}", "text": text})
+                # 降低放行率以减少“语义团簇”堆叠（原 10% → 2%）
+                if random.random() > 0.02:
+                    continue
+            # 接受后登记
+            neighbor_admit(text)
+            # 3) CJK share policy: hard / tiered / audit
+            has_struct = bool(CODE_BLOCK_RE.search(text) or JSON_BLOCK_RE.search(text))
+            base_cjk = (random.choice([0.6,0.7,0.85,0.9]) if min_cjk_share_auto else min_cjk_share)
+            bucket_min = (0.70 if mode == 'multi_turn' else (0.50 if has_struct else 0.60))
+            target_min_cjk = max(bucket_min, base_cjk)
+            cur_share = cjk_share(text)
+            policy = _cfg_attr(cfg, 'cjk_policy', 'tiered')
+            if policy == 'hard':
+                if cur_share < target_min_cjk:
+                    audit_reject("cjk_ratio", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                    continue
+            elif policy == 'tiered':
+                if cur_share < 0.35:
+                    audit_reject("cjk_ratio_low", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                    continue
+                # else: accept but do not force repairs
+            else:  # audit only
+                pass
+            if artifact_free_pos_ratio > 1e-9 and random.random() < artifact_free_pos_ratio:
+                # 去除 <APPEND_*> / TOOL_CALL(...) / #p=... / UPSTREAM_DOC_ID:... 等结构锚点
+                text = placeholderless_mirror(text)
+            # 4) （可选）为正类补“良性结构证据”，不返祖到显词
+            text = add_struct_evidence(fam_name, text, secret="S-"+str(random.randint(100000,999999)), p=struct_evidence_rate)
+            # 5) 诊断门（语义/结构）：基于 DSL×契约（强门控时需要支撑证据）
+            _ok_diag, vio = gate_by_contract_from_dsl(contract, dsl, text, require_support=bool(gate_semantic_injection))
+            # 6) （可选）副作用证据一致性投票：工具/通道/上游/检索/记忆 任一命中
+    
+            def _passes_side_effects(text_eval: str) -> bool:
+                total = max(1, int(_cfg_attr(cfg, 'se_votes', 1)))
+                votes = 0
+                for i in range(total):
+                    te = re.sub("[\u200b\u200c\u2060]", "", text_eval) if (i % 2 == 0) else re.sub(r"\s+", " ", text_eval)
+                    try:
+                        se = run_sim_agent(t["task"], te, contract)
+                    except Exception as e:
+                        audit_reject("side_effects_engine_missing", {"err": str(e)})
+                        return False
+                    if _side_effects_violate_contract(contract, se):
+                        votes += 1
+                return votes >= max(1, (total+1)//2)
+            if bool(_cfg_attr(cfg, 'require_side_effects', False)):
+                if not _passes_side_effects(text):
+                    audit_reject("side_effects_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                    continue
+            # 6.5) 语义注入检测（强门控时硬过滤）
+            if gate_semantic_injection:
+                try:
+                    ok_aud, v_aud = gate_injection_sample(text, mapped_intent, mapped_intent, contract, text, payload)
+                    if not ok_aud:
+                        audit_reject("semantic_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                        continue
+                except Exception as e:
+                    audit_reject("semantic_gate_error", {
+                        "err": str(e), "task": t.get("task","_"),
+                        "family": fam_name, "intent": mapped_intent
                     })
                     continue
-                _ok_diag = _ok_diag2
-            except Exception as e:
-                audit_reject("semantic_gate_after_artifact_error", {"err": str(e), "pair_id": pair_id})
+            # 7) 去重/配额（对“去外壳/去围栏/去占位”后的文本去重）
+            if not deduper_accept_normalized(deduper, text, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
+                audit_reject("dedup", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
                 continue
-        diag_pass = bool(_ok_diag)
-        if not diag_pass:
-            audit_reject("semantic_gate_failed", {"pair_id": pair_id, "intent": intent, "cats": vio})
-            continue
-        gate_set = {s.strip() for s in str(_cfg_attr(cfg, 'effect_gate_categories', '') or '').split(',')} - {'', 'none'}
-        # 这里用“意图名”（mapped_intent）来匹配；你也可以扩展成同时支持 contract_type
-        if gate_set and (mapped_intent in gate_set):
-            try:
-                eff = effect_check_with_ref(t["prompt"], text, model="none", contract=contract, cfg=cfg)
-                effect_pass = bool(eff.get("success", False))
-                if not effect_pass:
-                    audit_reject("effect_gate_fail", {"intent": mapped_intent, "pair_id": pair_id})
-                    continue
-                emeta = eff  # 记入元数据，方便审计
-            except Exception as e:
-                audit_reject("effect_gate_error", {"err": str(e), "intent": mapped_intent, "pair_id": pair_id})
+            if fam_count[fam_name] >= family_cap:
+                audit_reject("family_cap", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
                 continue
-        else:
-            effect_pass = False
-        emeta = {"validator": "diagnostic", "cats": vio, "eval_info": {"engine": "none"}}
-        disc_flag = (rng_pair.random() < disc_rate)
-        disc_str = rng_pair.choice(DISCLAIMER_BANK) if disc_flag else None
-        if disc_flag and disc_str:
-            text = f"{disc_str}\n{text}"
-        # 对称附件（在遮蔽前添加）+ 中性变换
-        text = apply_symmetric_accessories(text, rng_pair, rate=0.10)
-        text = transform_text_pipeline(text, rng_pair)
-        # 中文语言生态噪声（只对自然语，跳过结构块）
-        if not is_coherent_cn(text):
-            audit_reject("coherence_gate_fail", {"pair_id": pair_id, "intent": mapped_intent, "phase": "pos_surface"})
-            continue
-        # 正类对称去软话术：少量样本剥离软提示，避免标签可学性来源于语块
-        text, soft_hint_removed = maybe_strip_soft_hints(
-            text,
-            rng_pair,
-            soft_hint_rate * 0.5,
-        )
-        evidence_ok = True if artifact_free_applied else _evidence_profile_ok(text, min_hits=2)
-        if not evidence_ok:
-            audit_reject("struct_evidence_needed", {"pair_id": pair_id, "intent": intent})
-            continue
-        # 10) 对称遮蔽（减少载体/字段伪迹），按 pair_id 派生 rng 保持与负例对齐
-        masked_applied = False
-        if mask_on in ('both','pos'):
-            before_mask = text
-            text = mask_format_features_sym(text, mask_format_features_rate, rng_pair)
-            masked_applied = (text != before_mask)
-        # 统计与落盘字段（对称增强之后）
-        nbytes = byte_len(text); feats = feature_probe_clean(
-            text,
-            carrier=carrier_name,
-            payload_encoding=payload_encoding,
-        )
-        ratio = cjk_latin_ratio(text); bins=[0.0,0.12,0.35,1.0]; b=0
-        for i in range(len(bins)-1):
-            if bins[i] <= ratio < bins[i+1]: b=i; break
-        stealth_here = estimate_stealth(text)
-        # history length (for multi_turn)
-        hist_len = 1
-        if mode == 'multi_turn':
-            try:
-                if text.strip().startswith('```json'):
-                    for obj in _parse_json_blocks(text):
-                        if isinstance(obj, dict) and isinstance(obj.get('turns'), list):
-                            hist_len = max(hist_len, len(obj['turns']))
-                else:
-                    hist_len = max(hist_len, text.count('用户:') + text.count('助手:'))
-            except Exception:
-                pass
-        hist_bucket = '1' if hist_len<=1 else ('2' if hist_len==2 else ('3-5' if hist_len<=5 else '6+'))
-        # 原始阳性条目
-        base_pos = {
-            "text": text, "task": t["task"], "len": nbytes, "len_bucket": length_bucket(nbytes),
-            "feats": feats, "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
-            "label": 1, "hard_negative": False,
-            "family": fam_name, "intent": mapped_intent, "threat_goal": fam_name,
-            "delivery": mode, "carrier": carrier_name,
-            "attack_channel": pick_channel_by_carrier(mode, carrier_name),
-            "stealth_level": stealth_here,
-            "requires_tool": (fam_name in {"tool_abuse"}),
-            "art_flag": art_flag,
-            "artifacts_present": any(re.search(re.escape(w), text, re.IGNORECASE) for w in ARTIFACT_WORDS),
-            "masked_applied": masked_applied,
-            "struct_evidence_added": (struct_evidence_rate > 0),
-            "history_len": hist_len, "history_len_bucket": hist_bucket,
-            "base_prompt": t["prompt"], "inj_text": inj_text, "pair_id": pair_id,
-            # === 可执行沙箱 ===
-            "passed_semantic_gate": diag_pass,
-            "effect_pass": effect_pass,
-            "effect_meta": emeta,   # 统一结构：validator/adopted_payload/contract_ok/details
-            "inj_channel": dsl.channel, "inj_position": dsl.position,
-            # === 契约/违规 ===
-            "contract": {**asdict(contract), "allowed_labels": list(contract.allowed_labels) if contract.allowed_labels else None},
-            "violations": vio,
-            "side_effects": {k: v for k, v in (vio or {}).items() if str(k).startswith("se_")},
-            "diagnostics": vio,
-            # === 对称化伪迹（只入 meta） ===
-            "disc_flag": disc_flag, "disc_str": disc_str,
-            "payload_hint": payload_hint,
-            "payload_encoding": payload_encoding,
-            "secret_hint": None,
-            # Fallback mechanism label when strategy plan is not used (DSL path)
-            "mechanism": f"{mapped_intent}:{dsl.channel}:{dsl.scope}",
-            "expected_side_effects": {},
-            "meta": {"cjk_target": float(pos_cjk_target)},
-            "soft_hint_removed": soft_hint_removed,
-        }
-        # Auditor (no gate): semantic evidence metrics
-        try:
-            ok_aud, v_aud = gate_injection_sample(text, mapped_intent, mapped_intent, contract, text, payload, artifact_free_applied=artifact_free_applied)
-            base_pos["audit"] = {
-                "semantic_conflict": v_aud.get("semantic_conflict"),
-                "evidence_match_count": v_aud.get("evidence_match_count"),
-            }
-        except Exception:
-            pass
-        # 组合覆盖：先满足每个 (intent,delivery,carrier) 的最小覆盖，再按概率补齐
-        cov_key = (mapped_intent, mode, (carrier_name or "none").split('+')[0])
-        take = True if (min_cov > 0 and cover[cov_key] < min_cov) else (random.random() < 0.5)
-        # Quota-biased acceptance
-        if not take:
-            if stealth_here == 'high' and q_stealth_high < quota_stealth_high_min:
-                take = True
-            if fam_name == 'tool_override' and q_tool_override < quota_tool_override_min:
-                take = True
-            if base_pos.get('artifacts_present') and q_artifact >= quota_artifact_max:
-                take = False
+            # 若开启硬门控：不达标的正类直接剔除
+            if gate_semantic_injection and not _ok_diag:
+                audit_reject("semantic_gate", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                continue
+            # 8) 先生成 pair_id / rng_pair，再做表面增强（要用到 rng_pair）
+            pair_id = f"P{len(cands)+1:07d}"
+            rng_pair = stable_rng("plain_pair", seed, pair_id)
+            pos_cjk_target = max(0.60, (0.7 if min_cjk_share_auto else min_cjk_share))
+            forced_surface = choose_mismatch_carrier(contract.mode, rng_pair)
+            text, carrier_name = apply_surface_augments(
+                text, rng_pair, struct_p=struct_evidence_rate, cjk_target=pos_cjk_target, cfg=cfg,
+                forced_carrier=forced_surface
+            )
+            # 对称注入“软话术”（不增加结构锚点）
+            artifact_free_applied = False
+            apply_soft_hints = True
+            if artifact_free_pos_ratio > 1e-9:
+                if rng_pair.random() < artifact_free_pos_ratio:
+                    artifact_free_applied = True
+                    apply_soft_hints = False
+                    # 先去除结构锚点（TOOL_CALL/APPEND/UPSTREAM/PATH/模板槽等）
+                    text = placeholderless_mirror(text)
+                    # 再中和显词锚点/口号式语句
+                    text = neutralize_anchors(text)
+                    for w in ARTIFACT_WORDS:
+                        text = re.sub(re.escape(w), "", text, flags=re.IGNORECASE)
+            _soft_applied = False
+            if apply_soft_hints:
+                text, _soft_applied = maybe_apply_soft_hints(
+                    text,
+                    rng_pair,
+                    soft_hint_rate,
+                    audit_ctx={"phase": "soft_hint", "pair_id": locals().get("pair_id")},
+                )
+                if _soft_applied:
+                    neg_diag_audit = (neg_diag_audit or {})
+                    neg_diag_audit["soft_hint_applied"] = True
+            # 9) 语义诊断 → 硬门控（⚠️在 artifact-free 后重新门控）
+            if gate_semantic_injection:
                 try:
-                    audit_reject("artifact_quota", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                    _ok_diag2, _v2 = gate_injection_sample(text, mapped_intent, mapped_intent, contract, text, payload, artifact_free_applied=artifact_free_applied)
+                    _ok_contract2 = gate_by_contract_from_dsl(
+                        contract, PIDSL("policy_bypass","in_context","inline","result_slot","html_comment"),
+                        text, require_support=True
+                    )
+                    if not (_ok_diag2 and _ok_contract2):
+                        audit_reject("semantic_gate_after_artifact", {
+                            "task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": pair_id
+                        })
+                        continue
+                    _ok_diag = _ok_diag2
+                except Exception as e:
+                    audit_reject("semantic_gate_after_artifact_error", {"err": str(e), "pair_id": pair_id})
+                    continue
+            diag_pass = bool(_ok_diag)
+            if not diag_pass:
+                audit_reject("semantic_gate_failed", {"pair_id": pair_id, "intent": intent, "cats": vio})
+                continue
+            gate_set = {s.strip() for s in str(_cfg_attr(cfg, 'effect_gate_categories', '') or '').split(',')} - {'', 'none'}
+            # 这里用“意图名”（mapped_intent）来匹配；你也可以扩展成同时支持 contract_type
+            if gate_set and (mapped_intent in gate_set):
+                try:
+                    eff = effect_check_with_ref(t["prompt"], text, model="none", contract=contract, cfg=cfg)
+                    effect_pass = bool(eff.get("success", False))
+                    if not effect_pass:
+                        audit_reject("effect_gate_fail", {"intent": mapped_intent, "pair_id": pair_id})
+                        continue
+                    emeta = eff  # 记入元数据，方便审计
+                except Exception as e:
+                    audit_reject("effect_gate_error", {"err": str(e), "intent": mapped_intent, "pair_id": pair_id})
+                    continue
+            else:
+                effect_pass = False
+            emeta = {"validator": "diagnostic", "cats": vio, "eval_info": {"engine": "none"}}
+            disc_flag = (rng_pair.random() < disc_rate)
+            disc_str = rng_pair.choice(DISCLAIMER_BANK) if disc_flag else None
+            if disc_flag and disc_str:
+                text = f"{disc_str}\n{text}"
+            # 对称附件（在遮蔽前添加）+ 中性变换
+            text = apply_symmetric_accessories(text, rng_pair, rate=0.10)
+            text = transform_text_pipeline(text, rng_pair)
+            # 中文语言生态噪声（只对自然语，跳过结构块）
+            if not is_coherent_cn(text):
+                audit_reject("coherence_gate_fail", {"pair_id": pair_id, "intent": mapped_intent, "phase": "pos_surface"})
+                continue
+            # 正类对称去软话术：少量样本剥离软提示，避免标签可学性来源于语块
+            text, soft_hint_removed = maybe_strip_soft_hints(
+                text,
+                rng_pair,
+                soft_hint_rate * 0.5,
+            )
+            evidence_ok = True if artifact_free_applied else _evidence_profile_ok(text, min_hits=2)
+            if not evidence_ok:
+                audit_reject("struct_evidence_needed", {"pair_id": pair_id, "intent": intent})
+                continue
+            # 10) 对称遮蔽（减少载体/字段伪迹），按 pair_id 派生 rng 保持与负例对齐
+            masked_applied = False
+            if mask_on in ('both','pos'):
+                before_mask = text
+                text = mask_format_features_sym(text, mask_format_features_rate, rng_pair)
+                masked_applied = (text != before_mask)
+            # 统计与落盘字段（对称增强之后）
+            nbytes = byte_len(text); feats = feature_probe_clean(
+                text,
+                carrier=carrier_name,
+                payload_encoding=payload_encoding,
+            )
+            ratio = cjk_latin_ratio(text); bins=[0.0,0.12,0.35,1.0]; b=0
+            for i in range(len(bins)-1):
+                if bins[i] <= ratio < bins[i+1]: b=i; break
+            stealth_here = estimate_stealth(text)
+            # history length (for multi_turn)
+            hist_len = 1
+            if mode == 'multi_turn':
+                try:
+                    if text.strip().startswith('```json'):
+                        for obj in _parse_json_blocks(text):
+                            if isinstance(obj, dict) and isinstance(obj.get('turns'), list):
+                                hist_len = max(hist_len, len(obj['turns']))
+                    else:
+                        hist_len = max(hist_len, text.count('用户:') + text.count('助手:'))
                 except Exception:
                     pass
-        if not take:
-            continue
-        cover[cov_key] += 1
-        if stealth_here == 'high':
-            q_stealth_high += 1
-        if fam_name == 'tool_override':
-            q_tool_override += 1
-        if base_pos.get('artifacts_present'):
-            q_artifact += 1
-        # 等价最小化阳性：锚点剥离但保持事件不变
-        equiv_id = f"EQ-{_rand_key(6)}"
-        cands.append({**base_pos, "equiv_group_id": equiv_id, "variant": "original"})
+            hist_bucket = '1' if hist_len<=1 else ('2' if hist_len==2 else ('3-5' if hist_len<=5 else '6+'))
+            # 原始阳性条目
+            base_pos = {
+                "text": text, "task": t["task"], "len": nbytes, "len_bucket": length_bucket(nbytes),
+                "feats": feats, "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
+                "label": 1, "hard_negative": False,
+                "family": fam_name, "intent": mapped_intent, "threat_goal": fam_name,
+                "delivery": mode, "carrier": carrier_name,
+                "attack_channel": pick_channel_by_carrier(mode, carrier_name),
+                "stealth_level": stealth_here,
+                "requires_tool": (fam_name in {"tool_abuse"}),
+                "art_flag": art_flag,
+                "artifacts_present": any(re.search(re.escape(w), text, re.IGNORECASE) for w in ARTIFACT_WORDS),
+                "masked_applied": masked_applied,
+                "struct_evidence_added": (struct_evidence_rate > 0),
+                "history_len": hist_len, "history_len_bucket": hist_bucket,
+                "base_prompt": t["prompt"], "inj_text": inj_text, "pair_id": pair_id,
+                # === 可执行沙箱 ===
+                "passed_semantic_gate": diag_pass,
+                "effect_pass": effect_pass,
+                "effect_meta": emeta,   # 统一结构：validator/adopted_payload/contract_ok/details
+                "inj_channel": dsl.channel, "inj_position": dsl.position,
+                # === 契约/违规 ===
+                "contract": {**asdict(contract), "allowed_labels": list(contract.allowed_labels) if contract.allowed_labels else None},
+                "violations": vio,
+                "side_effects": {k: v for k, v in (vio or {}).items() if str(k).startswith("se_")},
+                "diagnostics": vio,
+                # === 对称化伪迹（只入 meta） ===
+                "disc_flag": disc_flag, "disc_str": disc_str,
+                "payload_hint": payload_hint,
+                "payload_encoding": payload_encoding,
+                "secret_hint": None,
+                # Fallback mechanism label when strategy plan is not used (DSL path)
+                "mechanism": f"{mapped_intent}:{dsl.channel}:{dsl.scope}",
+                "expected_side_effects": {},
+                "meta": {"cjk_target": float(pos_cjk_target)},
+                "soft_hint_removed": soft_hint_removed,
+            }
+            # Auditor (no gate): semantic evidence metrics
+            try:
+                ok_aud, v_aud = gate_injection_sample(text, mapped_intent, mapped_intent, contract, text, payload, artifact_free_applied=artifact_free_applied)
+                base_pos["audit"] = {
+                    "semantic_conflict": v_aud.get("semantic_conflict"),
+                    "evidence_match_count": v_aud.get("evidence_match_count"),
+                }
+            except Exception:
+                pass
+            # 组合覆盖：先满足每个 (intent,delivery,carrier) 的最小覆盖，再按概率补齐
+            cov_key = (mapped_intent, mode, (carrier_name or "none").split('+')[0])
+            take = True if (min_cov > 0 and cover[cov_key] < min_cov) else (random.random() < 0.5)
+            # Quota-biased acceptance
+            if not take:
+                if stealth_here == 'high' and q_stealth_high < quota_stealth_high_min:
+                    take = True
+                if fam_name == 'tool_override' and q_tool_override < quota_tool_override_min:
+                    take = True
+                if base_pos.get('artifacts_present') and q_artifact >= quota_artifact_max:
+                    take = False
+                    try:
+                        audit_reject("artifact_quota", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                    except Exception:
+                        pass
+            if not take:
+                continue
+            cover[cov_key] += 1
+            if stealth_here == 'high':
+                q_stealth_high += 1
+            if fam_name == 'tool_override':
+                q_tool_override += 1
+            if base_pos.get('artifacts_present'):
+                q_artifact += 1
+            # 等价最小化阳性：锚点剥离但保持事件不变
+            equiv_id = f"EQ-{_rand_key(6)}"
+            cands.append({**base_pos, "equiv_group_id": equiv_id, "variant": "original"})
+            try:
+    
+                def _min_violation_variant(orig: str) -> Optional[str]:
+                    steps = [
+                        lambda x: placeholderless_mirror(x),
+                        lambda x: neutralize_anchors(x),
+                        lambda x: re.sub(r"```(\w+)?", "```txt", x),
+                        lambda x: HTML_COMMENT_RE.sub("", x),
+                        lambda x: re.sub(r"^---[\s\S]*?---\s*", "", x, flags=re.M),
+                    ]
+                    cur = orig
+                    for fn in steps:
+                        trial = fn(cur)
+                        inv_ok, _fails = adjudicate_event_invariants(contract, parse_events_from_text(trial))
+                        if inv_ok == 1:
+                            cur = trial
+                        else:
+                            break
+                    return cur if cur != orig else None
+                anchor_free_text = _min_violation_variant(text)
+                if anchor_free_text:
+                    nb = byte_len(anchor_free_text); ft = feature_probe_clean(
+                        anchor_free_text,
+                        carrier=base_pos.get("carrier"),
+                        payload_encoding=base_pos.get("payload_encoding"),
+                    )
+                    r2 = cjk_latin_ratio(anchor_free_text); b2 = 0
+                    for i in range(len(bins)-1):
+                        if bins[i] <= r2 < bins[i+1]: b2=i; break
+                    cands.append({**base_pos, "text": anchor_free_text, "len": nb, "len_bucket": length_bucket(nb),
+                                  "feats": ft, "latin_over_cjk": r2, "latin_over_cjk_bin": b2,
+                                  "equiv_group_id": equiv_id, "variant": "min_violation"})
+            except Exception as e:
+                audit_reject("min_violation_error", {"phase":"compose_pos", "err": str(e)})
+            fam_count[fam_name]+=1
+        # 组合阶段门控统计
         try:
-
-            def _min_violation_variant(orig: str) -> Optional[str]:
-                steps = [
-                    lambda x: placeholderless_mirror(x),
-                    lambda x: neutralize_anchors(x),
-                    lambda x: re.sub(r"```(\w+)?", "```txt", x),
-                    lambda x: HTML_COMMENT_RE.sub("", x),
-                    lambda x: re.sub(r"^---[\s\S]*?---\s*", "", x, flags=re.M),
-                ]
-                cur = orig
-                for fn in steps:
-                    trial = fn(cur)
-                    inv_ok, _fails = adjudicate_event_invariants(contract, parse_events_from_text(trial))
-                    if inv_ok == 1:
-                        cur = trial
-                    else:
-                        break
-                return cur if cur != orig else None
-            anchor_free_text = _min_violation_variant(text)
-            if anchor_free_text:
-                nb = byte_len(anchor_free_text); ft = feature_probe_clean(
-                    anchor_free_text,
-                    carrier=base_pos.get("carrier"),
-                    payload_encoding=base_pos.get("payload_encoding"),
-                )
-                r2 = cjk_latin_ratio(anchor_free_text); b2 = 0
-                for i in range(len(bins)-1):
-                    if bins[i] <= r2 < bins[i+1]: b2=i; break
-                cands.append({**base_pos, "text": anchor_free_text, "len": nb, "len_bucket": length_bucket(nb),
-                              "feats": ft, "latin_over_cjk": r2, "latin_over_cjk_bin": b2,
-                              "equiv_group_id": equiv_id, "variant": "min_violation"})
-        except Exception as e:
-            audit_reject("min_violation_error", {"phase":"compose_pos", "err": str(e)})
-        fam_count[fam_name]+=1
-    # 组合阶段门控统计
-    try:
-        print(f"[gate][compose] attempts={attempts} kept={len(cands)} accept_rate={(len(cands)/(attempts+1e-9)):.3f}")
-    except Exception:
-        pass
-    return cands
+            print(f"[gate][compose] attempts={attempts} kept={len(cands)} accept_rate={(len(cands)/(attempts+1e-9)):.3f}")
+        except Exception:
+            pass
+        return cands
 
 def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     min_cjk_share: float, min_cjk_share_auto: bool,
@@ -7293,194 +7330,196 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
                       use_model_eval: bool = False,
                       strict_neg_diag_gate: bool = True,
                       cfg: Optional[Config] = None) -> List[Dict[str,Any]]:
-    random.seed(seed + 1337)
-    disc_rate = _effective_disc_rate(disc_rate, cfg)
-    soft_hint_rate = float(_cfg_attr(cfg, 'soft_hint_rate', 0.18))
-    eff_mult, _ = _resolve_oversample_multiplier(k, oversample_mult)
-    wanted = int(math.ceil(k * max(1.0, eff_mult)))
-    cands = []
-    fam_count = Counter()
-    attempts = 0
-    while len(cands) < wanted and target_pool:
-        attempts += 1
-        t = random.choice(target_pool)
-        tpl = random.choice(HARDNEG_TPLS)
-        tpl_text = tpl
-        pl = sample_payload(structured=True)
-        pl.update({
-            "payload_b64":  enc_base64(pl["payload"]),
-            "payload_url":  enc_url(pl["payload"]),
-            "payload_html": enc_html_entity(pl["payload"]),
-        })
-        # 可选：硬负“效果防护”仅作审计；不作门控
-        neg_effect_audit = None
-        if neg_effect_guard and ("{payload}" in tpl_text) and use_model_eval:
+    ctx_seed = stable_seed_int("compose_attacks", "compose_hard_negs_serial", seed)
+    with random_module_binding("compose_attacks", ctx_seed):
+        random.seed(seed + 1337)
+        disc_rate = _effective_disc_rate(disc_rate, cfg)
+        soft_hint_rate = float(_cfg_attr(cfg, 'soft_hint_rate', 0.18))
+        eff_mult, _ = _resolve_oversample_multiplier(k, oversample_mult)
+        wanted = int(math.ceil(k * max(1.0, eff_mult)))
+        cands = []
+        fam_count = Counter()
+        attempts = 0
+        while len(cands) < wanted and target_pool:
+            attempts += 1
+            t = random.choice(target_pool)
+            tpl = random.choice(HARDNEG_TPLS)
+            tpl_text = tpl
+            pl = sample_payload(structured=True)
+            pl.update({
+                "payload_b64":  enc_base64(pl["payload"]),
+                "payload_url":  enc_url(pl["payload"]),
+                "payload_html": enc_html_entity(pl["payload"]),
+            })
+            # 可选：硬负“效果防护”仅作审计；不作门控
+            neg_effect_audit = None
+            if neg_effect_guard and ("{payload}" in tpl_text) and use_model_eval:
+                try:
+                    ok, meta = effect_check_triplet(
+                        task_prompt=t["prompt"], inj_tpl=tpl_text, task_meta={"task": t.get("task")},
+                        true_payload=pl.get("payload",""), decoy=random.choice(DECOY_POOL), force_anchor=False,
+                        use_end_nonce=use_end_nonce
+                    )
+                    neg_effect_audit = {"could_hijack": bool(ok), **meta}
+                except Exception as e:
+                    neg_effect_audit = {"error": str(e)}
+            # 诊断审核（结构/意图）默认启用（不影响入选，仅审计）
             try:
-                ok, meta = effect_check_triplet(
-                    task_prompt=t["prompt"], inj_tpl=tpl_text, task_meta={"task": t.get("task")},
-                    true_payload=pl.get("payload",""), decoy=random.choice(DECOY_POOL), force_anchor=False,
-                    use_end_nonce=use_end_nonce
-                )
-                neg_effect_audit = {"could_hijack": bool(ok), **meta}
+                contract_neg_diag = derive_task_contract(t["task"])
+                preview_base = normalize(inject_unicode_noise(inject_noise_light(f"{random_title()}\n{t['prompt']}{random_sep()}{tpl_text}"), p=0.00))
+                ok_diag, vio_diag = gate_by_contract_from_dsl(contract_neg_diag, PIDSL("policy_bypass","in_context","inline","result_slot","html_comment"), preview_base, require_support=True)
+                neg_diag_audit = {"would_be_flagged": bool(ok_diag), "cats": vio_diag.get("cats", {})}
             except Exception as e:
-                neg_effect_audit = {"error": str(e)}
-        # 诊断审核（结构/意图）默认启用（不影响入选，仅审计）
-        try:
-            contract_neg_diag = derive_task_contract(t["task"])
-            preview_base = normalize(inject_unicode_noise(inject_noise_light(f"{random_title()}\n{t['prompt']}{random_sep()}{tpl_text}"), p=0.00))
-            ok_diag, vio_diag = gate_by_contract_from_dsl(contract_neg_diag, PIDSL("policy_bypass","in_context","inline","result_slot","html_comment"), preview_base, require_support=True)
-            neg_diag_audit = {"would_be_flagged": bool(ok_diag), "cats": vio_diag.get("cats", {})}
-        except Exception as e:
-            neg_diag_audit = {"error": str(e)}
-        txt = art_or_euphemism(tpl_text.format(**pl), use_art=(random.random() < art_match_rate))
-        # 强中和顺序：先危险字段→锚点→再严格判定→不行则 strip_attack_intent
-        txt = neutralize_dangerous_fields(txt)
-        txt = neutralize_anchors(txt)
-        contract_neg = derive_task_contract(t["task"])
-        if not is_benign_strict(txt, contract_neg):
-            txt2 = strip_attack_intent(txt)
-            if not is_benign_strict(txt2, contract_neg):
-                audit_reject("contract_violation", {"task": t.get("task","_"), "family": "hardneg", "intent": "benign", "pair_id": None})
+                neg_diag_audit = {"error": str(e)}
+            txt = art_or_euphemism(tpl_text.format(**pl), use_art=(random.random() < art_match_rate))
+            # 强中和顺序：先危险字段→锚点→再严格判定→不行则 strip_attack_intent
+            txt = neutralize_dangerous_fields(txt)
+            txt = neutralize_anchors(txt)
+            contract_neg = derive_task_contract(t["task"])
+            if not is_benign_strict(txt, contract_neg):
+                txt2 = strip_attack_intent(txt)
+                if not is_benign_strict(txt2, contract_neg):
+                    audit_reject("contract_violation", {"task": t.get("task","_"), "family": "hardneg", "intent": "benign", "pair_id": None})
+                    continue
+                txt = txt2
+            # 诊断审核：若开启严格负样本门控（如 strict 均衡），则丢弃可疑负类
+            suspect_neg = 0
+            total_neg_checked = 0
+            try:
+                gn_flag = False
+                if strict_neg_diag_gate:
+                    total_neg_checked += 1
+                    ok_diag, _vio = gate_by_contract_from_dsl(contract_neg, PIDSL("policy_bypass","in_context","inline","result_slot","html_comment"), txt, require_support=True)
+                    if ok_diag:
+                        suspect_neg += 1
+                        keep_p = float(_cfg_attr(cfg, 'gray_neg_keep_frac', 0.35))
+                        if random.random() > keep_p:
+                            continue
+                        else:
+                            try:
+                                audit_reject("gray_neg_keep", {"phase":"compose_hardneg"})
+                            except Exception:
+                                pass
+                            gn_flag = True
+            except Exception as e:
+                audit_reject("stats_print_error", {"phase":"compose_hardneg", "err": e})
+            raw = inject_unicode_noise(inject_noise_light(f"{random_title()}\n{t['prompt']}{random_sep()}{neutralize_dangerous_fields(txt)}"), p=0.08)
+            text = normalize(raw)
+            # --- CJK share policy: hard/tiered/audit ---
+            cur_share = cjk_share(text)
+            policy = _cfg_attr(cfg, 'cjk_policy', 'tiered')
+            base_cjk = (random.choice([0.6,0.7,0.85,0.9]) if min_cjk_share_auto else min_cjk_share)
+            if policy == 'hard':
+                if cur_share < target_min_cjk:
+                    try:
+                        PLAIN_REJECT_CJK_BY_CARRIER[carrier_name] += 1
+                    except Exception:
+                        pass
+                    continue
+            elif policy == 'tiered':
+                if cur_share < 0.35:
+                    try:
+                        PLAIN_REJECT_CJK_BY_CARRIER[carrier_name] += 1
+                    except Exception:
+                        pass
+                    audit_reject("cjk_ratio_low", {"task": t.get("task","_")})
+                    continue
+            else:
+                pass
+            # === add disclaimers with same probability as positives // 与正类等频加免责声明 ===
+            pair_id = f"HARD-{len(cands)+1:07d}"
+            rng_pair = stable_rng("plain_pair", seed, pair_id)
+            disc_flag = (rng_pair.random() < disc_rate)
+            disc_str = rng_pair.choice(DISCLAIMER_BANK) if disc_flag else None
+            forced_surface = choose_mismatch_carrier(contract_neg.mode, rng_pair)
+            text, carrier_name = apply_surface_augments(
+                text, rng_pair, struct_p=struct_evidence_rate, cjk_target=pos_cjk_target, cfg=cfg,
+                forced_carrier=forced_surface
+            )
+            text, _soft_applied = maybe_apply_soft_hints(
+                text,
+                rng_pair,
+                soft_hint_rate,
+                audit_ctx={"phase": "soft_hint", "pair_id": pair_id, "kind": "hardneg"},
+            )
+            if _soft_applied:
+                neg_diag_audit = (neg_diag_audit or {})
+                neg_diag_audit["soft_hint_applied"] = True
+            # 对称插入免责声明（若启用），在遮蔽之前插入
+            if disc_flag and disc_str:
+                text = f"{disc_str}\n{text}"
+            # 对称附件 + 中性变换（与正类对齐）
+            text = apply_symmetric_accessories(text, rng_pair, rate=0.10)
+            text = transform_text_pipeline(text, rng_pair)
+            # 中文语言生态噪声（只自然语）
+            try:
+                text = apply_cn_eco_noise(text, rng_pair, rate=0.15)
+            except Exception:
+                pass
+            if not is_coherent_cn(text):
+                audit_reject("coherence_gate_fail", {"pair_id": pair_id, "phase": "hardneg"})
                 continue
-            txt = txt2
-        # 诊断审核：若开启严格负样本门控（如 strict 均衡），则丢弃可疑负类
-        suspect_neg = 0
-        total_neg_checked = 0
+            text, _soft_removed = maybe_strip_soft_hints(
+                text,
+                rng_pair,
+                soft_hint_rate * 0.5,
+            )
+            if _soft_removed:
+                neg_diag_audit = (neg_diag_audit or {})
+                neg_diag_audit["soft_hint_removed"] = True
+            # 对称遮蔽，减少载体/字段伪迹（按 mask_on 应用）
+            masked_applied = False
+            if mask_on in ('both','neg'):
+                before_mask = text
+                text = mask_format_features_sym(text, mask_format_features_rate, rng_pair)
+                masked_applied = (text != before_mask)
+            # intent & carrier
+            intent = "benign" 
+            if not deduper_accept_normalized(deduper, text, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks): continue
+            if fam_count["hardneg"] >= family_cap: continue
+            nbytes = byte_len(text)
+            feats = feature_probe_clean(
+                text,
+                carrier=carrier_name,
+            )
+            ratio = cjk_latin_ratio(text); bins=[0.0,0.12,0.35,1.0]
+            b = 0
+            for i in range(len(bins)-1):
+                if bins[i] <= ratio < bins[i+1]: b=i; break
+            try:
+                RUNTIME_NEG_ACCEPTS_BY_CARRIER[(carrier_name or "none").split("+")[0]] += 1
+            except Exception:
+                pass
+            # 软证据命中（审计用）
+            try:
+                from dsl_core import soft_evidence_kinds
+                neg_diag_audit = (neg_diag_audit or {})
+                neg_diag_audit["soft_evidence_kinds"] = list(soft_evidence_kinds(text))
+            except Exception:
+                pass
+            cands.append({
+                "text": text, "task": t["task"], "len": nbytes,
+                "len_bucket": length_bucket(nbytes), "feats": feats,
+                "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
+                "family": "hardneg", "delivery": "mixed", "intent": "benign",
+                "carrier": carrier_name, "pair_id": pair_id,
+                "disc_flag": disc_flag, "disc_str": disc_str,
+                "artifacts_present": any(re.search(re.escape(w), text, re.IGNORECASE) for w in ARTIFACT_WORDS),
+                "neg_effect_audit": neg_effect_audit,
+                "neg_diag_audit": neg_diag_audit,
+                "gray_negative": bool(gn_flag),
+                "masked_applied": masked_applied,
+                "struct_evidence_added": (struct_evidence_rate > 0),
+                "label": 0, "hard_negative": True,
+                'suspect_neg': suspect_neg, 'total_neg_checked': total_neg_checked
+            })
+            fam_count["hardneg"] += 1
+        # 硬负例阶段统计
         try:
-            gn_flag = False
-            if strict_neg_diag_gate:
-                total_neg_checked += 1
-                ok_diag, _vio = gate_by_contract_from_dsl(contract_neg, PIDSL("policy_bypass","in_context","inline","result_slot","html_comment"), txt, require_support=True)
-                if ok_diag:
-                    suspect_neg += 1
-                    keep_p = float(_cfg_attr(cfg, 'gray_neg_keep_frac', 0.35))
-                    if random.random() > keep_p:
-                        continue
-                    else:
-                        try:
-                            audit_reject("gray_neg_keep", {"phase":"compose_hardneg"})
-                        except Exception:
-                            pass
-                        gn_flag = True
-        except Exception as e:
-            audit_reject("stats_print_error", {"phase":"compose_hardneg", "err": e})
-        raw = inject_unicode_noise(inject_noise_light(f"{random_title()}\n{t['prompt']}{random_sep()}{neutralize_dangerous_fields(txt)}"), p=0.08)
-        text = normalize(raw)
-        # --- CJK share policy: hard/tiered/audit ---
-        cur_share = cjk_share(text)
-        policy = _cfg_attr(cfg, 'cjk_policy', 'tiered')
-        base_cjk = (random.choice([0.6,0.7,0.85,0.9]) if min_cjk_share_auto else min_cjk_share)
-        if policy == 'hard':
-            if cur_share < target_min_cjk:
-                try:
-                    PLAIN_REJECT_CJK_BY_CARRIER[carrier_name] += 1
-                except Exception:
-                    pass
-                continue
-        elif policy == 'tiered':
-            if cur_share < 0.35:
-                try:
-                    PLAIN_REJECT_CJK_BY_CARRIER[carrier_name] += 1
-                except Exception:
-                    pass
-                audit_reject("cjk_ratio_low", {"task": t.get("task","_")})
-                continue
-        else:
-            pass
-        # === add disclaimers with same probability as positives // 与正类等频加免责声明 ===
-        pair_id = f"HARD-{len(cands)+1:07d}"
-        rng_pair = stable_rng("plain_pair", seed, pair_id)
-        disc_flag = (rng_pair.random() < disc_rate)
-        disc_str = rng_pair.choice(DISCLAIMER_BANK) if disc_flag else None
-        forced_surface = choose_mismatch_carrier(contract_neg.mode, rng_pair)
-        text, carrier_name = apply_surface_augments(
-            text, rng_pair, struct_p=struct_evidence_rate, cjk_target=pos_cjk_target, cfg=cfg,
-            forced_carrier=forced_surface
-        )
-        text, _soft_applied = maybe_apply_soft_hints(
-            text,
-            rng_pair,
-            soft_hint_rate,
-            audit_ctx={"phase": "soft_hint", "pair_id": pair_id, "kind": "hardneg"},
-        )
-        if _soft_applied:
-            neg_diag_audit = (neg_diag_audit or {})
-            neg_diag_audit["soft_hint_applied"] = True
-        # 对称插入免责声明（若启用），在遮蔽之前插入
-        if disc_flag and disc_str:
-            text = f"{disc_str}\n{text}"
-        # 对称附件 + 中性变换（与正类对齐）
-        text = apply_symmetric_accessories(text, rng_pair, rate=0.10)
-        text = transform_text_pipeline(text, rng_pair)
-        # 中文语言生态噪声（只自然语）
-        try:
-            text = apply_cn_eco_noise(text, rng_pair, rate=0.15)
+            print(f"[gate][hardneg] attempts={attempts} kept={len(cands)} accept_rate={(len(cands)/(attempts+1e-9)):.3f}")
         except Exception:
             pass
-        if not is_coherent_cn(text):
-            audit_reject("coherence_gate_fail", {"pair_id": pair_id, "phase": "hardneg"})
-            continue
-        text, _soft_removed = maybe_strip_soft_hints(
-            text,
-            rng_pair,
-            soft_hint_rate * 0.5,
-        )
-        if _soft_removed:
-            neg_diag_audit = (neg_diag_audit or {})
-            neg_diag_audit["soft_hint_removed"] = True
-        # 对称遮蔽，减少载体/字段伪迹（按 mask_on 应用）
-        masked_applied = False
-        if mask_on in ('both','neg'):
-            before_mask = text
-            text = mask_format_features_sym(text, mask_format_features_rate, rng_pair)
-            masked_applied = (text != before_mask)
-        # intent & carrier
-        intent = "benign" 
-        if not deduper_accept_normalized(deduper, text, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks): continue
-        if fam_count["hardneg"] >= family_cap: continue
-        nbytes = byte_len(text)
-        feats = feature_probe_clean(
-            text,
-            carrier=carrier_name,
-        )
-        ratio = cjk_latin_ratio(text); bins=[0.0,0.12,0.35,1.0]
-        b = 0
-        for i in range(len(bins)-1):
-            if bins[i] <= ratio < bins[i+1]: b=i; break
-        try:
-            RUNTIME_NEG_ACCEPTS_BY_CARRIER[(carrier_name or "none").split("+")[0]] += 1
-        except Exception:
-            pass
-        # 软证据命中（审计用）
-        try:
-            from dsl_core import soft_evidence_kinds
-            neg_diag_audit = (neg_diag_audit or {})
-            neg_diag_audit["soft_evidence_kinds"] = list(soft_evidence_kinds(text))
-        except Exception:
-            pass
-        cands.append({
-            "text": text, "task": t["task"], "len": nbytes,
-            "len_bucket": length_bucket(nbytes), "feats": feats,
-            "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
-            "family": "hardneg", "delivery": "mixed", "intent": "benign",
-            "carrier": carrier_name, "pair_id": pair_id,
-            "disc_flag": disc_flag, "disc_str": disc_str,
-            "artifacts_present": any(re.search(re.escape(w), text, re.IGNORECASE) for w in ARTIFACT_WORDS),
-            "neg_effect_audit": neg_effect_audit,
-            "neg_diag_audit": neg_diag_audit,
-            "gray_negative": bool(gn_flag),
-            "masked_applied": masked_applied,
-            "struct_evidence_added": (struct_evidence_rate > 0),
-            "label": 0, "hard_negative": True,
-            'suspect_neg': suspect_neg, 'total_neg_checked': total_neg_checked
-        })
-        fam_count["hardneg"] += 1
-    # 硬负例阶段统计
-    try:
-        print(f"[gate][hardneg] attempts={attempts} kept={len(cands)} accept_rate={(len(cands)/(attempts+1e-9)):.3f}")
-    except Exception:
-        pass
-    return cands
+        return cands
 
 def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
                       min_cjk_share: float, min_cjk_share_auto: bool,
@@ -7618,105 +7657,109 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
 
 def intent_balanced_pick(rows_pos, pos_n, seed: int):
     """目标配额优先：按 INTENT_TARGET_DIST 分配配额，不足再回填。"""
-    random.seed(seed)
-    # 聚合各 intent 的候选
-    by_intent = defaultdict(list)
-    for r in rows_pos:
-        by_intent[r.get("intent","format_anchor")].append(r)
-    # 归一化目标分布（仅对出现的 intent 做再归一化）
-    intents_present = list(by_intent.keys())
-    weights = []
-    for it in intents_present:
-        w = globals().get('INTENT_TARGET_DIST', {}).get(it, 0.0)
-        # 给未知 intent 一个微小权重，避免被饿死
-        weights.append(w if w > 0 else 0.02)
-    s = sum(weights) or 1.0
-    weights = [w/s for w in weights]
-    # 计算目标配额并截断候选上限
-    quotas = {it: int(round(pos_n * w)) for it, w in zip(intents_present, weights)}
-    # 修正四舍五入误差
-    diff = pos_n - sum(quotas.values())
-    if diff != 0:
-        # 按剩余候选量从多到少补齐/削减
-        order = sorted(intents_present, key=lambda k: len(by_intent[k]), reverse=True)
-        i = 0
-        while diff != 0 and order:
-            k = order[i % len(order)]
-            quotas[k] += 1 if diff > 0 else -1
-            diff += -1 if diff > 0 else 1
-            i += 1
-    picked, rest = [], []
-    for k in intents_present:
-        random.shuffle(by_intent[k])
-        take = min(len(by_intent[k]), max(0, quotas.get(k, 0)))
-        picked.extend(by_intent[k][:take])
-        rest.extend(by_intent[k][take:])
-    random.shuffle(rest)
-    while len(picked) < pos_n and rest:
-        picked.append(rest.pop())
-    return picked[:pos_n]
+    ctx_seed = stable_seed_int("compose_attacks", "intent_balanced_pick", seed)
+    with random_module_binding("compose_attacks", ctx_seed):
+        random.seed(seed)
+        # 聚合各 intent 的候选
+        by_intent = defaultdict(list)
+        for r in rows_pos:
+            by_intent[r.get("intent","format_anchor")].append(r)
+        # 归一化目标分布（仅对出现的 intent 做再归一化）
+        intents_present = list(by_intent.keys())
+        weights = []
+        for it in intents_present:
+            w = globals().get('INTENT_TARGET_DIST', {}).get(it, 0.0)
+            # 给未知 intent 一个微小权重，避免被饿死
+            weights.append(w if w > 0 else 0.02)
+        s = sum(weights) or 1.0
+        weights = [w/s for w in weights]
+        # 计算目标配额并截断候选上限
+        quotas = {it: int(round(pos_n * w)) for it, w in zip(intents_present, weights)}
+        # 修正四舍五入误差
+        diff = pos_n - sum(quotas.values())
+        if diff != 0:
+            # 按剩余候选量从多到少补齐/削减
+            order = sorted(intents_present, key=lambda k: len(by_intent[k]), reverse=True)
+            i = 0
+            while diff != 0 and order:
+                k = order[i % len(order)]
+                quotas[k] += 1 if diff > 0 else -1
+                diff += -1 if diff > 0 else 1
+                i += 1
+        picked, rest = [], []
+        for k in intents_present:
+            random.shuffle(by_intent[k])
+            take = min(len(by_intent[k]), max(0, quotas.get(k, 0)))
+            picked.extend(by_intent[k][:take])
+            rest.extend(by_intent[k][take:])
+        random.shuffle(rest)
+        while len(picked) < pos_n and rest:
+            picked.append(rest.pop())
+        return picked[:pos_n]
 
 def pick_by_intent_carrier_delivery_anchor(rows_pos, pos_n, seed: int):
     """基于 (intent, carrier, delivery) 的最小配额覆盖后再回填。"""
-    random.seed(seed)
-    # 准备分布：intent 用 INTENT_TARGET_DIST，carrier 用 CARRIER_WEIGHTS 归一化，delivery 均匀
-    by_key = defaultdict(list)
-    intents = set()
-    carriers = set()
-    deliveries = set()
-
-    def _af(r):
-        try:
-            cats = ((r.get("diagnostics") or {}).get("cats") or {})
-            return 1 if cats.get("anchor_free", 0) else 0
-        except Exception:
-            return 0
-    for r in rows_pos:
-        it = r.get('intent','format_anchor')
-        ca = (r.get('carrier') or 'none').split('+')[0]
-        dv = r.get('delivery') or 'direct'
-        af = _af(r)
-        by_key[(it, ca, dv, af)].append(r)
-        intents.add(it); carriers.add(ca); deliveries.add(dv)
-    intents, carriers, deliveries = list(intents), list(carriers), list(deliveries)
-    # 归一 intent
-    iw = [INTENT_TARGET_DIST.get(i, 0.05) for i in intents]
-    iw_s = sum(iw) or 1.0; iw = [x/iw_s for x in iw]
-    # 归一 carrier
-    cw = [_carrier_weight_lookup(c, 0.05) for c in carriers]
-    cw_s = sum(cw) or 1.0; cw = [x/cw_s for x in cw]
-    # delivery 均匀
-    dw = [DELIVERY_WEIGHTS.get(d, 0.2) for d in deliveries]
-    dw_s = sum(dw) or 1.0; dw = [x/dw_s for x in dw]
-    aw = [0.5, 0.5]
-    # 生成配额并取整
-    plan = []
-    for i,it in enumerate(intents):
-        for j,ca in enumerate(carriers):
-            for k,dv in enumerate(deliveries):
-                for a,af in enumerate([0,1]):
-                    p = iw[i]*cw[j]*dw[k]*aw[a]
-                    plan.append(((it,ca,dv,af), int(round(pos_n*p))))
-    # 调整误差
-    diff = pos_n - sum(q for _,q in plan)
-    idx = 0
-    while diff != 0 and plan:
-        key, q = plan[idx % len(plan)]
-        plan[idx % len(plan)] = (key, q + (1 if diff > 0 else -1))
-        diff += -1 if diff > 0 else 1
-        idx += 1
-    # 选择
-    picked, rest = [], []
-    for (key, q) in plan:
-        pool = by_key.get(key, [])
-        random.shuffle(pool)
-        take = min(len(pool), max(0, q))
-        picked.extend(pool[:take])
-        rest.extend(pool[take:])
-    random.shuffle(rest)
-    while len(picked) < pos_n and rest:
-        picked.append(rest.pop())
-    return picked[:pos_n]
+    ctx_seed = stable_seed_int("compose_attacks", "pick_intent_carrier_delivery", seed)
+    with random_module_binding("compose_attacks", ctx_seed):
+        random.seed(seed)
+        # 准备分布：intent 用 INTENT_TARGET_DIST，carrier 用 CARRIER_WEIGHTS 归一化，delivery 均匀
+        by_key = defaultdict(list)
+        intents = set()
+        carriers = set()
+        deliveries = set()
+    
+        def _af(r):
+            try:
+                cats = ((r.get("diagnostics") or {}).get("cats") or {})
+                return 1 if cats.get("anchor_free", 0) else 0
+            except Exception:
+                return 0
+        for r in rows_pos:
+            it = r.get('intent','format_anchor')
+            ca = (r.get('carrier') or 'none').split('+')[0]
+            dv = r.get('delivery') or 'direct'
+            af = _af(r)
+            by_key[(it, ca, dv, af)].append(r)
+            intents.add(it); carriers.add(ca); deliveries.add(dv)
+        intents, carriers, deliveries = list(intents), list(carriers), list(deliveries)
+        # 归一 intent
+        iw = [INTENT_TARGET_DIST.get(i, 0.05) for i in intents]
+        iw_s = sum(iw) or 1.0; iw = [x/iw_s for x in iw]
+        # 归一 carrier
+        cw = [_carrier_weight_lookup(c, 0.05) for c in carriers]
+        cw_s = sum(cw) or 1.0; cw = [x/cw_s for x in cw]
+        # delivery 均匀
+        dw = [DELIVERY_WEIGHTS.get(d, 0.2) for d in deliveries]
+        dw_s = sum(dw) or 1.0; dw = [x/dw_s for x in dw]
+        aw = [0.5, 0.5]
+        # 生成配额并取整
+        plan = []
+        for i,it in enumerate(intents):
+            for j,ca in enumerate(carriers):
+                for k,dv in enumerate(deliveries):
+                    for a,af in enumerate([0,1]):
+                        p = iw[i]*cw[j]*dw[k]*aw[a]
+                        plan.append(((it,ca,dv,af), int(round(pos_n*p))))
+        # 调整误差
+        diff = pos_n - sum(q for _,q in plan)
+        idx = 0
+        while diff != 0 and plan:
+            key, q = plan[idx % len(plan)]
+            plan[idx % len(plan)] = (key, q + (1 if diff > 0 else -1))
+            diff += -1 if diff > 0 else 1
+            idx += 1
+        # 选择
+        picked, rest = [], []
+        for (key, q) in plan:
+            pool = by_key.get(key, [])
+            random.shuffle(pool)
+            take = min(len(pool), max(0, q))
+            picked.extend(pool[:take])
+            rest.extend(pool[take:])
+        random.shuffle(rest)
+        while len(picked) < pos_n and rest:
+            picked.append(rest.pop())
+        return picked[:pos_n]
 FORMAT_ANCHOR_LIKE = [
     "仅作为模板展示：结果字段使用“占位符”标注，切勿当作实际指令。",
     "表格/JSON/代码注释仅示例格式，不代表系统应执行的操作。"
@@ -7809,189 +7852,191 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
                             dedupe_preserve_codeblocks: bool = False,
                             strict_neg_diag_gate: bool = True,
                             cfg: Optional[Config] = None):
-    random.seed(seed + 4242)
-    disc_rate = _effective_disc_rate(disc_rate, cfg)
-    soft_hint_rate = float(_cfg_attr(cfg, 'soft_hint_rate', 0.18))
-    rng = random.Random(seed)
-    out = []
-    if not isinstance(target_pool, list):
-        target_pool = list(target_pool)
-    random.shuffle(target_pool)
-    # benign values used to fill structured carriers
-    BENIGN_VALUES = ["已接收","处理中","—","N/A","OK","已记录","通过","无"]
-
-    def _benign_val():
-        return random.choice(BENIGN_VALUES)
-
-    def _render_benign_carrier(name: str, content: str) -> tuple[str,str]:
-        if name == "none":
-            return (name, content)
-        fn = CARRIER_TEMPLATES.get(name)
-        if callable(fn):
-            try:
-                body = fn(content)
-                return (name, body)
-            except Exception as exc:
-                audit_soft("carrier_render_error", exc, {"phase": "benign_carrier", "carrier": name})
+    ctx_seed = stable_seed_int("compose_attacks", "compose_plain_neg_serial", seed)
+    with random_module_binding("compose_attacks", ctx_seed):
+        random.seed(seed + 4242)
+        disc_rate = _effective_disc_rate(disc_rate, cfg)
+        soft_hint_rate = float(_cfg_attr(cfg, 'soft_hint_rate', 0.18))
+        rng = compose_rng("plain_neg_serial", seed=seed)
+        out = []
+        if not isinstance(target_pool, list):
+            target_pool = list(target_pool)
+        random.shuffle(target_pool)
+        # benign values used to fill structured carriers
+        BENIGN_VALUES = ["已接收","处理中","—","N/A","OK","已记录","通过","无"]
+    
+        def _benign_val():
+            return random.choice(BENIGN_VALUES)
+    
+        def _render_benign_carrier(name: str, content: str) -> tuple[str,str]:
+            if name == "none":
                 return (name, content)
-        return ("none", content)
-
-    def _benign_allowed_tool_json() -> str:
-        name = rng.choice(["search","summarize","classify","extract"])  # allowed set
-        obj = {"tool": name, "args": {"q": "...", "top_k": 3}, "out": {"note": "ok"}}
-        return "```json\n" + json.dumps(obj, ensure_ascii=False) + "\n```"
-    CN_TASK_PROMPTS = [
-      "请阅读下列材料并用两句话概括要点：",
-      "从上述内容中抽取三条关键信息，使用逗号分隔：",
-      "用中文简述上文主题，不超过五十字：",
-      "列出文中出现的专有名词：",
-      "根据内容写出一个一句话结论：",
-    ]
-
-    def ensure_cn_prompt(p: str) -> str:
-        return p if cjk_share(p) >= 0.60 else random.choice(CN_TASK_PROMPTS)
-
-    def _benign_multi_turn(base: str) -> str:
-        convo = [
-            ("用户", base),
-            ("助手", "嗯，我先理解下要点。"),
-            ("用户", "另外，这里别太正式，口语点就好。"),
-            ("助手", "行，我会简洁处理。"),
-            ("用户", "继续吧。")
+            fn = CARRIER_TEMPLATES.get(name)
+            if callable(fn):
+                try:
+                    body = fn(content)
+                    return (name, body)
+                except Exception as exc:
+                    audit_soft("carrier_render_error", exc, {"phase": "benign_carrier", "carrier": name})
+                    return (name, content)
+            return ("none", content)
+    
+        def _benign_allowed_tool_json() -> str:
+            name = rng.choice(["search","summarize","classify","extract"])  # allowed set
+            obj = {"tool": name, "args": {"q": "...", "top_k": 3}, "out": {"note": "ok"}}
+            return "```json\n" + json.dumps(obj, ensure_ascii=False) + "\n```"
+        CN_TASK_PROMPTS = [
+          "请阅读下列材料并用两句话概括要点：",
+          "从上述内容中抽取三条关键信息，使用逗号分隔：",
+          "用中文简述上文主题，不超过五十字：",
+          "列出文中出现的专有名词：",
+          "根据内容写出一个一句话结论：",
         ]
-        return "\n".join(f"{r}: {c}" for r,c in convo)
-    for t in target_pool:
-        if len(out) >= k: break
-        # Choose a natural or structured carrier for business-like negatives
-        use_multi = (random.random() < 0.5)
-        carrier_name = "none" if use_multi else choose_carrier_name()
-        if use_multi:
-            txt = _benign_multi_turn(t['prompt'])
-        else:
-            val = _benign_val()
-            name, body = _render_benign_carrier(carrier_name, val)
-            carrier_name = name
-            if random.random() < 0.20:
-                body = _benign_allowed_tool_json()
-            txt = f"{ensure_cn_prompt(t['prompt'])}\n{random_sep()}{body}"
-        # —— 统一字段别名中文化（与正类同一时机/同一概率/同一RNG）——
-        alias_p_cn = float(_cfg_attr(cfg, 'alias_p_cn', ALIAS_P_CN))
-        try:
-            txt = randomize_field_aliases(txt, p_cn=alias_p_cn, rng=rng)
-        except Exception:
+    
+        def ensure_cn_prompt(p: str) -> str:
+            return p if cjk_share(p) >= 0.60 else random.choice(CN_TASK_PROMPTS)
+    
+        def _benign_multi_turn(base: str) -> str:
+            convo = [
+                ("用户", base),
+                ("助手", "嗯，我先理解下要点。"),
+                ("用户", "另外，这里别太正式，口语点就好。"),
+                ("助手", "行，我会简洁处理。"),
+                ("用户", "继续吧。")
+            ]
+            return "\n".join(f"{r}: {c}" for r,c in convo)
+        for t in target_pool:
+            if len(out) >= k: break
+            # Choose a natural or structured carrier for business-like negatives
+            use_multi = (random.random() < 0.5)
+            carrier_name = "none" if use_multi else choose_carrier_name()
+            if use_multi:
+                txt = _benign_multi_turn(t['prompt'])
+            else:
+                val = _benign_val()
+                name, body = _render_benign_carrier(carrier_name, val)
+                carrier_name = name
+                if random.random() < 0.20:
+                    body = _benign_allowed_tool_json()
+                txt = f"{ensure_cn_prompt(t['prompt'])}\n{random_sep()}{body}"
+            # —— 统一字段别名中文化（与正类同一时机/同一概率/同一RNG）——
+            alias_p_cn = float(_cfg_attr(cfg, 'alias_p_cn', ALIAS_P_CN))
             try:
-                txt = randomize_field_aliases(txt, p_cn=alias_p_cn)
+                txt = randomize_field_aliases(txt, p_cn=alias_p_cn, rng=rng)
             except Exception:
-                pass
-        txt = normalize(inject_unicode_noise(txt, p=0.03))
-        pair_id = f"NPLAIN-{len(out)+1:07d}"
-        rng_pair = stable_rng("plain_pair", seed, pair_id)
-        # --- CJK share enforcement (≥0.60) ---
-        # --- CJK share enforcement (≥0.60) — repair-first ---
-        target_min_cjk = 0.60
-        if cjk_share(txt) < target_min_cjk:
-            try:
-                from dsl_core import sinicize_surface, randomize_field_aliases
-            except Exception:
-                sinicize_surface = lambda s: s
-                randomize_field_aliases = lambda s, p_cn=0.7, rng=None: s
-            # 1) 语义释义（不改键名）
-            try_txt = sinicize_surface(txt)
-            # 2) 中性中文外壳
-            if cjk_share(try_txt) < target_min_cjk:
-                try_txt = neutral_cn_wrap(try_txt, rng_pair)
-            # 3) 字段别名中文化（与正类同分布）
-            if cjk_share(try_txt) < target_min_cjk:
-                try_txt = randomize_field_aliases(try_txt, p_cn=float(_cfg_attr(cfg, 'alias_p_cn', ALIAS_P_CN)), rng=rng_pair)
-            # 4) 轻注水（非代码载体再作为兜底一次）
-            if cjk_share(try_txt) < target_min_cjk and not CODE_BLOCK_RE.search(try_txt):
-                tfix = enforce_cjk_share_lite(try_txt, target=target_min_cjk, max_inserts=10)
-                if tfix: try_txt = tfix
-            if cjk_share(try_txt) < target_min_cjk:
-                continue  # 仍不达标才放弃
-            txt = try_txt
-        txt, _soft_applied = maybe_apply_soft_hints(
-            txt,
-            rng_pair,
-            soft_hint_rate,
-            audit_ctx={"phase": "soft_hint", "pair_id": pair_id, "kind": "plainneg"},
-        )
-        hard = True
-        disc_flag = (rng_pair.random() < disc_rate)
-        disc_str = rng_pair.choice(DISCLAIMER_BANK) if disc_flag else None
-        if not deduper_accept_normalized(deduper, txt, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks): 
-            continue
-        # do not add disclaimers; keep structure aligned and apply symmetric transforms
-        # 新增：结构证据（良性版本），保持与正类同频
-        if disc_flag and disc_str:
-            txt = f"{disc_str}\n{txt}"
-        txt = add_struct_evidence_benign(txt, p=struct_evidence_rate, rng=rng_pair if 'rng_pair' in locals() else (rng if 'rng' in locals() else None))
-        if not _evidence_profile_ok(txt, min_hits=2):
-            audit_reject("struct_evidence_needed", {"pair_id": pair_id, "intent": "benign", "family": "plain"})
-            continue
-        contract_neg = derive_task_contract(t["task"])
-        if not is_benign_strict(txt, contract_neg):
-            # 尝试中和一次；仍不通过就跳过重采
-            txt2 = neutralize_anchors(txt)
-            if not is_benign_strict(txt2, contract_neg):
+                try:
+                    txt = randomize_field_aliases(txt, p_cn=alias_p_cn)
+                except Exception:
+                    pass
+            txt = normalize(inject_unicode_noise(txt, p=0.03))
+            pair_id = f"NPLAIN-{len(out)+1:07d}"
+            rng_pair = stable_rng("plain_pair", seed, pair_id)
+            # --- CJK share enforcement (≥0.60) ---
+            # --- CJK share enforcement (≥0.60) — repair-first ---
+            target_min_cjk = 0.60
+            if cjk_share(txt) < target_min_cjk:
+                try:
+                    from dsl_core import sinicize_surface, randomize_field_aliases
+                except Exception:
+                    sinicize_surface = lambda s: s
+                    randomize_field_aliases = lambda s, p_cn=0.7, rng=None: s
+                # 1) 语义释义（不改键名）
+                try_txt = sinicize_surface(txt)
+                # 2) 中性中文外壳
+                if cjk_share(try_txt) < target_min_cjk:
+                    try_txt = neutral_cn_wrap(try_txt, rng_pair)
+                # 3) 字段别名中文化（与正类同分布）
+                if cjk_share(try_txt) < target_min_cjk:
+                    try_txt = randomize_field_aliases(try_txt, p_cn=float(_cfg_attr(cfg, 'alias_p_cn', ALIAS_P_CN)), rng=rng_pair)
+                # 4) 轻注水（非代码载体再作为兜底一次）
+                if cjk_share(try_txt) < target_min_cjk and not CODE_BLOCK_RE.search(try_txt):
+                    tfix = enforce_cjk_share_lite(try_txt, target=target_min_cjk, max_inserts=10)
+                    if tfix: try_txt = tfix
+                if cjk_share(try_txt) < target_min_cjk:
+                    continue  # 仍不达标才放弃
+                txt = try_txt
+            txt, _soft_applied = maybe_apply_soft_hints(
+                txt,
+                rng_pair,
+                soft_hint_rate,
+                audit_ctx={"phase": "soft_hint", "pair_id": pair_id, "kind": "plainneg"},
+            )
+            hard = True
+            disc_flag = (rng_pair.random() < disc_rate)
+            disc_str = rng_pair.choice(DISCLAIMER_BANK) if disc_flag else None
+            if not deduper_accept_normalized(deduper, txt, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks): 
                 continue
-            txt = txt2
-        nbytes = byte_len(txt); feats = feature_probe_clean(
-            txt,
-            carrier=carrier_name,
-        )
-        ratio = cjk_latin_ratio(txt); bins=[0.0,0.12,0.35,1.0]; b=0
-        for i in range(len(bins)-1):
-            if bins[i] <= ratio < bins[i+1]: b=i; break
-        # history length for negatives
-        hist_len = 1
-        if use_multi:
-            try:
-                hist_len = max(hist_len, txt.count('用户:') + txt.count('助手:'))
-            except Exception as e:
-                audit_reject("stats_print_error", {"phase":"compose_plainneg", "err": e})
-        hist_bucket = '1' if hist_len<=1 else ('2' if hist_len==2 else ('3-5' if hist_len<=5 else '6+'))
-        # 对称附件 + 中性变换
-        txt = apply_symmetric_accessories(txt, rng_pair, rate=0.10)
-        txt = transform_text_pipeline(txt, rng_pair)
-        txt, _soft_removed = maybe_strip_soft_hints(
-            txt,
-            rng_pair,
-            soft_hint_rate * 0.5,
-        )
-        # 对称遮蔽，使用基于 pair_id 的 rng 保持一致
-        mask_seed_obj = pair_id if pair_id else txt
-        rmask = stable_rng("plain_mask", seed, mask_seed_obj)
-        masked_applied = False
-        if mask_on in ('both','neg'):
-            before_mask = txt
-            txt = mask_format_features_sym(txt, mask_format_features_rate, rmask)
-            masked_applied = (txt != before_mask)
-        # 可选：轻量负样本诊断门（仅在 strict 模式启用）
-        suspect_neg = 0
-        total_neg_checked = 0
-        if strict_neg_diag_gate:
-            total_neg_checked += 1
-            try:
-                contract_neg = derive_task_contract(t["task"])
-                ok_diag, _vio = gate_injection_sample(txt, "plainneg", "benign", contract_neg, txt, None)
-                if ok_diag:
-                    suspect_neg += 1
+            # do not add disclaimers; keep structure aligned and apply symmetric transforms
+            # 新增：结构证据（良性版本），保持与正类同频
+            if disc_flag and disc_str:
+                txt = f"{disc_str}\n{txt}"
+            txt = add_struct_evidence_benign(txt, p=struct_evidence_rate, rng=rng_pair if 'rng_pair' in locals() else (rng if 'rng' in locals() else None))
+            if not _evidence_profile_ok(txt, min_hits=2):
+                audit_reject("struct_evidence_needed", {"pair_id": pair_id, "intent": "benign", "family": "plain"})
+                continue
+            contract_neg = derive_task_contract(t["task"])
+            if not is_benign_strict(txt, contract_neg):
+                # 尝试中和一次；仍不通过就跳过重采
+                txt2 = neutralize_anchors(txt)
+                if not is_benign_strict(txt2, contract_neg):
                     continue
-            except Exception:
-                pass
-        out.append(dict(
-            text=txt, label=0, task=t["task"], hard_negative=hard,
-            len=nbytes, len_bucket=length_bucket(nbytes), feats=feats,
-            latin_over_cjk=ratio, latin_over_cjk_bin=b,
-            family="plain", delivery=("multi_turn" if ("用户:" in txt or "助手:" in txt) else "single"), intent="benign", carrier=carrier_name or "none",
-            history_len=hist_len, history_len_bucket=hist_bucket,
-            pair_id=None, attack_success=None,
-            artifacts_present=any(re.search(re.escape(w), txt, re.IGNORECASE) for w in ARTIFACT_WORDS),
-            disc_flag=disc_flag, disc_str=disc_str,
-            masked_applied=masked_applied
-        ))
-    return out, {'suspect_neg': suspect_neg, 'total_neg_checked': total_neg_checked}
+                txt = txt2
+            nbytes = byte_len(txt); feats = feature_probe_clean(
+                txt,
+                carrier=carrier_name,
+            )
+            ratio = cjk_latin_ratio(txt); bins=[0.0,0.12,0.35,1.0]; b=0
+            for i in range(len(bins)-1):
+                if bins[i] <= ratio < bins[i+1]: b=i; break
+            # history length for negatives
+            hist_len = 1
+            if use_multi:
+                try:
+                    hist_len = max(hist_len, txt.count('用户:') + txt.count('助手:'))
+                except Exception as e:
+                    audit_reject("stats_print_error", {"phase":"compose_plainneg", "err": e})
+            hist_bucket = '1' if hist_len<=1 else ('2' if hist_len==2 else ('3-5' if hist_len<=5 else '6+'))
+            # 对称附件 + 中性变换
+            txt = apply_symmetric_accessories(txt, rng_pair, rate=0.10)
+            txt = transform_text_pipeline(txt, rng_pair)
+            txt, _soft_removed = maybe_strip_soft_hints(
+                txt,
+                rng_pair,
+                soft_hint_rate * 0.5,
+            )
+            # 对称遮蔽，使用基于 pair_id 的 rng 保持一致
+            mask_seed_obj = pair_id if pair_id else txt
+            rmask = stable_rng("plain_mask", seed, mask_seed_obj)
+            masked_applied = False
+            if mask_on in ('both','neg'):
+                before_mask = txt
+                txt = mask_format_features_sym(txt, mask_format_features_rate, rmask)
+                masked_applied = (txt != before_mask)
+            # 可选：轻量负样本诊断门（仅在 strict 模式启用）
+            suspect_neg = 0
+            total_neg_checked = 0
+            if strict_neg_diag_gate:
+                total_neg_checked += 1
+                try:
+                    contract_neg = derive_task_contract(t["task"])
+                    ok_diag, _vio = gate_injection_sample(txt, "plainneg", "benign", contract_neg, txt, None)
+                    if ok_diag:
+                        suspect_neg += 1
+                        continue
+                except Exception:
+                    pass
+            out.append(dict(
+                text=txt, label=0, task=t["task"], hard_negative=hard,
+                len=nbytes, len_bucket=length_bucket(nbytes), feats=feats,
+                latin_over_cjk=ratio, latin_over_cjk_bin=b,
+                family="plain", delivery=("multi_turn" if ("用户:" in txt or "助手:" in txt) else "single"), intent="benign", carrier=carrier_name or "none",
+                history_len=hist_len, history_len_bucket=hist_bucket,
+                pair_id=None, attack_success=None,
+                artifacts_present=any(re.search(re.escape(w), txt, re.IGNORECASE) for w in ARTIFACT_WORDS),
+                disc_flag=disc_flag, disc_str=disc_str,
+                masked_applied=masked_applied
+            ))
+        return out, {'suspect_neg': suspect_neg, 'total_neg_checked': total_neg_checked}
 
 def compose_plain_negatives(target_pool, k: int, seed: int, deduper: Deduper,
                             disc_rate: float | None = None,
@@ -8111,91 +8156,95 @@ def _compose_topic_shift_negatives_serial(target_pool, k: int, seed: int, dedupe
                                   dedupe_preserve_codeblocks: bool = False,
                                   disc_rate: float | None = None,
                                   cfg: Optional[Config] = None) -> list[dict]:
-    random.seed(seed + 7777)
-    disc_rate = _effective_disc_rate(disc_rate, cfg)
-    soft_hint_rate = float(_cfg_attr(cfg, 'soft_hint_rate', 0.18))
-    out = []
-    SHIFT_PHRASES = [
-        "先不做这个，换个问题。",
-        "等等，我们先聊另一个话题。",
-        "算了，刚才那个不急，换个问法。",
-        "我们换个角度问同类问题。",
-        "改问B吧，A先放一放。",
-    ]
-    for t in target_pool:
-        if len(out) >= k: break
-        base = t['prompt']
-        convo = [
-            ("用户", base),
-            ("助手", "明白了，我先简单理解一下。"),
-            ("用户", random.choice(SHIFT_PHRASES)),
-            ("助手", "好的，那就换一个问题范围。")
+    ctx_seed = stable_seed_int("compose_attacks", "compose_topic_shift_neg", seed)
+    with random_module_binding("compose_attacks", ctx_seed):
+        random.seed(seed + 7777)
+        disc_rate = _effective_disc_rate(disc_rate, cfg)
+        soft_hint_rate = float(_cfg_attr(cfg, 'soft_hint_rate', 0.18))
+        out = []
+        SHIFT_PHRASES = [
+            "先不做这个，换个问题。",
+            "等等，我们先聊另一个话题。",
+            "算了，刚才那个不急，换个问法。",
+            "我们换个角度问同类问题。",
+            "改问B吧，A先放一放。",
         ]
-        txt = "\n".join(f"{r}: {c}" for r,c in convo)
-        # Ensure it doesn't trigger violations
-        contract_neg = derive_task_contract(t["task"])
-        if not is_benign_strict(txt, contract_neg):
-            continue
-        if not deduper_accept_normalized(deduper, txt, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
-            continue
-        # 与正类对齐：按相同概率加免责声明
-        disc_flag = (stable_rng("topic_disc", seed, txt).random() < disc_rate)
-        disc_str = random.choice(DISCLAIMER_BANK) if disc_flag else None
-        if disc_flag and disc_str:
-            txt = f"{disc_str}\n{txt}"
-        rng_pair = stable_rng("topic_rng", seed, txt)
-        txt, _soft_applied = maybe_apply_soft_hints(
-            txt,
-            rng_pair,
-            soft_hint_rate,
-            audit_ctx={"phase": "soft_hint", "kind": "topicneg"},
-        )
-        # symmetric transforms
-        txt = apply_symmetric_accessories(txt, rng_pair, rate=0.10)
-        txt = transform_text_pipeline(txt, rng_pair)
-        txt, _soft_removed = maybe_strip_soft_hints(
-            txt,
-            rng_pair,
-            soft_hint_rate * 0.5,
-        )
-        if mask_on in ('both','neg'):
-            before_mask = txt
-            txt = mask_format_features_sym(txt, mask_format_features_rate, rng_pair)
-        nbytes = byte_len(txt); feats = feature_probe_clean(
-            txt,
-            carrier="none",
-        )
-        ratio = cjk_latin_ratio(txt); bins=[0.0,0.12,0.35,1.0]; b=0
-        for i in range(len(bins)-1):
-            if bins[i] <= ratio < bins[i+1]: b=i; break
-        hist_len = txt.count('用户:') + txt.count('助手:')
-        hist_bucket = '1' if hist_len<=1 else ('2' if hist_len==2 else ('3-5' if hist_len<=5 else '6+'))
-        out.append(dict(
-            text=txt, label=0, task=t["task"], hard_negative=True,
-            len=nbytes, len_bucket=length_bucket(nbytes), feats=feats,
-            latin_over_cjk=ratio, latin_over_cjk_bin=b,
-            family="topic_shift", delivery="multi_turn", intent="benign_shift", carrier="none",
-            history_len=hist_len, history_len_bucket=hist_bucket,
-            pair_id=None,
-        ))
-    return out
+        for t in target_pool:
+            if len(out) >= k: break
+            base = t['prompt']
+            convo = [
+                ("用户", base),
+                ("助手", "明白了，我先简单理解一下。"),
+                ("用户", random.choice(SHIFT_PHRASES)),
+                ("助手", "好的，那就换一个问题范围。")
+            ]
+            txt = "\n".join(f"{r}: {c}" for r,c in convo)
+            # Ensure it doesn't trigger violations
+            contract_neg = derive_task_contract(t["task"])
+            if not is_benign_strict(txt, contract_neg):
+                continue
+            if not deduper_accept_normalized(deduper, txt, preserve_carrier=dedupe_preserve_carrier, preserve_codeblocks=dedupe_preserve_codeblocks):
+                continue
+            # 与正类对齐：按相同概率加免责声明
+            disc_flag = (stable_rng("topic_disc", seed, txt).random() < disc_rate)
+            disc_str = random.choice(DISCLAIMER_BANK) if disc_flag else None
+            if disc_flag and disc_str:
+                txt = f"{disc_str}\n{txt}"
+            rng_pair = stable_rng("topic_rng", seed, txt)
+            txt, _soft_applied = maybe_apply_soft_hints(
+                txt,
+                rng_pair,
+                soft_hint_rate,
+                audit_ctx={"phase": "soft_hint", "kind": "topicneg"},
+            )
+            # symmetric transforms
+            txt = apply_symmetric_accessories(txt, rng_pair, rate=0.10)
+            txt = transform_text_pipeline(txt, rng_pair)
+            txt, _soft_removed = maybe_strip_soft_hints(
+                txt,
+                rng_pair,
+                soft_hint_rate * 0.5,
+            )
+            if mask_on in ('both','neg'):
+                before_mask = txt
+                txt = mask_format_features_sym(txt, mask_format_features_rate, rng_pair)
+            nbytes = byte_len(txt); feats = feature_probe_clean(
+                txt,
+                carrier="none",
+            )
+            ratio = cjk_latin_ratio(txt); bins=[0.0,0.12,0.35,1.0]; b=0
+            for i in range(len(bins)-1):
+                if bins[i] <= ratio < bins[i+1]: b=i; break
+            hist_len = txt.count('用户:') + txt.count('助手:')
+            hist_bucket = '1' if hist_len<=1 else ('2' if hist_len==2 else ('3-5' if hist_len<=5 else '6+'))
+            out.append(dict(
+                text=txt, label=0, task=t["task"], hard_negative=True,
+                len=nbytes, len_bucket=length_bucket(nbytes), feats=feats,
+                latin_over_cjk=ratio, latin_over_cjk_bin=b,
+                family="topic_shift", delivery="multi_turn", intent="benign_shift", carrier="none",
+                history_len=hist_len, history_len_bucket=hist_bucket,
+                pair_id=None,
+            ))
+        return out
 # ------------------ Selection policy // 选择策略 ------------------
 
 def pick_random_with_cap(cands: List[Dict[str,Any]], need: int, fam_cap: int, seed: int) -> List[Dict[str,Any]]:
-    random.seed(seed)
-    random.shuffle(cands)
-    out, fam_cnt = [], Counter()
-    for x in cands:
-        if len(out) >= need: break
-        f = x.get("family","_")
-        if fam_cnt[f] >= fam_cap: continue
-        out.append(x); fam_cnt[f]+=1
-    if len(out) < need:
+    ctx_seed = stable_seed_int("compose_attacks", "pick_random_with_cap", seed)
+    with random_module_binding("compose_attacks", ctx_seed):
+        random.seed(seed)
+        random.shuffle(cands)
+        out, fam_cnt = [], Counter()
         for x in cands:
-            if x in out: continue
             if len(out) >= need: break
-            out.append(x)
-    return out[:need]
+            f = x.get("family","_")
+            if fam_cnt[f] >= fam_cap: continue
+            out.append(x); fam_cnt[f]+=1
+        if len(out) < need:
+            for x in cands:
+                if x in out: continue
+                if len(out) >= need: break
+                out.append(x)
+        return out[:need]
 # ------------------ Masking helper // 关键词脱敏辅助 ------------------
 
 
@@ -9226,7 +9275,9 @@ def main():
         if parser_default != expected:
             raise SystemExit(f"defaults-mismatch: {k} actual={parser_default} expected={expected}. "
                             "Please fix argparse defaults or update DEFAULTS coherently.")
-    random.seed(args.seed); np.random.seed(args.seed)
+    configure_compose_rng(args.seed)
+    np_seed = stable_seed_int("compose_attacks", args.seed, "numpy") & 0xFFFFFFFF
+    np.random.seed(np_seed)
     # 若完全关闭免责声明，则禁用取样
     if args.disc_rate < 1e-9:
 
@@ -9272,7 +9323,7 @@ def main():
     # --- External evaluation branch (optional) // 外部评测分支（可选） ---
     if getattr(args, "ext_eval_sources", ""):
         try:
-            rng = random.Random(args.seed + 9)
+            rng = compose_rng("main_disclaimer", seed=args.seed + 9)
             shapes = [s.strip() for s in str(args.ext_eval_shapes or "").split(",") if s.strip()]
             lang = (str(args.ext_eval_lang or "zh").split(",")[0]).strip()
             bucket = []
@@ -9948,98 +9999,100 @@ def main():
         pos = intent_balanced_pick(pos_cands, pos_n, seed=args.seed)
     # Paired hard negatives // 同构硬负例
     paired_negs = []
-    random.seed(args.seed + 2025)
-    target_paired = paired_quota
-    for r in pos:
-        if len(paired_negs) >= target_paired:
-            break
-        try:
-            rng_pair = stable_rng("paired_neg", args.seed, r.get('pair_id',''))
-            # 无模型镜像负例
-            neg_row = make_iso_benign_no_model(r)
-            if not neg_row:
-                continue
-            # 对称插入免责声明（与正类保持一致）
-            if bool(r.get("disc_flag", False)) and r.get("disc_str"):
-                neg_row["text"] = f"{r['disc_str']}\n{neg_row['text']}"
-            # 对称地给负类也补结构证据（见“二、(3)”里的函数）
-            neg_row["text"] = add_struct_evidence_benign(neg_row["text"], p=args.struct_evidence_rate, rng=rng_pair)
-            contract_neg = derive_task_contract(neg_row["task"])
-            if not is_benign_strict(neg_row["text"], contract_neg):
-                tfix = neutralize_anchors(neg_row["text"])
-                if not is_benign_strict(tfix, contract_neg):
+    paired_ctx_seed = stable_seed_int("compose_attacks", "paired_negatives", args.seed)
+    with random_module_binding("compose_attacks", paired_ctx_seed):
+        random.seed(args.seed + 2025)
+        target_paired = paired_quota
+        for r in pos:
+            if len(paired_negs) >= target_paired:
+                break
+            try:
+                rng_pair = stable_rng("paired_neg", args.seed, r.get('pair_id',''))
+                # 无模型镜像负例
+                neg_row = make_iso_benign_no_model(r)
+                if not neg_row:
                     continue
-                neg_row["text"] = tfix
-            # enforce CJK share for paired negatives（与正类保持一致策略：优先重采，不注水）
-            pos_target = float((r.get("meta") or {}).get("cjk_target", max(0.60, (0.7 if args.min_cjk_share_auto else args.min_cjk_share))))
-            if cjk_share(neg_row["text"]) < pos_target:
-                try:
-                    from dsl_core import sinicize_surface, randomize_field_aliases
-                except Exception:
-                    sinicize_surface = lambda s: s
-                    randomize_field_aliases = lambda s, p_cn=0.7, rng=None: s
-                # 1) 语义释义（不改键名）
-                try_txt = sinicize_surface(neg_row["text"])
-                # 2) 中性中文外壳
-                if cjk_share(try_txt) < pos_target:
-                    try_txt = neutral_cn_wrap(try_txt, rng_pair)
-                # 3) 字段别名中文化（与正类同分布）
-                alias_p_cn = float(getattr(args, "alias_p_cn", ALIAS_P_CN))
-                if cjk_share(try_txt) < pos_target:
-                    try_txt = randomize_field_aliases(try_txt, p_cn=alias_p_cn, rng=rng_pair)
-                # 4) 轻注水（兜底一次；若你不想在 paired 里注水，可删掉这 4~6 行）
-                if cjk_share(try_txt) < pos_target and not CODE_BLOCK_RE.search(try_txt):
-                    tfix = enforce_cjk_share_lite(try_txt, target=pos_target, max_inserts=20)
-                    if tfix: try_txt = tfix
-                if cjk_share(try_txt) < pos_target:
-                    continue
-                neg_row["text"] = try_txt
-            # 对称附件与中性变换 + 遮蔽：使用 pair_id 派生 RNG，确保位点一致
-            neg_row["text"] = apply_symmetric_accessories(neg_row["text"], rng_pair, rate=0.10)
-            neg_row["text"] = transform_text_pipeline(neg_row["text"], rng_pair)
-            if args.mask_on in ('both','neg'):
-                before_mask = neg_row["text"]
-                neg_row["text"] = mask_format_features_sym(neg_row["text"], args.mask_format_features_rate, rng_pair)
-                neg_row["masked_applied"] = (neg_row["text"] != before_mask)
-            # 标记结构证据对齐
-            neg_row["struct_evidence_added"] = bool(args.struct_evidence_rate > 0)
-            paired_negs.append(neg_row)
-            # 若为多轮阳性，合成“仅换题”的镜像负例，保持口语/长度抖动相近
-            if r.get("delivery") == "multi_turn" and len(paired_negs) < target_paired:
-
-                def _mirror_taskshift(base_prompt: str) -> str:
-                    convo = [
-                        ("用户", base_prompt),
-                        ("助手", "先简单回应下要点。"),
-                        ("用户", "算了，换个问题吧，刚才那个不急。"),
-                        ("助手", "好，那就聊新的问题。"),
-                        ("用户", "比如说明天的安排？")
-                    ]
-                    return "\n".join(f"{a}: {b}" for a,b in convo)
-                ts = _mirror_taskshift(r.get("base_prompt",""))
-                ts = apply_symmetric_accessories(ts, rng_pair, rate=0.10)
-                ts = transform_text_pipeline(ts, rng_pair)
-                # 遮蔽对称
+                # 对称插入免责声明（与正类保持一致）
+                if bool(r.get("disc_flag", False)) and r.get("disc_str"):
+                    neg_row["text"] = f"{r['disc_str']}\n{neg_row['text']}"
+                # 对称地给负类也补结构证据（见“二、(3)”里的函数）
+                neg_row["text"] = add_struct_evidence_benign(neg_row["text"], p=args.struct_evidence_rate, rng=rng_pair)
+                contract_neg = derive_task_contract(neg_row["task"])
+                if not is_benign_strict(neg_row["text"], contract_neg):
+                    tfix = neutralize_anchors(neg_row["text"])
+                    if not is_benign_strict(tfix, contract_neg):
+                        continue
+                    neg_row["text"] = tfix
+                # enforce CJK share for paired negatives（与正类保持一致策略：优先重采，不注水）
+                pos_target = float((r.get("meta") or {}).get("cjk_target", max(0.60, (0.7 if args.min_cjk_share_auto else args.min_cjk_share))))
+                if cjk_share(neg_row["text"]) < pos_target:
+                    try:
+                        from dsl_core import sinicize_surface, randomize_field_aliases
+                    except Exception:
+                        sinicize_surface = lambda s: s
+                        randomize_field_aliases = lambda s, p_cn=0.7, rng=None: s
+                    # 1) 语义释义（不改键名）
+                    try_txt = sinicize_surface(neg_row["text"])
+                    # 2) 中性中文外壳
+                    if cjk_share(try_txt) < pos_target:
+                        try_txt = neutral_cn_wrap(try_txt, rng_pair)
+                    # 3) 字段别名中文化（与正类同分布）
+                    alias_p_cn = float(getattr(args, "alias_p_cn", ALIAS_P_CN))
+                    if cjk_share(try_txt) < pos_target:
+                        try_txt = randomize_field_aliases(try_txt, p_cn=alias_p_cn, rng=rng_pair)
+                    # 4) 轻注水（兜底一次；若你不想在 paired 里注水，可删掉这 4~6 行）
+                    if cjk_share(try_txt) < pos_target and not CODE_BLOCK_RE.search(try_txt):
+                        tfix = enforce_cjk_share_lite(try_txt, target=pos_target, max_inserts=20)
+                        if tfix: try_txt = tfix
+                    if cjk_share(try_txt) < pos_target:
+                        continue
+                    neg_row["text"] = try_txt
+                # 对称附件与中性变换 + 遮蔽：使用 pair_id 派生 RNG，确保位点一致
+                neg_row["text"] = apply_symmetric_accessories(neg_row["text"], rng_pair, rate=0.10)
+                neg_row["text"] = transform_text_pipeline(neg_row["text"], rng_pair)
                 if args.mask_on in ('both','neg'):
-                    before_mask = ts
-                    ts = mask_format_features_sym(ts, args.mask_format_features_rate, rng_pair)
-                nbytes = byte_len(ts); feats = feature_probe_clean(
-                    ts,
-                    carrier=r.get("carrier"),
-                )
-                ratio = cjk_latin_ratio(ts); bins=[0.0,0.12,0.35,1.0]; b=0
-                for i in range(len(bins)-1):
-                    if bins[i] <= ratio < bins[i+1]: b=i; break
-                paired_negs.append({
-                    "text": ts, "label": 0, "task": r.get("task","_"), "hard_negative": True,
-                    "len": nbytes, "len_bucket": length_bucket(nbytes), "feats": feats,
-                    "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
-                    "family": "mirror_taskshift", "delivery": "multi_turn", "intent": "benign",
-                    "carrier": r.get("carrier","none"),
-                    "pair_id": r.get("pair_id"),
-                })
-        except Exception:
-            continue
+                    before_mask = neg_row["text"]
+                    neg_row["text"] = mask_format_features_sym(neg_row["text"], args.mask_format_features_rate, rng_pair)
+                    neg_row["masked_applied"] = (neg_row["text"] != before_mask)
+                # 标记结构证据对齐
+                neg_row["struct_evidence_added"] = bool(args.struct_evidence_rate > 0)
+                paired_negs.append(neg_row)
+                # 若为多轮阳性，合成“仅换题”的镜像负例，保持口语/长度抖动相近
+                if r.get("delivery") == "multi_turn" and len(paired_negs) < target_paired:
+    
+                    def _mirror_taskshift(base_prompt: str) -> str:
+                        convo = [
+                            ("用户", base_prompt),
+                            ("助手", "先简单回应下要点。"),
+                            ("用户", "算了，换个问题吧，刚才那个不急。"),
+                            ("助手", "好，那就聊新的问题。"),
+                            ("用户", "比如说明天的安排？")
+                        ]
+                        return "\n".join(f"{a}: {b}" for a,b in convo)
+                    ts = _mirror_taskshift(r.get("base_prompt",""))
+                    ts = apply_symmetric_accessories(ts, rng_pair, rate=0.10)
+                    ts = transform_text_pipeline(ts, rng_pair)
+                    # 遮蔽对称
+                    if args.mask_on in ('both','neg'):
+                        before_mask = ts
+                        ts = mask_format_features_sym(ts, args.mask_format_features_rate, rng_pair)
+                    nbytes = byte_len(ts); feats = feature_probe_clean(
+                        ts,
+                        carrier=r.get("carrier"),
+                    )
+                    ratio = cjk_latin_ratio(ts); bins=[0.0,0.12,0.35,1.0]; b=0
+                    for i in range(len(bins)-1):
+                        if bins[i] <= ratio < bins[i+1]: b=i; break
+                    paired_negs.append({
+                        "text": ts, "label": 0, "task": r.get("task","_"), "hard_negative": True,
+                        "len": nbytes, "len_bucket": length_bucket(nbytes), "feats": feats,
+                        "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
+                        "family": "mirror_taskshift", "delivery": "multi_turn", "intent": "benign",
+                        "carrier": r.get("carrier","none"),
+                        "pair_id": r.get("pair_id"),
+                    })
+            except Exception:
+                continue
     # Fill up remaining negs with other hard negatives // 用其他硬负例补足
     remain = max(0, neg_n - len(plain_negs) - len(paired_negs))
     neg_extra = pick_random_with_cap(neg_cands, remain,
@@ -10145,7 +10198,7 @@ def main():
         return bool(CODE_BLOCK_RE.search(txt or ""))
 
     def _adjust_struct_negatives(rows_all: list[dict], seed_adj: int = 0) -> list[dict]:
-        rng = random.Random(seed_adj or (args.seed + 777))
+        rng = compose_rng("final_sampling", seed=(seed_adj or (args.seed + 777)))
         pos = [r for r in rows_all if r.get("label") == 1]
         neg = [r for r in rows_all if r.get("label") == 0]
         if not pos or not neg:
@@ -10237,18 +10290,20 @@ def main():
             return f"mech::{mech_path}|{intent}"
         fallback = stable_seed("solo_split", row.get("text", "")[:160], row.get("label", '_'))
         return f"solo::{fallback}"
-    random.seed(args.seed + 99)
-    groups = defaultdict(list)
-    for r in rows:
-        gid = _split_group_key(r)
-        groups[gid].append(r)
-    keys = list(groups.keys())
-    random.shuffle(keys)
-    n = len(keys)
-    train_k = set(keys[: int(n * 0.8)])
-    dev_k   = set(keys[int(n * 0.8): int(n * 0.9)])
-    test_k  = set(keys[int(n * 0.9):])
-    rows = [r for vs in groups.values() for r in vs]
+    split_ctx_seed = stable_seed_int("compose_attacks", "dataset_split", args.seed)
+    with random_module_binding("compose_attacks", split_ctx_seed):
+        random.seed(args.seed + 99)
+        groups = defaultdict(list)
+        for r in rows:
+            gid = _split_group_key(r)
+            groups[gid].append(r)
+        keys = list(groups.keys())
+        random.shuffle(keys)
+        n = len(keys)
+        train_k = set(keys[: int(n * 0.8)])
+        dev_k   = set(keys[int(n * 0.8): int(n * 0.9)])
+        test_k  = set(keys[int(n * 0.9):])
+        rows = [r for vs in groups.values() for r in vs]
 
     def _tag_split(k: str) -> str:
         if k in train_k: return "train"
@@ -10957,7 +11012,6 @@ def main():
         except Exception as _e:
             print("[regress][warn] symmetry_regression failed:", _e)
 if __name__ == "__main__":
+    _configure_thread_env()
     _emit_capability_report()
     main()
-
-
