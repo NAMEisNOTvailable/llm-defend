@@ -1183,6 +1183,17 @@ def soft_gate_parallel(candidates: list[str],
     )
     if workers <= 1 or chunk >= n:
         return [phrase for phrase in candidates if _passes_soft_gate_threshold(phrase, thresh)]
+    try:
+        w = int(workers)
+    except Exception:
+        w = 1
+    if n > 0 and w > 0:
+        target_shards = max(w * 2, w + 2)     # 你要更激进可设 w*3
+        est_shards = max(1, math.ceil(n / max(1, chunk)))
+        if est_shards < target_shards:
+            chunk = max(50_000, int(math.ceil(n / target_shards)))
+            print(f"[gate][mp] autotune chunk→{chunk} (n={n}, workers={w}, target_shards={target_shards})",
+                  flush=True)
     ranges = [(i, min(i + chunk, n)) for i in range(0, n, chunk)]
     kept = []
     next_log = int(log_every) if log_every else 0
@@ -1259,6 +1270,17 @@ def strong_dedupe_parallel(phrases: list[str],
                                      k=k, n_hash=n_hash, bands=bands,
                                      jaccard_thresh=jaccard_thresh,
                                      vec_dim=vec_dim, cosine_thresh=cosine_thresh)
+    try:
+        w = int(workers)
+    except Exception:
+        w = 1
+    if n > 0 and w > 0:
+        target_shards = max(w * 3, w + 4)
+        est_shards = max(1, math.ceil(n / max(1, shard_size)))
+        if est_shards < target_shards:
+            shard_size = max(100_000, int(math.ceil(n / target_shards)))
+            print(f"[dedupe][mp] autotune shard_size→{shard_size} (n={n}, workers={w}, target_shards={target_shards})",
+                  flush=True)
     ranges = [(i, min(i + shard_size, n)) for i in range(0, n, shard_size)]
     kept_all: list[tuple[int, str]] = []
     next_log = log_every
@@ -1769,15 +1791,40 @@ def _main_impl(args):
     prewarm_keys = PREWARM_DEFAULT_KEYS
     if args.prewarm_keys:
         prewarm_keys = [k.strip() for k in args.prewarm_keys.split(",") if k.strip()]
-    prewarm_stats = attach_to_dsl_core(
-        dc,
-        keys=prewarm_keys,
-        per_kind=args.prewarm_per_kind,
-        seed=args.prewarm_seed,
-        dedupe=not args.prewarm_allow_dupes,
-    )
+
+    reuse_bank = False
+    snap_path = _safe_cache_path(BANK_SNAPSHOT) if BANK_SNAPSHOT else None
+    if args.reuse_bank_snapshot and snap_path and snap_path.exists() and not args.force_build_bank:
+        try:
+            with snap_path.open("r", encoding="utf-8") as f:
+                snap = json.load(f) or {}
+            for k, v in (snap.items() if isinstance(snap, dict) else []):
+                if isinstance(v, list):
+                    dc.SOFT_PARAPHRASE_BANK.setdefault(k, []).extend(s for s in v if isinstance(s, str))
+            # 每类去重
+            for k in list(dc.SOFT_PARAPHRASE_BANK):
+                dc.SOFT_PARAPHRASE_BANK[k] = list(dict.fromkeys(dc.SOFT_PARAPHRASE_BANK[k]))
+            # 基于快照重建索引/检查
+            rebuild_soft_check()
+            rebuild_bank_sketches()
+            print(f"[bank] reused snapshot from {snap_path}; skip prewarm/hydrate", flush=True)
+            reuse_bank = True
+        except Exception as e:
+            print(f"[bank][warn] reuse snapshot failed: {e}; fallback to build.", flush=True)
+
+    # ---- 仅当未复用快照时，才执行 prewarm / hydrate ----
+    prewarm_stats = None
+    if (not reuse_bank) and (args.prewarm_per_kind > 0):
+        prewarm_stats = attach_to_dsl_core(
+            dc,
+            keys=prewarm_keys,
+            per_kind=args.prewarm_per_kind,
+            seed=args.prewarm_seed,
+            dedupe=not args.prewarm_allow_dupes,
+        )
+
     hydration_stats = None
-    if args.hydrate_microgrammars:
+    if (not reuse_bank) and args.hydrate_microgrammars:
         hydrate_keys = HYDRATE_DEFAULT_KEYS
         if args.hydrate_keys:
             hydrate_keys = [k.strip() for k in args.hydrate_keys.split(",") if k.strip()]
@@ -1844,6 +1891,10 @@ def _main_impl(args):
     # Refresh soft-evidence checks so hydrated banks influence gating early.
     rebuild_soft_check()
     combined_candidates = cand_word + cand_char
+    try:
+        _ensure_hanlp()
+    except Exception:
+        pass
     cand_after_gate = soft_gate_parallel(
         combined_candidates,
         thresh=args.soft_gate_thresh,
@@ -2046,6 +2097,8 @@ if __name__ == "__main__":
     p.add_argument("--min_cjk", type=float, default=0.6)
     p.add_argument("--cluster_thr", type=float, default=0.85)
     p.add_argument("--cluster_min", type=int, default=2)
+    p.add_argument("--prewarm_keys", type=str, default=None,
+               help="Comma-separated soft evidence kinds to prewarm; defaults to the priority list.")
     p.add_argument("--soft_gate_thresh", type=float, default=0.74,
                    help="Minimum softish score for KeyBERT phrases to pass into clustering (default 0.74).")
     p.add_argument("--soft_gate_workers", type=str, default="auto",
@@ -2061,8 +2114,6 @@ if __name__ == "__main__":
         help="Force all phrases into the specified soft-evidence bucket; omit or set to 'auto' for auto-routing."
     )
     p.add_argument("--bank_all", action="store_true")
-    p.add_argument("--prewarm_keys", type=str, default=None,
-                   help="Comma-separated soft evidence kinds to prewarm; defaults to the priority list.")
     p.add_argument("--prewarm_per_kind", type=int, default=300)
     p.add_argument("--prewarm_seed", type=int, default=2025)
     p.add_argument("--prewarm_allow_dupes", action="store_true",
@@ -2114,4 +2165,9 @@ if __name__ == "__main__":
                    help="Upper bound for auto dedupe workers (None uses all available cores minus two).")
     p.add_argument("--dedupe_shard", type=int, default=1000000,
                    help="每个进程处理的分片目标条数。")
+    p.add_argument("--reuse_bank_snapshot", action="store_true",
+               help="若设置且 --bank_snapshot 文件已存在，则直接加载该快照到内存并跳过 prewarm/hydrate。")
+    p.add_argument("--force_build_bank", action="store_true",
+               help="忽略快照强制重新执行 prewarm/hydrate。")
+
     main(p.parse_args())
