@@ -1,5 +1,4 @@
 # extract_and_bank_zh_phrases.py
-
 # -*- coding: utf-8 -*-
 import unicodedata
 import os
@@ -15,7 +14,6 @@ for _env_key in (
     "VECLIB_MAXIMUM_THREADS",
     "NUMEXPR_NUM_THREADS",
 ):
-
     os.environ[_env_key] = str(_n_cores)
 
 os.environ.setdefault("NUMBA_NUM_THREADS", str(_n_cores))
