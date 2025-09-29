@@ -18,7 +18,6 @@ for _env_key in (
 
 os.environ.setdefault("NUMBA_NUM_THREADS", str(_n_cores))
 os.environ.setdefault("NUMBA_THREADING_LAYER", "omp")
-
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import torch
@@ -192,9 +191,6 @@ NUMERIC_MEASURE_RX = re.compile(
     r'^\d+(?:\.\d+)?(?:[~\-–—]\d+(?:\.\d+)?)?[\u4e00-\u9fff]{1,4}$'
 )
 
-
-
-
 def _is_cjk_char(ch: str) -> bool:
     code = ord(ch)
     for start, end in CJK_CODE_RANGES:
@@ -217,7 +213,6 @@ def _keep_phrase(s: str) -> bool:
     if s2 in STOPWORDS:
         return False
     return True
-
 
 def _softish_score(text: str) -> float:
     """Return a heuristic soft-evidence score; >1 means strong semantic evidence via bank matches."""
@@ -244,7 +239,6 @@ def _softish_score(text: str) -> float:
         pass
     return 0.0
 
-
 @lru_cache(maxsize=50000)
 def _has_actionish_pos(text: str) -> bool:
     phrase = (text or "").strip()
@@ -258,7 +252,6 @@ def _has_actionish_pos(text: str) -> bool:
         pass
     return False
 
-
 def build_vectorizer(ngram=(2,4), stopwords=None, analyzer="char_wb", use_jieba=False):
     if use_jieba:
         _ensure_jieba_initialized()
@@ -271,7 +264,6 @@ def build_vectorizer(ngram=(2,4), stopwords=None, analyzer="char_wb", use_jieba=
     return CountVectorizer(analyzer=analyzer,
                            ngram_range=ngram,
                            stop_words=stopwords)
-
 
 @contextmanager
 def patched_encode(st_model, *, bs_try=4096):
@@ -670,7 +662,6 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
     print(f"[stage] keybert_candidates done | docs={len(docs)} | flat_cands={len(flat_cands)}", flush=True)
     return raw_all, word_candidates, char_candidates
 
-
 def _keybert_worker_job(payload):
     docs, model_name, device_str, params, seed = payload
     top_n, ngram_word, ngram_char, use_mmr, diversity, min_cjk = params
@@ -691,7 +682,6 @@ def _keybert_worker_job(payload):
             diversity=diversity,
             min_cjk=min_cjk,
         )
-
 
 def _generate_keybert_candidates(docs, *, model_name: str, device: str, params: dict, seed: int) -> tuple[list[str], list[str], list[str]]:
     if not docs:
@@ -767,7 +757,6 @@ def _mp_init(numba_threads: int, omp_threads: int, phrases_ref=None) -> None:
     if phrases_ref is not None:
         _PHRASES_VIEW = phrases_ref
 
-
 def _dedupe_shard_worker_range(payload):
     """单分片严格顺序强去重；与主流程同阈值、同算法。通过 [start, end) 区间读取全局视图。"""
     (start, end), cfg = payload
@@ -790,8 +779,6 @@ def _dedupe_shard_worker_range(payload):
             kept.append((idx, ph))
     return kept
 
-
-
 def _passes_soft_gate_threshold(phrase: str, thresh: float) -> bool:
     score = _softish_score(phrase)
     return (score >= thresh) or (score >= SOFT_GATE_VERB_FALLBACK and _has_actionish_pos(phrase))
@@ -813,7 +800,6 @@ def _soft_gate_worker_range(payload):
         except Exception:
             continue
     return passed
-
 
 def _resolve_parallel_workers(workers_spec,
                               *,
@@ -848,7 +834,6 @@ def _resolve_parallel_workers(workers_spec,
     per_proc_numba = max(1, usable // resolved)
     per_proc_omp = 1
     return resolved, usable, per_proc_numba, per_proc_omp
-
 
 def soft_gate_parallel(candidates: list[str],
                        *,
@@ -912,10 +897,6 @@ def soft_gate_parallel(candidates: list[str],
     kept.sort(key=lambda t: t[0])      # 恢复输入顺序
     out = [s for _, s in kept]
     return out
-
-
-
-
 
 def strong_dedupe_parallel(phrases: list[str],
                            *,
@@ -997,7 +978,6 @@ def strong_dedupe_parallel(phrases: list[str],
     print(f"[dedupe][mp] final={len(final):,}", flush=True)
     return final
 
-
 def cluster_by_semantics(phrases, st_model, thr=0.85, min_size=2, precomputed_embs: Optional[torch.Tensor] = None):
     if not phrases:
         return []
@@ -1031,10 +1011,6 @@ def cluster_by_semantics(phrases, st_model, thr=0.85, min_size=2, precomputed_em
         torch.cuda.empty_cache()
 
     return results
-
-
-
-
 
 PRIORITY = [
     "result_slot", "contract_soft", "routing_bias", "merge_directive",
@@ -1077,12 +1053,10 @@ def _safe_cache_path(path_str: Optional[str]) -> Optional[Path]:
             return None
     return resolved
 
-
 def _coerce_str_list(items: Any) -> list[str]:
     if not isinstance(items, list):
         return []
     return [str(item) for item in items if isinstance(item, str)]
-
 
 def _load_candidate_cache(path_str: str) -> Optional[tuple[list[str], list[str], list[str]]]:
     cache_path = _safe_cache_path(path_str)
@@ -1127,7 +1101,6 @@ def _load_candidate_cache(path_str: str) -> Optional[tuple[list[str], list[str],
     except Exception as exc:
         print(f"[cache][skip] {cache_path} not JSON/pickle; recomputing. ({exc})", flush=True)
         return None
-
 
 def _save_candidate_cache(path_str: str, cand_raw: list[str], cand_word: list[str], cand_char: list[str]) -> None:
     cache_path = _safe_cache_path(path_str)
@@ -1189,8 +1162,6 @@ def _model_signature(st_model) -> str:
         pass
     return repr(st_model)
 
-
-
 def _list_fingerprint(lst: list[str]) -> str:
     h = hashlib.sha1()
     items = [s if isinstance(s, str) else str(s) for s in lst]
@@ -1199,14 +1170,12 @@ def _list_fingerprint(lst: list[str]) -> str:
         h.update(b"\0")
     return h.hexdigest()
 
-
 def _embedding_cache_meta(st_model, *, normalize_embeddings: bool, emb_tensor: Optional[torch.Tensor] = None) -> Dict[str, Any]:
     return {
         'model': _model_signature(st_model),
         'dim': _infer_embedding_dim(st_model, emb_tensor),
         'normalize_embeddings': bool(normalize_embeddings),
     }
-
 
 @contextmanager
 def _amp_autocast(device_hint: Any):
@@ -1234,8 +1203,6 @@ def _amp_autocast(device_hint: Any):
     with torch.autocast(device_type='cuda', dtype=dtype):
         yield
 
-
-
 def rebuild_bank_sketches() -> None:
     global BANK_SKETCHES
     bank = getattr(dc, "SOFT_PARAPHRASE_BANK", {}) or {}
@@ -1244,7 +1211,6 @@ def rebuild_bank_sketches() -> None:
         k: [dc._sketch5(proto) for proto in dict.fromkeys(bank.get(k, []) or [])]
         for k in keys
     }
-
 
 def rebuild_bank_embeddings(st_model, bs_try: int = 4096) -> None:
     global BANK_EMBS
@@ -1260,14 +1226,11 @@ def rebuild_bank_embeddings(st_model, bs_try: int = 4096) -> None:
 
 rebuild_bank_sketches()
 
-
-
 def _prioritize_kinds(kinds: Iterable[str]) -> list[str]:
     unique = {k for k in kinds if k}
     if not unique:
         return []
     return sorted(unique, key=lambda k: _PRIORITY_RANK.get(k, len(PRIORITY)))
-
 
 def best_kind_by_bank_sim(phrase: str, candidate_kinds: list[str]) -> Optional[str]:
     if not candidate_kinds:
@@ -1341,7 +1304,6 @@ def _auto_route_kind_once(phrase: str) -> Optional[str]:
     routed = best_kind_by_bank_sim(phrase, [single_kind])
     return routed
 
-
 def auto_route_kind(phrase: str) -> Optional[str]:
     kind = _auto_route_kind_once(phrase)
     if kind:
@@ -1350,7 +1312,6 @@ def auto_route_kind(phrase: str) -> Optional[str]:
     if collapsed and collapsed != phrase:
         return _auto_route_kind_once(collapsed)
     return None
-
 
 def label_cluster(rep: str, members: list[str], rep_emb: torch.Tensor) -> Optional[str]:
     kind = auto_route_kind(rep)
@@ -1607,7 +1568,6 @@ def _main_impl(args):
                                     min_size=args.cluster_min,
                                     precomputed_embs=phrase_embs)
 
-
     routing_mode = "auto"
     routing_summary: dict[str, object] = {}
     skipped_reps: list[str] = []
@@ -1654,7 +1614,6 @@ def _main_impl(args):
             "bank_all": bool(args.bank_all),
         }
 
-    # 閲嶅缓杞瘉鎹娴嬶紙鍩轰簬 bank + 璇箟鍖归厤锛?
     rebuild_soft_check()
     rebuild_bank_embeddings(st_model)
     rebuild_bank_sketches()
@@ -1681,7 +1640,6 @@ def _main_impl(args):
             return {str(k): _json_safe(v) for k, v in o.items()}
         return str(o)
 
-    # 鏉堟挸鍤粻鈧崡鏇犵埠鐠?
     print(json.dumps({
         "prewarm_stats": {k: len(v) for k, v in prewarm_stats.items()} if isinstance(prewarm_stats, dict) else prewarm_stats,
         "hydration_stats": hydration_stats,
@@ -1798,6 +1756,3 @@ if __name__ == "__main__":
     p.add_argument("--dedupe_shard", type=int, default=500000,
                    help="每个进程处理的分片目标条数（默认 5e5 条）。")
     main(p.parse_args())
-
-
-
