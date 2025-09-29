@@ -41,7 +41,6 @@ _RANDOM_BIND_FUNCS = (
 
 _MISSING = object()
 
-
 def stable_seed_hex(*parts: object) -> str:
     """Return a deterministic hex seed by hashing the provided parts."""
     joined = "||".join("" if p is None else str(p) for p in parts)

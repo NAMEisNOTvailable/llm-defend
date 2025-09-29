@@ -6677,7 +6677,6 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     cfg: Optional[Config] = None) -> List[Dict[str,Any]]:
     ctx_seed = stable_seed_int("compose_attacks", "compose_attacks_serial", seed)
     with random_module_binding("compose_attacks", ctx_seed):
-        random.seed(seed)
         # unify effective knobs with CLI defaults
         disc_rate = _effective_disc_rate(disc_rate, cfg)
         artifact_free_pos_ratio = _effective_artifact_free_pos_ratio(artifact_free_pos_ratio, cfg)
@@ -7332,7 +7331,6 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
                       cfg: Optional[Config] = None) -> List[Dict[str,Any]]:
     ctx_seed = stable_seed_int("compose_attacks", "compose_hard_negs_serial", seed)
     with random_module_binding("compose_attacks", ctx_seed):
-        random.seed(seed + 1337)
         disc_rate = _effective_disc_rate(disc_rate, cfg)
         soft_hint_rate = float(_cfg_attr(cfg, 'soft_hint_rate', 0.18))
         eff_mult, _ = _resolve_oversample_multiplier(k, oversample_mult)
@@ -7659,7 +7657,6 @@ def intent_balanced_pick(rows_pos, pos_n, seed: int):
     """目标配额优先：按 INTENT_TARGET_DIST 分配配额，不足再回填。"""
     ctx_seed = stable_seed_int("compose_attacks", "intent_balanced_pick", seed)
     with random_module_binding("compose_attacks", ctx_seed):
-        random.seed(seed)
         # 聚合各 intent 的候选
         by_intent = defaultdict(list)
         for r in rows_pos:
@@ -7701,7 +7698,6 @@ def pick_by_intent_carrier_delivery_anchor(rows_pos, pos_n, seed: int):
     """基于 (intent, carrier, delivery) 的最小配额覆盖后再回填。"""
     ctx_seed = stable_seed_int("compose_attacks", "pick_intent_carrier_delivery", seed)
     with random_module_binding("compose_attacks", ctx_seed):
-        random.seed(seed)
         # 准备分布：intent 用 INTENT_TARGET_DIST，carrier 用 CARRIER_WEIGHTS 归一化，delivery 均匀
         by_key = defaultdict(list)
         intents = set()
@@ -7854,7 +7850,6 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
                             cfg: Optional[Config] = None):
     ctx_seed = stable_seed_int("compose_attacks", "compose_plain_neg_serial", seed)
     with random_module_binding("compose_attacks", ctx_seed):
-        random.seed(seed + 4242)
         disc_rate = _effective_disc_rate(disc_rate, cfg)
         soft_hint_rate = float(_cfg_attr(cfg, 'soft_hint_rate', 0.18))
         rng = compose_rng("plain_neg_serial", seed=seed)
@@ -8158,7 +8153,6 @@ def _compose_topic_shift_negatives_serial(target_pool, k: int, seed: int, dedupe
                                   cfg: Optional[Config] = None) -> list[dict]:
     ctx_seed = stable_seed_int("compose_attacks", "compose_topic_shift_neg", seed)
     with random_module_binding("compose_attacks", ctx_seed):
-        random.seed(seed + 7777)
         disc_rate = _effective_disc_rate(disc_rate, cfg)
         soft_hint_rate = float(_cfg_attr(cfg, 'soft_hint_rate', 0.18))
         out = []
@@ -8231,7 +8225,6 @@ def _compose_topic_shift_negatives_serial(target_pool, k: int, seed: int, dedupe
 def pick_random_with_cap(cands: List[Dict[str,Any]], need: int, fam_cap: int, seed: int) -> List[Dict[str,Any]]:
     ctx_seed = stable_seed_int("compose_attacks", "pick_random_with_cap", seed)
     with random_module_binding("compose_attacks", ctx_seed):
-        random.seed(seed)
         random.shuffle(cands)
         out, fam_cnt = [], Counter()
         for x in cands:
@@ -10001,7 +9994,6 @@ def main():
     paired_negs = []
     paired_ctx_seed = stable_seed_int("compose_attacks", "paired_negatives", args.seed)
     with random_module_binding("compose_attacks", paired_ctx_seed):
-        random.seed(args.seed + 2025)
         target_paired = paired_quota
         for r in pos:
             if len(paired_negs) >= target_paired:
@@ -10292,7 +10284,6 @@ def main():
         return f"solo::{fallback}"
     split_ctx_seed = stable_seed_int("compose_attacks", "dataset_split", args.seed)
     with random_module_binding("compose_attacks", split_ctx_seed):
-        random.seed(args.seed + 99)
         groups = defaultdict(list)
         for r in rows:
             gid = _split_group_key(r)

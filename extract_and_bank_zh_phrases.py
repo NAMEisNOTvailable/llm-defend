@@ -1,7 +1,8 @@
-# extract_and_bank_zh_phrases.py
+﻿# extract_and_bank_zh_phrases.py
 # -*- coding: utf-8 -*-
 import os
 import multiprocessing
+import logging
 
 _CPU_RESERVE = 2
 _cpu_total = multiprocessing.cpu_count()
@@ -14,6 +15,11 @@ for _env_key in (
     "NUMEXPR_NUM_THREADS",
 ):
     os.environ[_env_key] = str(_n_cores)
+
+os.environ.setdefault("NUMBA_NUM_THREADS", str(_n_cores))
+os.environ.setdefault("NUMBA_THREADING_LAYER", "omp")
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import torch
 
@@ -71,6 +77,7 @@ from pathlib import Path
 from collections import defaultdict
 from typing import Optional, Iterable, List, Any, Dict
 from threading import Lock
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
     import jieba_fast as jieba
@@ -95,6 +102,19 @@ def _ensure_jieba_initialized() -> None:
     with _JIEBA_INIT_LOCK:
         if _JIEBA_READY:
             return
+        try:
+            import logging
+            try:
+                jieba.setLogLevel(logging.ERROR)
+            except Exception:
+                try:
+                    default_logger = getattr(jieba, 'default_logger', None)
+                    if default_logger is not None:
+                        default_logger.setLevel(logging.ERROR)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             initializer = getattr(jieba, "initialize", None)
             if callable(initializer):
@@ -134,6 +154,9 @@ GPU_RESERVE_BYTES: int = 6 * 1024**3
 CPU_MEM_RESERVE_PCT: float = 0.20
 CAND_CHUNK_MAX_CAP: int | None = None
 ALLOW_EXTERNAL_CACHE: bool = False
+ST_MODEL_NAME = "BAAI/bge-large-zh-v1.5"
+
+_PHRASES_VIEW = None
 
 
 SOFT_HINT_TOKENS = (
@@ -161,8 +184,6 @@ CJK_CODE_RANGES = (
     (0x30000, 0x323AF),
     (0x2F800, 0x2FA1F),
 )
-
-
 
 _PUNCT_ONLY = re.compile(r'^[\W_]+$', re.UNICODE)
 STOPWORDS = {"然后", "那么", "其实", "就是", "以及", "关于", "如果", "需要", "由于", "因此", "此外", "同时", "可以", "进行", "有关", "问题", "情况", "方面", "不会", "不是", "没有", "为了", "这个", "那个"}
@@ -342,6 +363,44 @@ def patched_encode(st_model, *, bs_try=4096):
     finally:
         st_model.encode = orig
 
+def _auto_encode_batch_size(st_model, default_bs: int, data_len: int) -> int:
+    try:
+        device = getattr(st_model, "device", torch.device("cpu"))
+    except Exception:
+        device = torch.device("cpu")
+    target_len = max(1, int(data_len))
+    base = max(1, int(default_bs))
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        return min(base, target_len) if data_len else base
+    try:
+        with torch.cuda.device(device):
+            free_mem, total_mem = torch.cuda.mem_get_info()
+    except Exception:
+        return min(base, target_len) if data_len else base
+    reserve = max(int(0.05 * total_mem), 256 * 1024**2)
+    headroom = max(0, int(free_mem) - reserve)
+    if headroom <= 0:
+        return min(base, target_len) if data_len else base
+    try:
+        sample_param = next(st_model.parameters())
+        dtype = sample_param.dtype
+    except Exception:
+        dtype = torch.float32
+    try:
+        dtype_size = torch.tensor([], dtype=dtype).element_size()
+    except Exception:
+        dtype_size = 4
+    embed_dim = _infer_embedding_dim(st_model) or 1024
+    per_item_bytes = max(dtype_size * embed_dim * 6, dtype_size * 512)
+    guess = headroom // per_item_bytes if per_item_bytes > 0 else base
+    if guess <= 0:
+        return min(base, target_len) if data_len else base
+    guess = max(base, int(guess))
+    guess = min(65536, guess)
+    if data_len:
+        return min(target_len, guess)
+    return guess
+
 def encode_gpu(
     st_model,
     texts,
@@ -351,10 +410,17 @@ def encode_gpu(
     normalize_embeddings=True,
     **kwargs,
 ):
-    with patched_encode(st_model, bs_try=bs_try):
+    try:
+        data_len = len(texts)  # type: ignore[arg-type]
+    except Exception:
+        data_len = 0
+    base_bs = max(1, int(bs_try or 1024))
+    auto_bs = _auto_encode_batch_size(st_model, base_bs, data_len or base_bs)
+    eff_bs = max(1, int(auto_bs))
+    with patched_encode(st_model, bs_try=eff_bs):
         return st_model.encode(
             texts,
-            batch_size=bs_try,
+            batch_size=eff_bs,
             convert_to_tensor=convert_to_tensor,
             normalize_embeddings=normalize_embeddings,
             **kwargs,
@@ -604,23 +670,333 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
     print(f"[stage] keybert_candidates done | docs={len(docs)} | flat_cands={len(flat_cands)}", flush=True)
     return raw_all, word_candidates, char_candidates
 
+
+def _keybert_worker_job(payload):
+    docs, model_name, device_str, params, seed = payload
+    top_n, ngram_word, ngram_char, use_mmr, diversity, min_cjk = params
+    resolved_device = device_str
+    if isinstance(resolved_device, str) and resolved_device.startswith('cuda') and not torch.cuda.is_available():
+        resolved_device = 'cpu'
+    with _seed_ctx('keybert_candidates', seed):
+        st_model = SentenceTransformer(model_name, device=resolved_device)
+        st_model.eval()
+        print(f"[stage] keybert_spawn model={model_name} device={st_model.device}", flush=True)
+        return keybert_candidates(
+            docs,
+            st_model,
+            top_n=top_n,
+            ngram_word=ngram_word,
+            ngram_char=ngram_char,
+            use_mmr=use_mmr,
+            diversity=diversity,
+            min_cjk=min_cjk,
+        )
+
+
+def _generate_keybert_candidates(docs, *, model_name: str, device: str, params: dict, seed: int) -> tuple[list[str], list[str], list[str]]:
+    if not docs:
+        return [], [], []
+    payload = (docs, model_name, device, (
+        int(params.get('top_n', 20)),
+        tuple(params.get('ngram_word', (2, 6))),
+        tuple(params.get('ngram_char', (3, 6))),
+        bool(params.get('use_mmr', True)),
+        float(params.get('diversity', 0.5)),
+        float(params.get('min_cjk', 0.3)),
+    ), int(seed))
+    try:
+        ctx = multiprocessing.get_context('spawn')
+    except Exception:
+        ctx = multiprocessing.get_context()
+    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as ex:
+        future = ex.submit(_keybert_worker_job, payload)
+        return future.result()
+
 def strong_dedupe(phrases, simhash_bits=64, simhash_thresh=1,
                   k=5, n_hash=64, bands=16, jaccard_thresh=0.90,
                   vec_dim=1024, cosine_thresh=0.92):
-    # Deduper: SimHash + MinHash-LSH + hashed trigram cosine
     cfg = get_default_deduper_kwargs(sim_bits=simhash_bits,
                                      sim_thresh=simhash_thresh,
                                      k=k, n_hash=n_hash, bands=bands,
                                      jaccard_thresh=jaccard_thresh,
                                      vec_dim=vec_dim, cosine_thresh=cosine_thresh)
     dd = Deduper(**cfg)
-    uniq = []
-    for ph in phrases:
-        ok, reason, rec = dd.probe(ph)
+    uniq: list[str] = []
+    dd_probe = dd.probe
+    dd_add = dd.add_record
+    u_append = uniq.append
+    total = len(phrases)
+    for i, ph in enumerate(phrases):
+        try:
+            ok, _, rec = dd_probe(ph)
+        except Exception:
+            # [dedupe][warn] Optional diagnostic: print the offending sample when needed.
+            continue
         if ok:
-            dd.add_record(rec)
-            uniq.append(ph)
+            dd_add(rec)
+            u_append(ph)
+        if (i + 1) % 200000 == 0:
+            kept = len(uniq)
+            print(f"[dedupe] seen={i+1:,} kept={kept:,} keep_rate={kept/(i+1):.3f}", flush=True)
+    kept = len(uniq)
+    if total:
+        print(f"[dedupe] seen={total:,} kept={kept:,} keep_rate={kept/total:.3f}", flush=True)
+    else:
+        print("[dedupe] seen=0 kept=0 keep_rate=0.000", flush=True)
     return uniq
+def _mp_init(numba_threads: int, omp_threads: int, phrases_ref=None) -> None:
+    """Initializer used by multiprocessing workers to bound intra-process threading."""
+    import os
+    global _PHRASES_VIEW
+    numba_threads = max(1, int(numba_threads))
+    omp_threads = max(1, int(omp_threads))
+    os.environ["NUMBA_NUM_THREADS"] = str(numba_threads)
+    for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[key] = str(omp_threads)
+    try:
+        import numba as _nb
+        _nb.set_num_threads(numba_threads)
+    except Exception:
+        pass
+    try:
+        import numexpr as _ne
+        _ne.set_num_threads(omp_threads)
+    except Exception:
+        pass
+    if phrases_ref is not None:
+        _PHRASES_VIEW = phrases_ref
+
+
+def _dedupe_shard_worker_range(payload):
+    """单分片严格顺序强去重；与主流程同阈值、同算法。通过 [start, end) 区间读取全局视图。"""
+    (start, end), cfg = payload
+    if _PHRASES_VIEW is None:
+        raise RuntimeError("[dedupe][mp] phrases view not initialized in worker")
+    dd = Deduper(**cfg)
+    kept: list[tuple[int, str]] = []
+    dd_probe = dd.probe
+    dd_add = dd.add_record
+    view = _PHRASES_VIEW
+    for idx in range(start, end):
+        ph = view[idx]
+        try:
+            ok, _, rec = dd_probe(ph)
+        except Exception:
+            # [dedupe][warn] Optional diagnostic: print the offending sample when needed.
+            continue
+        if ok:
+            dd_add(rec)
+            kept.append((idx, ph))
+    return kept
+
+
+
+def _passes_soft_gate_threshold(phrase: str, thresh: float) -> bool:
+    score = _softish_score(phrase)
+    return (score >= thresh) or (score >= SOFT_GATE_VERB_FALLBACK and _has_actionish_pos(phrase))
+
+
+def _soft_gate_worker_range(payload):
+    """payload = ((start, end), thresh)；从全局只读视图 _PHRASES_VIEW 取文本做软门控。"""
+    (start, end), thresh = payload
+    if _PHRASES_VIEW is None:
+        raise RuntimeError("[gate][mp] phrases view not initialized in worker")
+    _ensure_jieba_initialized()  # 每个进程初始化 jieba
+    view = _PHRASES_VIEW
+    passed = []
+    for idx in range(start, end):
+        s = view[idx]
+        try:
+            if _passes_soft_gate_threshold(s, thresh):
+                passed.append((idx, s))
+        except Exception:
+            continue
+    return passed
+
+
+def _resolve_parallel_workers(workers_spec,
+                              *,
+                              cap=None,
+                              reserve_cores: int = 2) -> tuple[int, int, int, int]:
+    cores = os.cpu_count() or 4
+    max_reserve = max(cores - 1, 0)
+    reserve = min(max(reserve_cores, 0), max_reserve)
+    usable = max(1, cores - reserve)
+    if cap is not None:
+        try:
+            cap_val = int(cap)
+        except Exception:
+            cap_val = None
+        else:
+            if cap_val and cap_val > 0:
+                usable = max(1, min(usable, cap_val))
+    if isinstance(workers_spec, str):
+        if workers_spec.lower() == "auto":
+            resolved = usable
+        else:
+            try:
+                resolved = int(workers_spec)
+            except Exception:
+                resolved = 1
+    else:
+        try:
+            resolved = int(workers_spec)
+        except Exception:
+            resolved = 1
+    resolved = max(1, min(usable, resolved))
+    per_proc_numba = max(1, usable // resolved)
+    per_proc_omp = 1
+    return resolved, usable, per_proc_numba, per_proc_omp
+
+
+def soft_gate_parallel(candidates: list[str],
+                       *,
+                       thresh: float,
+                       workers="auto",
+                       chunk=200_000,
+                       log_every=1_000_000,
+                       cap=None) -> list[str]:
+    """与单线程 _passes_soft_gate 等价的并行版本；仅提升吞吐，不改语义。"""
+    n = len(candidates)
+    if n == 0:
+        return []
+
+    chunk = max(1, int(chunk))
+
+    workers, _, per_proc_numba, per_proc_omp = _resolve_parallel_workers(
+        workers,
+        cap=cap,
+    )
+
+    if workers <= 1 or chunk >= n:
+        return [phrase for phrase in candidates if _passes_soft_gate_threshold(phrase, thresh)]
+
+    ranges = [(i, min(i + chunk, n)) for i in range(0, n, chunk)]
+
+    global _PHRASES_VIEW
+    _PHRASES_VIEW = candidates
+
+    print(f"[gate][mp] start {len(ranges)} shards, workers={workers}, "
+          f"chunk≈{chunk}, thresh={thresh}", flush=True)
+    print(f"[gate][mp] workers={workers} | per_proc_numba={per_proc_numba} | per_proc_omp={per_proc_omp}",
+          flush=True)
+
+    kept = []
+    next_log = int(log_every) if log_every else 0
+
+    try:
+        try:
+            ctx = multiprocessing.get_context("fork")
+        except Exception:
+            ctx = multiprocessing.get_context()
+
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=ctx,
+            initializer=_mp_init,
+            initargs=(per_proc_numba, per_proc_omp, _PHRASES_VIEW),
+        ) as ex:
+            futs = [ex.submit(_soft_gate_worker_range, (r, thresh)) for r in ranges]
+            total = len(futs)
+            done = 0
+            for fut in as_completed(futs):
+                part = fut.result()
+                kept.extend(part)
+                done += 1
+                if (next_log and len(kept) >= next_log) or (done % 2 == 0) or done == total:
+                    print(f"[gate][mp] shard done {done}/{total} | pass_so_far={len(kept):,}", flush=True)
+    finally:
+        _PHRASES_VIEW = None
+
+    kept.sort(key=lambda t: t[0])      # 恢复输入顺序
+    out = [s for _, s in kept]
+    return out
+
+
+
+
+
+def strong_dedupe_parallel(phrases: list[str],
+                           *,
+                           simhash_bits=64, simhash_thresh=1,
+                           k=5, n_hash=64, bands=16, jaccard_thresh=0.90,
+                           vec_dim=1024, cosine_thresh=0.92,
+                           workers="auto",
+                           worker_cap=None,
+                           shard_size=500_000, log_every=200_000) -> list[str]:
+    """Map-Reduce 并行强去重；分片去重 + 汇总再做一次全局强去重。"""
+    n = len(phrases)
+    if n == 0:
+        return []
+
+    shard_size = max(1, int(shard_size))
+    log_every = max(0, int(log_every)) if log_every is not None else 0
+
+    workers, _, per_proc_numba, per_proc_omp = _resolve_parallel_workers(
+        workers,
+        cap=worker_cap,
+    )
+
+    if workers <= 1 or n <= shard_size * 1.2:
+        return strong_dedupe(phrases,
+                             simhash_bits=simhash_bits, simhash_thresh=simhash_thresh,
+                             k=k, n_hash=n_hash, bands=bands, jaccard_thresh=jaccard_thresh,
+                             vec_dim=vec_dim, cosine_thresh=cosine_thresh)
+
+    cfg = get_default_deduper_kwargs(sim_bits=simhash_bits,
+                                     sim_thresh=simhash_thresh,
+                                     k=k, n_hash=n_hash, bands=bands,
+                                     jaccard_thresh=jaccard_thresh,
+                                     vec_dim=vec_dim, cosine_thresh=cosine_thresh)
+
+    try:
+        ctx = multiprocessing.get_context("fork")
+    except Exception:
+        ctx = multiprocessing.get_context()
+
+    global _PHRASES_VIEW
+    _PHRASES_VIEW = phrases
+    ranges = [(i, min(i + shard_size, n)) for i in range(0, n, shard_size)]
+    print(f"[dedupe][mp] start {len(ranges)} shards, workers={workers}, shard_size≈{shard_size}", flush=True)
+    print(f"[dedupe][mp] workers={workers} | per_proc_numba={per_proc_numba} | per_proc_omp={per_proc_omp}", flush=True)
+    kept_all: list[tuple[int, str]] = []
+    next_log = log_every
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=ctx,
+        initializer=_mp_init,
+        initargs=(per_proc_numba, per_proc_omp, _PHRASES_VIEW),
+    ) as ex:
+        futures = [ex.submit(_dedupe_shard_worker_range, (r, cfg)) for r in ranges]
+        total = len(futures)
+        completed = 0
+        for fut in as_completed(futures):
+            part = fut.result()
+            kept_all.extend(part)
+            completed += 1
+            kept_count = len(kept_all)
+            should_log = False
+            if log_every and kept_count >= next_log:
+                should_log = True
+                next_log += log_every
+            elif completed % 2 == 0 or completed == total:
+                should_log = True
+            if should_log:
+                print(f"[dedupe][mp] shard done {completed}/{total} | kept_so_far={kept_count:,}", flush=True)
+    _PHRASES_VIEW = None
+
+    kept_all.sort(key=lambda t: t[0])
+    first_pass = [ph for _, ph in kept_all]
+    print(f"[dedupe][mp] first_pass={len(first_pass):,}, now global strong_dedupe...", flush=True)
+
+    final = strong_dedupe(first_pass,
+                          simhash_bits=simhash_bits, simhash_thresh=simhash_thresh,
+                          k=k, n_hash=n_hash, bands=bands, jaccard_thresh=jaccard_thresh,
+                          vec_dim=vec_dim, cosine_thresh=cosine_thresh)
+    print(f"[dedupe][mp] final={len(final):,}", flush=True)
+    return final
+
 
 def cluster_by_semantics(phrases, st_model, thr=0.85, min_size=2, precomputed_embs: Optional[torch.Tensor] = None):
     if not phrases:
@@ -1108,13 +1484,9 @@ def _main_impl(args):
             docs.append(seg)
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-    st_model = SentenceTransformer("BAAI/bge-large-zh-v1.5", device=device)
-    st_model.eval()
-    print(f"[info] model=BAAI/bge-large-zh-v1.5 device={st_model.device}", flush=True)
+    model_name = ST_MODEL_NAME
 
     rebuild_bank_sketches()
-    rebuild_bank_embeddings(st_model)
-
 
     # 1) KeyBERT ????MMR ???
     ngram_word = (args.ngram_min, args.ngram_max)
@@ -1125,15 +1497,19 @@ def _main_impl(args):
         cand_raw, cand_word, cand_char = cached_candidates
         cand_cache_hit = True
     if not cand_cache_hit:
-        cand_raw, cand_word, cand_char = keybert_candidates(
+        cand_raw, cand_word, cand_char = _generate_keybert_candidates(
             docs,
-            st_model,
-            top_n=args.top_n,
-            ngram_word=ngram_word,
-            ngram_char=ngram_char,
-            use_mmr=True,
-            diversity=args.diversity,
-            min_cjk=args.min_cjk,
+            model_name=model_name,
+            device=device,
+            params={
+                'top_n': args.top_n,
+                'ngram_word': ngram_word,
+                'ngram_char': ngram_char,
+                'use_mmr': True,
+                'diversity': args.diversity,
+                'min_cjk': args.min_cjk,
+            },
+            seed=args.seed,
         )
         _save_candidate_cache(CAND_CACHE, cand_raw, cand_word, cand_char)
     cand_word_filtered = cand_word
@@ -1143,23 +1519,32 @@ def _main_impl(args):
 
     combined_candidates = cand_word + cand_char
 
-    def _passes_soft_gate(phrase: str) -> bool:
-        score = _softish_score(phrase)
-        if score >= args.soft_gate_thresh:
-            return True
-        return score >= SOFT_GATE_VERB_FALLBACK and _has_actionish_pos(phrase)
+    cand_after_gate = soft_gate_parallel(
+        combined_candidates,
+        thresh=args.soft_gate_thresh,
+        workers=args.soft_gate_workers,
+        chunk=args.soft_gate_chunk,
+        cap=args.soft_gate_cap,
+    )
 
-    cand_after_gate = [phrase for phrase in combined_candidates if _passes_soft_gate(phrase)]
-
-    # 在 strong_dedupe 之前
+    # 在强去重之前
     cand_after_gate = list(dict.fromkeys(cand_after_gate))
 
     phrase_embs = None
-    vec_dim = _infer_embedding_dim(st_model, phrase_embs if isinstance(phrase_embs, torch.Tensor) else None)
-    cand = strong_dedupe(cand_after_gate,
-                         simhash_bits=64, simhash_thresh=1,
-                         k=5, n_hash=64, bands=16, jaccard_thresh=0.90,
-                         vec_dim=vec_dim, cosine_thresh=0.92)
+    cand = strong_dedupe_parallel(
+        cand_after_gate,
+        simhash_bits=64, simhash_thresh=1,
+        k=5, n_hash=64, bands=16, jaccard_thresh=0.90,
+        vec_dim=1024, cosine_thresh=0.92,
+        workers=args.dedupe_workers,
+        worker_cap=args.dedupe_worker_cap,
+        shard_size=args.dedupe_shard
+    )
+
+    st_model = SentenceTransformer(model_name, device=device)
+    st_model.eval()
+    print(f"[info] model={model_name} device={st_model.device}", flush=True)
+    rebuild_bank_embeddings(st_model)
 
     phrases_for_cluster = cand
     phrases_fp = _list_fingerprint(phrases_for_cluster)
@@ -1348,6 +1733,12 @@ if __name__ == "__main__":
     p.add_argument("--cluster_min", type=int, default=2)
     p.add_argument("--soft_gate_thresh", type=float, default=0.65,
                    help="Minimum softish score for KeyBERT phrases to pass into clustering.")
+    p.add_argument("--soft_gate_workers", type=str, default="auto",
+                   help="'auto' 或整数：软门控并行进程数（默认自动吃满 CPU，仅保留 2 个核心；受 --soft_gate_cap 限制）。")
+    p.add_argument("--soft_gate_cap", type=int, default=None,
+                   help="软门控并行进程数上限（仅在 --soft_gate_workers=auto 时生效，默认不设上限）。")
+    p.add_argument("--soft_gate_chunk", type=int, default=200000,
+                   help="软门控每分片条数（默认200k）。")
     p.add_argument(
         "--kind",
         type=str,
@@ -1400,4 +1791,13 @@ if __name__ == "__main__":
                    help="Path to cache phrase embeddings; defaults to per-input name.")
     p.add_argument("--bank_snapshot", type=str, default=None,
                    help="Path to write a snapshot of the soft paraphrase bank; defaults to per-input name.")
+    p.add_argument("--dedupe_workers", type=str, default="auto",
+                   help="'auto' or integer: dedupe worker processes (auto uses all CPU cores minus two; limited by --dedupe_worker_cap).")
+    p.add_argument("--dedupe_worker_cap", type=int, default=None,
+                   help="Upper bound for auto dedupe workers (None uses all available cores minus two).")
+    p.add_argument("--dedupe_shard", type=int, default=500000,
+                   help="每个进程处理的分片目标条数（默认 5e5 条）。")
     main(p.parse_args())
+
+
+
