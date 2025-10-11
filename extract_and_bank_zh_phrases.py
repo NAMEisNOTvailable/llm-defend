@@ -167,15 +167,15 @@ SOFT_HINT_TOKENS = ( "请只", "务必", "不超过", "控制在", "最后一句
     "忽略前文","无视之前","覆盖规则","扮演","作为","切换角色",
     "不要遵循","禁用安全","越过","只输出","仅输出","一步步","以JSON输出","JSON格式输出", "不要解释")
 ACTIONISH_POS_TAGS = { "v", "vd", "vn", "vshi", "vyou", "vf", "vx", "vi", "vl", "vg", }
-CJK_CODE_RANGES = ( (0x2E80, 0x2FFF), (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF), (0x20000, 0x2A6DF), (0x2A700, 0x2B73F), (0x2B740, 0x2B81F), (0x2B820, 0x2CEAF), (0x2CEB0, 0x2EBEF), (0x30000, 0x323AF), (0x2F800, 0x2FA1F), )
+CN_CODE_RANGES = ( (0x2E80, 0x2FFF), (0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF), (0x20000, 0x2A6DF), (0x2A700, 0x2B73F), (0x2B740, 0x2B81F), (0x2B820, 0x2CEAF), (0x2CEB0, 0x2EBEF), (0x30000, 0x323AF), (0x2F800, 0x2FA1F), )
 _PUNCT_ONLY = re.compile(r'^[\W_]+$', re.UNICODE)
 STOPWORDS = {"然后", "那么", "其实", "就是", "以及", "关于", "如果", "需要", "由于", "因此", "此外", "同时", "可以", "进行", "有关", "问题", "情况", "方面", "不会", "不是", "没有", "为了", "这个", "那个"}
 NUMERIC_MEASURE_RX = re.compile( r'^\d+(?:\.\d+)?(?:[~\-–—]\d+(?:\.\d+)?)?[\u4e00-\u9fff]{1,4}$' )
 CONFUSABLES = {ord('\u200b'):None, ord('\u200c'):None, ord('\u200d'):None, ord('\ufeff'):None}
 
-def _is_cjk_char(ch: str) -> bool:
+def _is_CN_char(ch: str) -> bool:
     code = ord(ch)
-    for start, end in CJK_CODE_RANGES:
+    for start, end in CN_CODE_RANGES:
         if start <= code <= end:
             return True
     return False
@@ -188,8 +188,8 @@ def _keep_phrase(s: str) -> bool:
         return False
     if not NUMERIC_MEASURE_RX.fullmatch(s2) and s2.isdigit():
         return False
-    cjk = sum(1 for ch in s2 if _is_cjk_char(ch))
-    if (cjk / max(1, len(s2))) < 0.4:
+    CN = sum(1 for ch in s2 if _is_CN_char(ch))
+    if (CN / max(1, len(s2))) < 0.4:
         return False
     if s2 in STOPWORDS:
         return False
@@ -630,7 +630,7 @@ def _fused_rescore(
     return [texts[i] for i in order]
 
 def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3,6),
-                       use_mmr=True, diversity=0.5, min_cjk=0.3):
+                       use_mmr=True, diversity=0.5, min_CN=0.3):
     vec_word = build_vectorizer(ngram=ngram_word, use_jieba=True)
     vec_char = build_vectorizer(ngram=ngram_char, analyzer="char_wb", use_jieba=False)
     an_word = vec_word.build_analyzer()
@@ -640,13 +640,13 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
     flat_cands: list[str] = []
     raw_all: list[str] = []
     seed_by_doc: list[list[str]] = []
-    def cjk_ratio(s: str) -> float:
-        count = sum(1 for ch in s if _is_cjk_char(ch))
+    def CN_ratio(s: str) -> float:
+        count = sum(1 for ch in s if _is_CN_char(ch))
         return count / max(1, len(s))
     for doc in docs:
         seeds = harvest_rule_based_phrases(doc)
         seed_by_doc.append(seeds)
-        if cjk_ratio(doc) < min_cjk:
+        if CN_ratio(doc) < min_CN:
             offsets.append((len(flat_cands), len(flat_cands)))
             continue
         if len(doc) > KEYBERT_MAX_DOC_CHARS:
@@ -978,7 +978,7 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
 
 def _keybert_worker_job(payload):
     docs, model_name, device_str, params, seed = payload
-    top_n, ngram_word, ngram_char, use_mmr, diversity, min_cjk = params
+    top_n, ngram_word, ngram_char, use_mmr, diversity, min_CN = params
     resolved_device = device_str
     if isinstance(resolved_device, str) and resolved_device.startswith('cuda') and not torch.cuda.is_available():
         resolved_device = 'cpu'
@@ -996,7 +996,7 @@ def _keybert_worker_job(payload):
             ngram_char=ngram_char,
             use_mmr=use_mmr,
             diversity=diversity,
-            min_cjk=min_cjk,
+            min_CN=min_CN,
         )
 
 def _generate_keybert_candidates(docs, *, model_name: str, device: str, params: dict, seed: int) -> tuple[list[str], list[str], list[str]]:
@@ -1008,7 +1008,7 @@ def _generate_keybert_candidates(docs, *, model_name: str, device: str, params: 
         tuple(params.get('ngram_char', (3, 6))),
         bool(params.get('use_mmr', True)),
         float(params.get('diversity', 0.5)),
-        float(params.get('min_cjk', 0.3)),
+        float(params.get('min_CN', 0.3)),
     ), int(seed))
     try:
         ctx = multiprocessing.get_context('spawn')
@@ -1882,7 +1882,7 @@ def _main_impl(args):
                 'ngram_char': ngram_char,
                 'use_mmr': True,
                 'diversity': args.diversity,
-                'min_cjk': args.min_cjk,
+                'min_CN': args.min_CN,
             },
             seed=args.seed,
         )
@@ -2094,7 +2094,7 @@ if __name__ == "__main__":
     p.add_argument("--ngram_min", type=int, default=2)
     p.add_argument("--ngram_max", type=int, default=6)
     p.add_argument("--diversity", type=float, default=0.5, help="KeyBERT MMR diversity; 0.4-0.6 suits most cases, bump to ~0.65 for forum/colloquial corpora.")
-    p.add_argument("--min_cjk", type=float, default=0.6)
+    p.add_argument("--min_CN", type=float, default=0.6)
     p.add_argument("--cluster_thr", type=float, default=0.85)
     p.add_argument("--cluster_min", type=int, default=2)
     p.add_argument("--prewarm_keys", type=str, default=None,

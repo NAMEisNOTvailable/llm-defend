@@ -32,35 +32,35 @@ def _noop_apply_style(text: str, spec: Any, rnd: random.Random) -> str:
 
 # ---------------------- helpers ----------------------
 
-_CJK_RANGES = [
+_CN_RANGES = [
     (0x4E00, 0x9FFF), (0x3400, 0x4DBF), (0x20000, 0x2A6DF),
     (0x2A700, 0x2B73F), (0x2B740, 0x2B81F), (0x2B820, 0x2CEAF),
     (0xF900, 0xFAFF)
 ]
 
-def _is_cjk(ch: str) -> bool:
+def _is_CN(ch: str) -> bool:
     o = ord(ch)
-    return any(a <= o <= b for a, b in _CJK_RANGES)
+    return any(a <= o <= b for a, b in _CN_RANGES)
 
-def _local_cjk_share(s: str) -> float:
+def _local_CN_share(s: str) -> float:
     if not s:
         return 0.0
-    cjk = sum(1 for ch in s if _is_cjk(ch))
-    return cjk / max(1, len(s))
+    CN = sum(1 for ch in s if _is_CN(ch))
+    return CN / max(1, len(s))
 
 try:
-    from dsl_core import cjk_share as _dsl_cjk_share  # type: ignore
+    from dsl_core import CN_share as _dsl_CN_share  # type: ignore
 
 except Exception:
-    _dsl_cjk_share = None
+    _dsl_CN_share = None
 
-def cjk_share(s: str) -> float:
-    if _dsl_cjk_share is not None:
+def CN_share(s: str) -> float:
+    if _dsl_CN_share is not None:
         try:
-            return float(_dsl_cjk_share(s))
+            return float(_dsl_CN_share(s))
         except Exception:
             pass
-    return _local_cjk_share(s)
+    return _local_CN_share(s)
 
 try:
     import dsl_core as _DSL_CORE  # type: ignore
@@ -176,7 +176,7 @@ class MicroGrammar:
     joiners: List[str] = field(default_factory=lambda: ["\uFF0C", "\uFF1B", "\uFF0C\u5e76", "\uFF0C\u4e14"])
     trailing: List[str] = field(default_factory=lambda: ["\u3002", "\uFF01", "\uFF1F", ""])
     max_len: int = 28
-    min_cjk_share: float = 0.70
+    min_CN_share: float = 0.70
     tight_pairs: Set[Tuple[str, str]] = field(default_factory=set)
     # 体裁化前/后缀，按 register 选择（小概率混入）
     prefix_by_register: Dict[str, List[str]] = field(default_factory=dict)
@@ -286,7 +286,7 @@ class MicroGrammar:
                 continue
             if len(t) > self.max_len:
                 continue
-            if cjk_share(t) < self.min_cjk_share:
+            if CN_share(t) < self.min_CN_share:
                 continue
             return t
         return ""
@@ -427,7 +427,7 @@ def style_wrap(
         carrier="style",
         delivery="single_turn",
         evidence=[],
-        min_cjk_share=0.0,
+        min_CN_share=0.0,
     )
     spec.persona = persona
     spec.register = register
@@ -508,7 +508,7 @@ def expand_grammar(
             continue
         if len(s) < 6 or len(s) > mg.max_len:
             continue
-        if cjk_share(s) < mg.min_cjk_share:
+        if CN_share(s) < mg.min_CN_share:
             continue
         if s in seen:
             continue
@@ -677,7 +677,7 @@ def grammar_result_slot() -> MicroGrammar:
         orders=orders,
         joiners=["", "、", " ", "，"],
         max_len=32,
-        min_cjk_share=0.8,
+        min_CN_share=0.8,
         prefix_by_register=prefix,
         suffix_by_register=suffix,
         tight_pairs={('act', 'obj')},
@@ -987,7 +987,7 @@ def grammar_reward_field() -> MicroGrammar:
         ],
         joiners=[', ', ', ', '; ', ', '],
         max_len=64,
-        min_cjk_share=0.10,
+        min_CN_share=0.10,
     )
 
 def grammar_reward_channel() -> MicroGrammar:
@@ -1052,7 +1052,7 @@ def grammar_reward_channel() -> MicroGrammar:
         ],
         joiners=[', ', '; ', ', '],
         max_len=72,
-        min_cjk_share=0.10,
+        min_CN_share=0.10,
         prefix_by_register={
             'ops_runbook': ORAL_OPENERS.get('ticket', []),
             'sop': ORAL_OPENERS.get('support_template', []),
@@ -1118,7 +1118,7 @@ def grammar_loop_state_drift() -> MicroGrammar:
         ],
         joiners=[', ', ', ', '; '],
         max_len=72,
-        min_cjk_share=0.10,
+        min_CN_share=0.10,
     )
 
 # ---------------------- evidence hydration helpers ----------------------

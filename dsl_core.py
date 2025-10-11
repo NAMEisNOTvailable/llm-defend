@@ -1814,14 +1814,14 @@ class AFCase:
     label: Optional[str] = None
 
 
-def _anchor_free_spec(evidence: list[str], min_cjk: float = 0.60, soft_min: int = 3) -> AttackSpec:
+def _anchor_free_spec(evidence: list[str], min_CN: float = 0.60, soft_min: int = 3) -> AttackSpec:
     spec = AttackSpec(
         strategy="policy_bypass",
         channel="ui",
         carrier="natlang",
         delivery="direct",
         evidence=evidence,
-        min_cjk_share=min_cjk,
+        min_CN_share=min_CN,
     )
     spec.constraints = {"anchor_free": True, "anchor_free_soft_min_hits": soft_min}
     return spec
@@ -1838,7 +1838,7 @@ def check_af_once(
     seed: int = 2025,
 ) -> tuple[bool, list[str], str, bool, set[str]]:
     rng = stable_rng("dsl_core", "check_af_once", seed)
-    spec = _anchor_free_spec(case.evidence, min_cjk=0.60, soft_min=soft_min)
+    spec = _anchor_free_spec(case.evidence, min_CN=0.60, soft_min=soft_min)
     txt = render_anchor_free_context(case.proto, rng)
     stripped = strip_anchors(txt)
     ok, fails = adjudicate_invariants(stripped, spec)
@@ -2079,7 +2079,7 @@ class AttackSpec:
     carrier: str
     delivery: str
     evidence: list[str]
-    min_cjk_share: float = 0.6
+    min_CN_share: float = 0.6
     multi_turn_rounds: int = 0
     constraints: dict[str, bool] = field(default_factory=dict)
     # Style/speech axes — 仅影响话术表达
@@ -2128,7 +2128,7 @@ def sample_spec(seed=None, pin: Optional[Dict]=None) -> AttackSpec:
     mt = 0 if de != "multi_turn" else rnd.choice([2, 3, 4])
     spec = AttackSpec(strategy=s, channel=ch, carrier=ca, delivery=de,
                   evidence=ev, multi_turn_rounds=mt,
-                  min_cjk_share=float((pin or {}).get("min_cjk_share", 0.60)))
+                  min_CN_share=float((pin or {}).get("min_CN_share", 0.60)))
     # === sample speech/style axes (pin overrides) ===
     spec.speech_family = (pin.get("speech_family") if pin else None) or rnd.choice(SPEECH_FAMILY)
     spec.register      = (pin.get("register") if pin else None) or rnd.choice(REGISTERS)
@@ -2213,7 +2213,7 @@ def randomize_field_aliases(text: str, p_cn: float = 0.7, rng: Optional[random.R
     以一定概率将常见字段名替换为中文别名。
 
     - English: Works for JSON/YAML/front‑matter/Markdown table forms to boost
-      CJK share without changing structure; supports both `"key": val` and
+      CN share without changing structure; supports both `"key": val` and
       `key: val` styles.
     - 中文：适用于 JSON/YAML/front‑matter/Markdown 表格，在不改变结构的前提下提升
       中文占比；兼容 `"key": val` 与 `key: val` 形式。
@@ -3112,24 +3112,24 @@ else:
     _HAN_TOKEN_RE = re.compile(_TOKEN_PATTERN, re.UNICODE)
     _HAN_HAS = lambda token: bool(re.search(r"[\u4e00-\u9fff]", token))
 _TOKEN_PUNCT_RE = re.compile(r"^[^\w\u4e00-\u9fff]+$")
-def cjk_share(s: str) -> float:
-    """Return the share of tokens that contain CJK characters."""
+def CN_share(s: str) -> float:
+    """Return the share of tokens that contain CN characters."""
     if not s:
         return 0.0
     toks = _HAN_TOKEN_RE.findall(s or "")
     if not toks:
         return 0.0
     total = 0
-    cjk = 0
+    CN = 0
     for tok in toks:
         if _TOKEN_PUNCT_RE.match(tok):
             continue
         total += 1
         if _HAN_HAS(tok):
-            cjk += 1
+            CN += 1
     if total == 0:
         return 0.0
-    return cjk / (total + 1e-6)
+    return CN / (total + 1e-6)
 
 def adjudicate_invariants(text: str, spec: AttackSpec) -> tuple[bool, list[str]]:
     """
@@ -3138,7 +3138,7 @@ def adjudicate_invariants(text: str, spec: AttackSpec) -> tuple[bool, list[str]]
 
     - English: Enforces carrier-specific form, checks evidence hits via
       structural patterns (and soft hints under anchor-free), and requires
-      minimal CJK share for language-carriers.
+      minimal CN share for language-carriers.
     - 中文：按载体形状约束、结构模式命中（无锚时允许软证据），并对语言载体要求
       最低中文占比。
     """
@@ -3184,9 +3184,9 @@ def adjudicate_invariants(text: str, spec: AttackSpec) -> tuple[bool, list[str]]
             fails.append("soft_evidence_insufficient")
 
     # 中文占比：仅对“自然语/文档类载体”强制，代码/协议类放宽
-    if carrier in LANG_CARRIERS and cjk_share(text) < spec.min_cjk_share:
-        fails.append("cjk_share_below_threshold")
-        fails.append("fix:cjk_alias")
+    if carrier in LANG_CARRIERS and CN_share(text) < spec.min_CN_share:
+        fails.append("CN_share_below_threshold")
+        fails.append("fix:CN_alias")
     if carrier == "yaml" and not _looks_like_yaml(text):
         fails.append("carrier:yaml")
     if carrier == "code_comment" and "/*" not in text and "//" not in text:
@@ -3426,7 +3426,7 @@ def generate_batch(
      coverage_axes: tuple[str, ...] = ("contract_type", "channel", "carrier", "delivery", "anchor_free", "ev_bucket", "ev_family", "appearance"),
      min_per_combo: int = 0,
      min_per_cfam: int = 0,
-     audit_cb=None, cjk_ratio_fn=None,
+     audit_cb=None, CN_ratio_fn=None,
      mechanism_signal_fn: Optional[Callable[[str, 'AttackSpec'], Any]] = None
 ):
     """
@@ -3458,7 +3458,7 @@ def generate_batch(
     dedupe_combo: dict[tuple[Any, ...], Deduper] = {}
     dedupe_mech: dict[tuple[Any, ...], Deduper] = {}
     dedupe_style: dict[tuple[Any, ...], Deduper] = {}
-    reject_cjk_by_carrier = defaultdict(int)
+    reject_CN_by_carrier = defaultdict(int)
     attempts_by_carrier = defaultdict(int)
     alias_hits_by_carrier = defaultdict(int)
     sinicize_hits_by_carrier = defaultdict(int)
@@ -3557,7 +3557,7 @@ def generate_batch(
             "vector": tuple(rec.vector) if rec.vector else None,
         }
     audit_cb = audit_cb or (lambda *a, **k: None)
-    cjk_ratio_fn = cjk_ratio_fn or cjk_share
+    CN_ratio_fn = CN_ratio_fn or CN_share
     soft_counts_hist = defaultdict(int)          # {命中种数: 样本数}
     soft_kinds_totals = defaultdict(int)         # {软证据类别: 频次}
     soft_used_by_ev = defaultdict(int)           # {证据ev: 使用软证据通过的次数}
@@ -3727,7 +3727,7 @@ def generate_batch(
 
         if not ok:
             # 只因中文占比失败：先语义释义化 → 再字段别名 → 最后低概率用结构模板
-            if set(_fails) <= {"cjk_share_below_threshold", "fix:cjk_alias"}:
+            if set(_fails) <= {"CN_share_below_threshold", "fix:CN_alias"}:
                 # 1) 语义层中文释义
                 txt2 = sinicize_surface(txt)
                 ok2, _fails2 = adjudicate_invariants(txt2, spec)
@@ -3759,8 +3759,8 @@ def generate_batch(
                                 _applied_struct_cn = True
                                 struct_cn_hits_by_carrier[spec.carrier] += 1
                             else:
-                                if any(r == "cjk_share_below_threshold" for r in _fails4):
-                                    reject_cjk_by_carrier[spec.carrier] += 1
+                                if any(r == "CN_share_below_threshold" for r in _fails4):
+                                    reject_CN_by_carrier[spec.carrier] += 1
                                 for r in _fails4:
                                     fail_by_combo[key_tmp][r] += 1
                                 attempts_per_combo[key_tmp] += 1
@@ -3768,8 +3768,8 @@ def generate_batch(
                                     blocked_combos.add(key_tmp)
                                 continue
                         else:
-                            if any(r == "cjk_share_below_threshold" for r in _fails3):
-                                reject_cjk_by_carrier[spec.carrier] += 1
+                            if any(r == "CN_share_below_threshold" for r in _fails3):
+                                reject_CN_by_carrier[spec.carrier] += 1
                             for r in _fails3:
                                 fail_by_combo[key_tmp][r] += 1
                             continue
@@ -4024,7 +4024,7 @@ def generate_batch(
         "fail_by_combo": {str(k): dict(v) for k, v in fail_by_combo.items()},
         "fail_totals":   {r: sum(v.get(r,0) for v in fail_by_combo.values())
                           for r in {rr for v in fail_by_combo.values() for rr in v.keys()}},
-        "reject_cjk_by_carrier": dict(reject_cjk_by_carrier),
+        "reject_CN_by_carrier": dict(reject_CN_by_carrier),
         "attempts_by_carrier":   dict(attempts_by_carrier),
         "rewrite_hits_by_carrier": {
             "sinicize": dict(sinicize_hits_by_carrier),

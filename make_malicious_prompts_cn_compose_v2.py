@@ -15,7 +15,7 @@ Purpose // 用途:
 Example // 示例:
 python make_malicious_prompts_cn_compose_v2.py \
   --out data.jsonl --n 6000 --seed 42 --neg_ratio 0.15 \
-  --family_max_frac 0.08 --artifact_rate 0.25 --min_cjk_share_auto 
+  --family_max_frac 0.08 --artifact_rate 0.25 --min_CN_share_auto 
 Dependencies // 依赖:
 - pip install datasets regex
 """
@@ -262,7 +262,7 @@ def _load_dsl_core_core():
         generate_batch,
         invariant_result_slot,
         JSON_BLOCK_RE,
-        cjk_share as _dsl_cjk_share,
+        CN_share as _dsl_CN_share,
         _parse_json_blocks as _dsl_parse_json_blocks,
         _tool_param_context_mismatch,
         AttackSpec,
@@ -279,7 +279,7 @@ def _load_dsl_core_core():
         'generate_batch': generate_batch,
         'invariant_result_slot': invariant_result_slot,
         'JSON_BLOCK_RE': JSON_BLOCK_RE,
-        '_dsl_cjk_share': _dsl_cjk_share,
+        '_dsl_CN_share': _dsl_CN_share,
         '_dsl_parse_json_blocks': _dsl_parse_json_blocks,
         '_tool_param_context_mismatch': _tool_param_context_mismatch,
         'AttackSpec': AttackSpec,
@@ -309,7 +309,7 @@ if _dsl_core_bindings is None:
 
     soft_evidence_kinds = _soft_evidence_kinds_fallback
 
-    def cjk_share(s: str) -> float:
+    def CN_share(s: str) -> float:
         if not s:
             return 0.0
         text = _re.sub(r"\s+", "", s)
@@ -355,7 +355,7 @@ else:
     generate_batch = _dsl_core_bindings['generate_batch']
     invariant_result_slot = _dsl_core_bindings['invariant_result_slot']
     JSON_BLOCK_RE = _dsl_core_bindings['JSON_BLOCK_RE']
-    _dsl_cjk_share = _dsl_core_bindings['_dsl_cjk_share']
+    _dsl_CN_share = _dsl_core_bindings['_dsl_CN_share']
     _dsl_parse_json_blocks = _dsl_core_bindings['_dsl_parse_json_blocks']
     _tool_param_context_mismatch = _dsl_core_bindings['_tool_param_context_mismatch']
     AttackSpec = _dsl_core_bindings['AttackSpec']
@@ -419,8 +419,8 @@ else:
             }
             _register_capability('micro_grammar.refresh', True, 'ready')
 
-    def cjk_share(s: str) -> float:
-        return _dsl_cjk_share(s)
+    def CN_share(s: str) -> float:
+        return _dsl_CN_share(s)
 
     def _parse_json_blocks(text: str) -> list[dict]:
         out: list[dict] = []
@@ -700,9 +700,9 @@ def audit_semantic_neighbors(rows_all, topk: int = 5):
         }
     except Exception as e:
         return {'skipped': str(e)}
-# ---- plain negatives CJK 修复统计（按载体） ----
+
 PLAIN_ATTEMPTS_BY_CARRIER   = defaultdict(int)
-PLAIN_REJECT_CJK_BY_CARRIER = defaultdict(int)
+PLAIN_REJECT_CN_BY_CARRIER = defaultdict(int)
 PLAIN_SINICIZE_HITS_BY_CARRIER = defaultdict(int)
 PLAIN_STRUCT_CN_HITS_BY_CARRIER = defaultdict(int)
 PLAIN_ALIAS_HITS_BY_CARRIER    = defaultdict(int)
@@ -717,10 +717,10 @@ MP_AUDIT_QUEUE: Optional["_mp.Queue"] = None
 AUDIT_REASON_COUNT = {
     "semantic_gate": 0,
     "dedup": 0,
-    "cjk_ratio": 0,
+    "CN_ratio": 0,
     "family_cap": 0,
     "contract_violation": 0,
-    "cjk_ratio_low": 0,
+    "CN_ratio_low": 0,
     "gray_neg_keep": 0,
 }
 
@@ -934,8 +934,8 @@ class Config:
     disc_rate: float
     art_match_rate: float
     code_switch_prob: float
-    min_cjk_share: float
-    min_cjk_share_auto: bool
+    min_CN_share: float
+    min_CN_share_auto: bool
     pick_strategy: str
     coverage_min_per_combo: int
     targets_json: str | None
@@ -944,7 +944,7 @@ class Config:
     adv_mutate: bool = False              # adversarial mutation search on positives
     adv_iters: int = 6                    # heuristic hill-climb steps
     gray_neg_keep_frac: float = 0.35      # keep fraction for gray negatives
-    cjk_policy: str = "tiered"            # CJK policy: "hard"|"tiered"|"audit"
+    CN_policy: str = "tiered"            # CN policy: "hard"|"tiered"|"audit"
     mt_tool_override_rate: float = 0.25   # multi-turn tool-override sampling rate
     soft_hint_rate: float = 0.18
     effect_gate_categories: str = ""
@@ -1008,7 +1008,7 @@ URL_RE = re.compile(r"https?://|www\.")
 AT_HASH_RE = re.compile(r"[@#]\w+")
 LATIN_RE = re.compile(r"[A-Za-z]")
 DIGIT_RE = re.compile(r"\d")
-CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+CN_RE = re.compile(r"[\u4e00-\u9fff]")
 # Used early in build_balance_key; define upfront to avoid NameError at import time
 NOISE_P = 0.05
 # Default plain negative ratio; can be overridden by CLI
@@ -1038,9 +1038,9 @@ def _term_candidates_from_corpus(lines: list[str]) -> list[str]:
         r"[A-Za-z0-9"              # ASCII 英文与数字
         r"\uFF10-\uFF19"           # 全角数字
         r"\uFF21-\uFF3A\uFF41-\uFF5A"  # 全角英文
-        r"\u3400-\u4DBF"           # CJK 扩展A
-        r"\u4E00-\u9FFF"           # CJK 基本区
-        r"\uF900-\uFAFF"           # CJK 兼容表意
+        r"\u3400-\u4DBF"           # CN 扩展A
+        r"\u4E00-\u9FFF"           # CN 基本区
+        r"\uF900-\uFAFF"           # CN 兼容表意
         r"]{2,8}"
     )
     cands: set[str] = set()
@@ -1133,7 +1133,7 @@ SEPS = [
     "\n\n---\n","\n\n// update\n","\n\n# UPDATE\n","\n\n【系统提示】\n","\n\n[Update]\n","\n\n\u3010变更\u3011\n"
 ]
 TITLES = ["[CTX]","[环境]","<doc>","<data>","【输入】","### 输入","[UserInput]","[PayloadCtx]","<content>"]
-# CN wrappers to boost CJK share // 提升中文占比的包裹模板
+# CN wrappers to boost CN share // 提升中文占比的包裹模板
 CN_WRAP_PREFIX = [
     "【背景】以下为参考材料与问题描述：",
     "【说明】下面提供若干片段用于理解：",
@@ -1228,7 +1228,7 @@ def length_bucket(n: int) -> str:
     return "long"
 
 
-PREFER_SAMPLING_CJK = True  # 采样优先：尽量不做强注水/外壳修复
+PREFER_SAMPLING_CN = True  # 采样优先：尽量不做强注水/外壳修复
 # 多样化的中性中文外壳模板池（正负共享）
 NEUTRAL_WRAP_TEMPLATES = [
     lambda x: f"【背景】以下为参考材料：\n{x}\n【完】",
@@ -1249,7 +1249,7 @@ class FeatureVector(Mapping[str, int]):
         "athash",
         "latin",
         "digit",
-        "cjk",
+        "CN",
         "zw",
         "bidi",
         "homoglyph",
@@ -1652,7 +1652,7 @@ def maybe_code_switch(text: str, rng: random.Random, base_prob: float, strength:
 
 def apply_surface_augments(txt: str, rng: random.Random,
                            carrier_p=0.20, stack_p=0.08, code_switch_p=0.06,
-                           struct_p=0.25, cjk_target=0.7, cfg: Optional[Config] = None,
+                           struct_p=0.25, CN_target=0.7, cfg: Optional[Config] = None,
                            forced_carrier: Optional[str] = None) -> Tuple[str, str]:
     force_repair = False
     carrier_name = "none"
@@ -1693,23 +1693,23 @@ def apply_surface_augments(txt: str, rng: random.Random,
     try:
         PLAIN_ATTEMPTS_BY_CARRIER[carrier_name] += 1
     except Exception as e:
-        audit_reject('cjk_repair_error', {"phase":"attempt_stat", "err": str(e), "carrier": carrier_name})
+        audit_reject('CN_repair_error', {"phase":"attempt_stat", "err": str(e), "carrier": carrier_name})
     # === 现在再根据当前载体做是否“强制修复”的判定 ===
     try:
         attempts = PLAIN_ATTEMPTS_BY_CARRIER.get(carrier_name, 0)
-        rejects  = PLAIN_REJECT_CJK_BY_CARRIER.get(carrier_name, 0)
+        rejects  = PLAIN_REJECT_CN_BY_CARRIER.get(carrier_name, 0)
         rej_rate = (rejects / max(1, attempts))
         if rej_rate > 0.45 and should_fill_quota_for(carrier_name, cfg=cfg):
             force_repair = True
     except Exception as e:
-        audit_reject('cjk_repair_error', {"phase":"quota_probe", "err": str(e), "carrier": carrier_name})
+        audit_reject('CN_repair_error', {"phase":"quota_probe", "err": str(e), "carrier": carrier_name})
     # 为负类对称添加“良性结构证据”（prob=struct_p），不触发危险字段
     try:
         txt = add_struct_evidence_benign(txt, p=float(struct_p))
     except Exception:
         pass
-    # CJK 占比：默认不做注水/加壳，交由上层采样保障
-    if (force_repair or not PREFER_SAMPLING_CJK):
+    # CN 占比：默认不做注水/加壳，交由上层采样保障
+    if (force_repair or not PREFER_SAMPLING_CN):
         # A) 先“语义释义化”（不改键名）
         try:
             from dsl_core import randomize_field_aliases, sinicize_surface
@@ -1717,7 +1717,7 @@ def apply_surface_augments(txt: str, rng: random.Random,
             sinicize_surface = lambda s: s  # 兜底
             randomize_field_aliases = lambda s, p_cn=0.7, rng=None: s
         try_txt = sinicize_surface(txt)
-        if cjk_share(try_txt) >= cjk_target:
+        if CN_share(try_txt) >= CN_target:
             txt = try_txt
             try:
                 PLAIN_SINICIZE_HITS_BY_CARRIER[carrier_name] += 1
@@ -1726,7 +1726,7 @@ def apply_surface_augments(txt: str, rng: random.Random,
         else:
             # B) 再尝试“结构中文模板”外壳（不含危险锚点）
             try_txt2 = neutral_cn_wrap(try_txt, rng)
-            if cjk_share(try_txt2) >= cjk_target:
+            if CN_share(try_txt2) >= CN_target:
                 txt = try_txt2
                 try:
                     PLAIN_STRUCT_CN_HITS_BY_CARRIER[carrier_name] += 1
@@ -1735,7 +1735,7 @@ def apply_surface_augments(txt: str, rng: random.Random,
             else:
                 # C) 最后才做“字段别名中文化”
                 try_txt3 = randomize_field_aliases(try_txt2, p_cn=alias_p, rng=rng)
-                if cjk_share(try_txt3) >= cjk_target:
+                if CN_share(try_txt3) >= CN_target:
                     txt = try_txt3
                     try:
                         PLAIN_ALIAS_HITS_BY_CARRIER[carrier_name] += 1
@@ -1745,7 +1745,7 @@ def apply_surface_augments(txt: str, rng: random.Random,
                     # D) 仍未达标，最终兜底才做轻注水（若非代码载体）
                     has_code = bool(CODE_BLOCK_RE.search(try_txt3))
                     if not has_code:
-                        tfix = enforce_cjk_share_lite(try_txt3, target=cjk_target, max_inserts=10)
+                        tfix = enforce_CN_share_lite(try_txt3, target=CN_target, max_inserts=10)
                         if tfix:
                             txt = tfix
     return normalize(inject_unicode_noise(inject_noise_light(txt), p=NOISE_P)), carrier_name
@@ -1763,7 +1763,7 @@ def feature_probe_clean(s: str, *, carrier: Optional[str] = None, payload_encodi
     athash = 1 if AT_HASH_RE.search(text) else 0
     latin = 1 if LATIN_RE.search(text) else 0
     digit = 1 if DIGIT_RE.search(text) else 0
-    cjk = 1 if CJK_RE.search(text) else 0
+    CN = 1 if CN_RE.search(text) else 0
     zw_flag = 1 if ZERO_WIDTH_RE.search(text) else 0
     bidi_flag = 1 if BIDI_CONTROL_RE.search(text) else 0
     homoglyph_re = globals().get('HOMOGLYPH_RE')
@@ -1773,7 +1773,7 @@ def feature_probe_clean(s: str, *, carrier: Optional[str] = None, payload_encodi
     payload_key = (payload_encoding or "").strip().lower()
     payload_kind = _PAYLOAD_KIND_TO_CODE.get(payload_key, 0)
     return FeatureVector.from_flags(
-        codef, xml, braces, url, athash, latin, digit, cjk,
+        codef, xml, braces, url, athash, latin, digit, CN,
         zw_flag, bidi_flag, homoglyph_flag, double_wrap_flag, payload_kind,
     )
 
@@ -1786,9 +1786,9 @@ def _json_default(obj):
         return str(obj)
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
-def cjk_latin_ratio(s: str) -> float:
-    """Latin-to-CJK ratio. // 拉丁与中文字符比。"""
-    c = len(CJK_RE.findall(s)); l = len(LATIN_RE.findall(s))
+def CN_latin_ratio(s: str) -> float:
+    """Latin-to-CN ratio. // 拉丁与中文字符比。"""
+    c = len(CN_RE.findall(s)); l = len(LATIN_RE.findall(s))
     return (l + 1e-6) / (c + 1e-6)
 
 def cheap_fingerprint(s: str) -> str:
@@ -2055,7 +2055,7 @@ def build_balance_key(r: Dict[str,Any]) -> Tuple:
     fence_layer = 1 if CODE_BLOCK_RE.search(t) else 0
     fam_bin = _field_family_bucket(t)
     return (r["feats"]["codef"], r["feats"]["xml"], r["feats"]["braces"], r["feats"]["url"],
-            r.get("latin_over_cjk_bin",0), has_json, has_disc, disc_style, carrier_bin, multi, intent_id,
+            r.get("latin_over_CN_bin",0), has_json, has_disc, disc_style, carrier_bin, multi, intent_id,
             r.get("len_bucket","medium"), af, st_bin, art, hneg,fam_bin, fence_layer, r.get("task","_"))
 
 def stratified_balance(rows):
@@ -3057,9 +3057,9 @@ def _yield_wildchat(lang: str = "zh", n: int = 2000, seed: int = 0):
         txt = (r.get("user_message") or r.get("human") or "") + "\n" + (r.get("assistant_response") or r.get("assistant") or "")
         if not txt: 
             continue
-        if lang == "zh" and not CJK_RE.search(txt):
+        if lang == "zh" and not CN_RE.search(txt):
             continue
-        if lang == "code_switch" and not (CJK_RE.search(txt) and LATIN_RE.search(txt)):
+        if lang == "code_switch" and not (CN_RE.search(txt) and LATIN_RE.search(txt)):
             continue
         yield {"text": normalize(txt), "label": 0, "source": "wildchat"}
         cnt += 1
@@ -4227,7 +4227,7 @@ def _regional_variants(s: str, rng: random.Random, p: float = 0.10) -> str:
     if rng.random() >= p:
         return s
     t = s
-    # swap quotes to CJK styles
+    # swap quotes to CN styles
     t = t.replace('"', '”') if rng.random() < 0.5 else t
     t = t.replace("'", "’") if rng.random() < 0.3 else t
     t = t.replace("（", "(" ) if rng.random() < 0.2 else t
@@ -4287,7 +4287,7 @@ def transform_text_pipeline(s: str, rng: random.Random) -> str:
     t = _add_variation_selectors(t, rng, p=0.02)
     # 分隔体裁与编码链
     t = _delim_wrapper(t, rng, p=0.08)
-    # regional / locale variants (CJK/HK punctuation, numerals, date formats)
+    # regional / locale variants (CN/HK punctuation, numerals, date formats)
     t = _regional_variants(t, rng, p=0.10)
     # 仅对“轻量片段”尝试编码链，避免大段文本爆量
     if len(t) < 800:
@@ -4662,8 +4662,8 @@ X-说明: {x}
     "md_table_cn":  lambda x: f"| 字段 | 值 |\n|---|---|\n| 结论 | {x} |\n| 备注 | 无 |\n",
 }
 # --- Field alias randomizer: 将易记忆的英文字段随机映射为中/英文同义键（70% 中文） ---
-CJK_ALIAS_P = 0.70  # 70% 概率使用中文别名（满足“中文≥60%”目标且降伪迹）
-ALIAS_P_CN = CJK_ALIAS_P  # runtime-adjustable
+CN_ALIAS_P = 0.70  # 70% 概率使用中文别名（满足“中文≥60%”目标且降伪迹）
+ALIAS_P_CN = CN_ALIAS_P  # runtime-adjustable
 ALIAS_MAP = {
     "note": {
         "cn": ["备注", "说明", "注释"],
@@ -5005,7 +5005,7 @@ def mitigate_leakage(rows: List[Dict[str, Any]], leak_info: Dict[str, Any], iter
                         carrier=rows[i].get("carrier"),
                         payload_encoding=rows[i].get("payload_encoding"),
                     )
-                    rows[i]["latin_over_cjk"] = cjk_latin_ratio(new_text)
+                    rows[i]["latin_over_CN"] = CN_latin_ratio(new_text)
                     acted += 1
     neg_idx = [i for i, lbl in enumerate(labels) if lbl == 0]
     if neg_idx:
@@ -5023,7 +5023,7 @@ def mitigate_leakage(rows: List[Dict[str, Any]], leak_info: Dict[str, Any], iter
                         carrier=rows[i].get("carrier"),
                         payload_encoding=rows[i].get("payload_encoding"),
                     )
-                    rows[i]["latin_over_cjk"] = cjk_latin_ratio(new_text)
+                    rows[i]["latin_over_CN"] = CN_latin_ratio(new_text)
                     acted += 1
     high_take = max(1, len(scores)//10 or 1)
     for i in sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)[:high_take]:
@@ -5317,29 +5317,29 @@ def estimate_stealth(s: str) -> str:
     return 'high'
 # ------------------ CN enforcement helpers // 中文占比强制工具 ------------------
 
-def enforce_cjk_share(text: str, target: float = 0.60, max_wraps: int = 3) -> Optional[str]:
-    """Ensure text has enough CJK share by wrapping Chinese context. // 通过中文包裹确保中文占比。"""
+def enforce_CN_share(text: str, target: float = 0.60, max_wraps: int = 3) -> Optional[str]:
+    """Ensure text has enough CN share by wrapping Chinese context. // 通过中文包裹确保中文占比。"""
     t = text
     wraps = 0
-    while cjk_share(t) < target and wraps < max_wraps:
+    while CN_share(t) < target and wraps < max_wraps:
         t = f"{random.choice(CN_WRAP_PREFIX)}\n{t}\n{random.choice(CN_WRAP_SUFFIX)}"
         wraps += 1
-    if cjk_share(t) < target:
+    if CN_share(t) < target:
         return None
     return t
-# 轻注水版本：用高频虚词/标点轻度插入，提高 CJK 占比，避免固定外壳
+# 轻注水版本：用高频虚词/标点轻度插入，提高 CN 占比，避免固定外壳
 CN_FILL_TOKS = list("的一是在不了有和人为这中大上个来到时就说用地们可而要于以着与也与及还并更或及其")
 
-def enforce_cjk_share_lite(text: str, target: float = 0.60, max_inserts: int = 20) -> Optional[str]:
+def enforce_CN_share_lite(text: str, target: float = 0.60, max_inserts: int = 20) -> Optional[str]:
     t = list(text)
     inserts = 0
     cap = min(max_inserts, max(4, int(len(t) * 0.25)))
-    while cjk_share("".join(t)) < target and inserts < cap:
+    while CN_share("".join(t)) < target and inserts < cap:
         pos = random.randrange(0, len(t)+1)
         t.insert(pos, random.choice(CN_FILL_TOKS))
         inserts += 1
     out = "".join(t)
-    return out if cjk_share(out) >= target else None
+    return out if CN_share(out) >= target else None
 # ------------------ Strategy DSL for Attack Generation // 策略驱动的注入生成 DSL ------------------
 # Why // 目的：Model “injection intent” as mechanisms & side-effects, not surface forms.
 #             用“机制与副作用”表达“注入意图”，而非靠表层外观/模板。
@@ -5977,8 +5977,8 @@ def _hard_neg_producer_job(job: tuple[int, int]) -> dict:
         target_pool=targets,
         k=int(batch),
         seed=int(seed),
-        min_cjk_share=float(cfg.get('min_cjk_share', 0.60)),
-        min_cjk_share_auto=bool(cfg.get('min_cjk_share_auto', False)),
+        min_CN_share=float(cfg.get('min_CN_share', 0.60)),
+        min_CN_share_auto=bool(cfg.get('min_CN_share_auto', False)),
         oversample_mult=cfg.get('oversample_mult', 1),
         deduper=local_deduper,
         family_cap=int(worker_cap),
@@ -6213,8 +6213,8 @@ class AttackSelector:
 
     def __init__(self,
                  seed: int,
-                 min_cjk_share: float,
-                 min_cjk_share_auto: bool,
+                 min_CN_share: float,
+                 min_CN_share_auto: bool,
                  oversample_mult: int,
                  deduper: Deduper,
                  family_cap: int,
@@ -6248,8 +6248,8 @@ class AttackSelector:
                  adaptive: Optional[AdaptiveOversample] = None,
                  cfg: Optional[Config] = None):
         self.seed = seed
-        self.min_cjk_share = min_cjk_share
-        self.min_cjk_share_auto = min_cjk_share_auto
+        self.min_CN_share = min_CN_share
+        self.min_CN_share_auto = min_CN_share_auto
         self.deduper = deduper
         self.family_cap = family_cap
         self.struct_evidence_rate = struct_evidence_rate
@@ -6383,18 +6383,18 @@ class AttackSelector:
                 return False
         neighbor_admit(text)
         has_struct = bool(CODE_BLOCK_RE.search(text) or JSON_BLOCK_RE.search(text))
-        base_cjk = (self.rng_global.choice([0.6,0.7,0.85,0.9]) if self.min_cjk_share_auto else self.min_cjk_share)
+        base_CN = (self.rng_global.choice([0.6,0.7,0.85,0.9]) if self.min_CN_share_auto else self.min_CN_share)
         bucket_min = (0.70 if mode == 'multi_turn' else (0.50 if has_struct else 0.60))
-        target_min_cjk = max(bucket_min, base_cjk)
-        cur_share = cjk_share(text)
-        policy = _cfg_attr(self.cfg, 'cjk_policy', 'tiered')
+        target_min_CN = max(bucket_min, base_CN)
+        cur_share = CN_share(text)
+        policy = _cfg_attr(self.cfg, 'CN_policy', 'tiered')
         if policy == 'hard':
-            if cur_share < target_min_cjk:
-                audit_reject("cjk_ratio", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+            if cur_share < target_min_CN:
+                audit_reject("CN_ratio", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
                 return False
         elif policy == 'tiered':
             if cur_share < 0.35:
-                audit_reject("cjk_ratio_low", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                audit_reject("CN_ratio_low", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
                 return False
         if self.artifact_free_pos_ratio > 1e-9 and self.rng_global.random() < self.artifact_free_pos_ratio:
             text = placeholderless_mirror(text)
@@ -6447,10 +6447,10 @@ class AttackSelector:
         pair_id = f"P{len(self.cands)+1:07d}"
         rng_pair = stable_rng("pos_pair", self.seed, pair_id)
         soft_hint_rate = float(_cfg_attr(self.cfg, 'soft_hint_rate', 0.18))
-        pos_cjk_target = max(0.60, (0.7 if self.min_cjk_share_auto else self.min_cjk_share))
+        pos_CN_target = max(0.60, (0.7 if self.min_CN_share_auto else self.min_CN_share))
         forced_surface = choose_mismatch_carrier(contract.mode, rng_pair)
         text2, carrier_after = apply_surface_augments(
-            text, rng_pair, struct_p=self.struct_evidence_rate, cjk_target=pos_cjk_target, cfg=self.cfg,
+            text, rng_pair, struct_p=self.struct_evidence_rate, CN_target=pos_CN_target, cfg=self.cfg,
             forced_carrier=forced_surface
         )
         if carrier_after:
@@ -6544,7 +6544,7 @@ class AttackSelector:
             carrier=carrier_name,
             payload_encoding=payload_encoding,
         )
-        ratio = cjk_latin_ratio(text); bins=[0.0,0.12,0.35,1.0]; b=0
+        ratio = CN_latin_ratio(text); bins=[0.0,0.12,0.35,1.0]; b=0
         for i in range(len(bins)-1):
             if bins[i] <= ratio < bins[i+1]: b=i; break
         stealth_here = estimate_stealth(text)
@@ -6562,7 +6562,7 @@ class AttackSelector:
         hist_bucket = '1' if hist_len<=1 else ('2' if hist_len==2 else ('3-5' if hist_len<=5 else '6+'))
         base_pos = {
             "text": text, "task": t["task"], "len": nbytes, "len_bucket": length_bucket(nbytes),
-            "feats": feats, "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
+            "feats": feats, "latin_over_CN": ratio, "latin_over_CN_bin": b,
             "label": 1, "hard_negative": False,
             "family": fam_name, "intent": mapped_intent, "threat_goal": fam_name,
             "delivery": mode, "carrier": carrier_name,
@@ -6589,7 +6589,7 @@ class AttackSelector:
             "secret_hint": None,
             "mechanism": f"{mapped_intent}:{dsl.channel}:{dsl.scope}",
             "expected_side_effects": {},
-            "meta": {"cjk_target": float(pos_cjk_target)},
+            "meta": {"CN_target": float(pos_CN_target)},
             "soft_hint_removed": soft_hint_removed,
         }
         try:
@@ -6650,7 +6650,7 @@ class AttackSelector:
         self.fam_count[fam_name] += 1
 
 def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
-                    min_cjk_share: float, min_cjk_share_auto: bool,
+                    min_CN_share: float, min_CN_share_auto: bool,
                     oversample_mult: int, deduper: Deduper,
                     family_cap: int, artifact_rate: float, 
                     code_switch_prob: float = 0.18, carrier_mix_prob: float = 0.25,
@@ -6791,7 +6791,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     text = adversarial_search(text, contract, payload, max_iters=int(_cfg_attr(cfg, 'adv_iters', 6)), seed=seed, cfg=cfg)
             except Exception as e:
                 audit_reject("adv_mutate_error", {"phase":"compose_pos", "err": str(e)})
-            # 近邻软拒（放在 normalize/对抗搜索 后、CJK 检查前）
+            # 近邻软拒（放在 normalize/对抗搜索 后、CN 检查前）
             is_dup, sim = near_duplicate(text, thr=0.90)
             if is_dup:
                 audit_reject("near_duplicate", {"phase":"compose_pos", "sim": round(sim, 3), "pair_id": f"POS-{len(cands)+1:07d}", "text": text})
@@ -6800,20 +6800,20 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                     continue
             # 接受后登记
             neighbor_admit(text)
-            # 3) CJK share policy: hard / tiered / audit
+            # 3) CN share policy: hard / tiered / audit
             has_struct = bool(CODE_BLOCK_RE.search(text) or JSON_BLOCK_RE.search(text))
-            base_cjk = (random.choice([0.6,0.7,0.85,0.9]) if min_cjk_share_auto else min_cjk_share)
+            base_CN = (random.choice([0.6,0.7,0.85,0.9]) if min_CN_share_auto else min_CN_share)
             bucket_min = (0.70 if mode == 'multi_turn' else (0.50 if has_struct else 0.60))
-            target_min_cjk = max(bucket_min, base_cjk)
-            cur_share = cjk_share(text)
-            policy = _cfg_attr(cfg, 'cjk_policy', 'tiered')
+            target_min_CN = max(bucket_min, base_CN)
+            cur_share = CN_share(text)
+            policy = _cfg_attr(cfg, 'CN_policy', 'tiered')
             if policy == 'hard':
-                if cur_share < target_min_cjk:
-                    audit_reject("cjk_ratio", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                if cur_share < target_min_CN:
+                    audit_reject("CN_ratio", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
                     continue
             elif policy == 'tiered':
                 if cur_share < 0.35:
-                    audit_reject("cjk_ratio_low", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
+                    audit_reject("CN_ratio_low", {"task": t.get("task","_"), "family": fam_name, "intent": mapped_intent, "pair_id": None})
                     continue
                 # else: accept but do not force repairs
             else:  # audit only
@@ -6871,10 +6871,10 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
             # 8) 先生成 pair_id / rng_pair，再做表面增强（要用到 rng_pair）
             pair_id = f"P{len(cands)+1:07d}"
             rng_pair = stable_rng("plain_pair", seed, pair_id)
-            pos_cjk_target = max(0.60, (0.7 if min_cjk_share_auto else min_cjk_share))
+            pos_CN_target = max(0.60, (0.7 if min_CN_share_auto else min_CN_share))
             forced_surface = choose_mismatch_carrier(contract.mode, rng_pair)
             text, carrier_name = apply_surface_augments(
-                text, rng_pair, struct_p=struct_evidence_rate, cjk_target=pos_cjk_target, cfg=cfg,
+                text, rng_pair, struct_p=struct_evidence_rate, CN_target=pos_CN_target, cfg=cfg,
                 forced_carrier=forced_surface
             )
             # 对称注入“软话术”（不增加结构锚点）
@@ -6971,7 +6971,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                 carrier=carrier_name,
                 payload_encoding=payload_encoding,
             )
-            ratio = cjk_latin_ratio(text); bins=[0.0,0.12,0.35,1.0]; b=0
+            ratio = CN_latin_ratio(text); bins=[0.0,0.12,0.35,1.0]; b=0
             for i in range(len(bins)-1):
                 if bins[i] <= ratio < bins[i+1]: b=i; break
             stealth_here = estimate_stealth(text)
@@ -6991,7 +6991,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
             # 原始阳性条目
             base_pos = {
                 "text": text, "task": t["task"], "len": nbytes, "len_bucket": length_bucket(nbytes),
-                "feats": feats, "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
+                "feats": feats, "latin_over_CN": ratio, "latin_over_CN_bin": b,
                 "label": 1, "hard_negative": False,
                 "family": fam_name, "intent": mapped_intent, "threat_goal": fam_name,
                 "delivery": mode, "carrier": carrier_name,
@@ -7022,7 +7022,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                 # Fallback mechanism label when strategy plan is not used (DSL path)
                 "mechanism": f"{mapped_intent}:{dsl.channel}:{dsl.scope}",
                 "expected_side_effects": {},
-                "meta": {"cjk_target": float(pos_cjk_target)},
+                "meta": {"CN_target": float(pos_CN_target)},
                 "soft_hint_removed": soft_hint_removed,
             }
             # Auditor (no gate): semantic evidence metrics
@@ -7087,11 +7087,11 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
                         carrier=base_pos.get("carrier"),
                         payload_encoding=base_pos.get("payload_encoding"),
                     )
-                    r2 = cjk_latin_ratio(anchor_free_text); b2 = 0
+                    r2 = CN_latin_ratio(anchor_free_text); b2 = 0
                     for i in range(len(bins)-1):
                         if bins[i] <= r2 < bins[i+1]: b2=i; break
                     cands.append({**base_pos, "text": anchor_free_text, "len": nb, "len_bucket": length_bucket(nb),
-                                  "feats": ft, "latin_over_cjk": r2, "latin_over_cjk_bin": b2,
+                                  "feats": ft, "latin_over_CN": r2, "latin_over_CN_bin": b2,
                                   "equiv_group_id": equiv_id, "variant": "min_violation"})
             except Exception as e:
                 audit_reject("min_violation_error", {"phase":"compose_pos", "err": str(e)})
@@ -7104,7 +7104,7 @@ def _compose_attacks_serial(target_pool: List[Dict[str,Any]], n: int, seed: int,
         return cands
 
 def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
-                    min_cjk_share: float, min_cjk_share_auto: bool,
+                    min_CN_share: float, min_CN_share_auto: bool,
                     oversample_mult: int, deduper: Deduper,
                     family_cap: int, artifact_rate: float, 
                     code_switch_prob: float = 0.18, carrier_mix_prob: float = 0.25,
@@ -7136,7 +7136,7 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
     # 1 = serial; 0 or >=2 => parallel with auto-tuning
     if workers == 1:
         return _compose_attacks_serial(
-            target_pool, n, seed, min_cjk_share, min_cjk_share_auto,
+            target_pool, n, seed, min_CN_share, min_CN_share_auto,
             oversample_mult, deduper, family_cap, artifact_rate,
             code_switch_prob=code_switch_prob, carrier_mix_prob=carrier_mix_prob,
             stack_prob=stack_prob, disc_rate=disc_rate, art_match_rate=art_match_rate,
@@ -7164,8 +7164,8 @@ def compose_attacks(target_pool: List[Dict[str,Any]], n: int, seed: int,
     wanted = oversample_ctl.current_target()
     selector = AttackSelector(
         seed=seed,
-        min_cjk_share=min_cjk_share,
-        min_cjk_share_auto=min_cjk_share_auto,
+        min_CN_share=min_CN_share,
+        min_CN_share_auto=min_CN_share_auto,
         oversample_mult=oversample_mult,
         deduper=deduper,
         family_cap=family_cap,
@@ -7316,7 +7316,7 @@ HARDNEG_TPLS = [
 ]
 
 def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: int,
-                      min_cjk_share: float, min_cjk_share_auto: bool,
+                      min_CN_share: float, min_CN_share_auto: bool,
                       oversample_mult: int, deduper: Deduper, family_cap: int,
                       disc_rate: float | None = None, art_match_rate: float = 0.50,
                       struct_evidence_rate: float = 0.0,
@@ -7403,24 +7403,24 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
                 audit_reject("stats_print_error", {"phase":"compose_hardneg", "err": e})
             raw = inject_unicode_noise(inject_noise_light(f"{random_title()}\n{t['prompt']}{random_sep()}{neutralize_dangerous_fields(txt)}"), p=0.08)
             text = normalize(raw)
-            # --- CJK share policy: hard/tiered/audit ---
-            cur_share = cjk_share(text)
-            policy = _cfg_attr(cfg, 'cjk_policy', 'tiered')
-            base_cjk = (random.choice([0.6,0.7,0.85,0.9]) if min_cjk_share_auto else min_cjk_share)
+            # --- CN share policy: hard/tiered/audit ---
+            cur_share = CN_share(text)
+            policy = _cfg_attr(cfg, 'CN_policy', 'tiered')
+            base_CN = (random.choice([0.6,0.7,0.85,0.9]) if min_CN_share_auto else min_CN_share)
             if policy == 'hard':
-                if cur_share < target_min_cjk:
+                if cur_share < target_min_CN:
                     try:
-                        PLAIN_REJECT_CJK_BY_CARRIER[carrier_name] += 1
+                        PLAIN_REJECT_CN_BY_CARRIER[carrier_name] += 1
                     except Exception:
                         pass
                     continue
             elif policy == 'tiered':
                 if cur_share < 0.35:
                     try:
-                        PLAIN_REJECT_CJK_BY_CARRIER[carrier_name] += 1
+                        PLAIN_REJECT_CN_BY_CARRIER[carrier_name] += 1
                     except Exception:
                         pass
-                    audit_reject("cjk_ratio_low", {"task": t.get("task","_")})
+                    audit_reject("CN_ratio_low", {"task": t.get("task","_")})
                     continue
             else:
                 pass
@@ -7431,7 +7431,7 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
             disc_str = rng_pair.choice(DISCLAIMER_BANK) if disc_flag else None
             forced_surface = choose_mismatch_carrier(contract_neg.mode, rng_pair)
             text, carrier_name = apply_surface_augments(
-                text, rng_pair, struct_p=struct_evidence_rate, cjk_target=pos_cjk_target, cfg=cfg,
+                text, rng_pair, struct_p=struct_evidence_rate, CN_target=pos_CN_target, cfg=cfg,
                 forced_carrier=forced_surface
             )
             text, _soft_applied = maybe_apply_soft_hints(
@@ -7480,7 +7480,7 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
                 text,
                 carrier=carrier_name,
             )
-            ratio = cjk_latin_ratio(text); bins=[0.0,0.12,0.35,1.0]
+            ratio = CN_latin_ratio(text); bins=[0.0,0.12,0.35,1.0]
             b = 0
             for i in range(len(bins)-1):
                 if bins[i] <= ratio < bins[i+1]: b=i; break
@@ -7498,7 +7498,7 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
             cands.append({
                 "text": text, "task": t["task"], "len": nbytes,
                 "len_bucket": length_bucket(nbytes), "feats": feats,
-                "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
+                "latin_over_CN": ratio, "latin_over_CN_bin": b,
                 "family": "hardneg", "delivery": "mixed", "intent": "benign",
                 "carrier": carrier_name, "pair_id": pair_id,
                 "disc_flag": disc_flag, "disc_str": disc_str,
@@ -7520,7 +7520,7 @@ def _compose_hard_negs_serial(target_pool: List[Dict[str,Any]], k: int, seed: in
         return cands
 
 def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
-                      min_cjk_share: float, min_cjk_share_auto: bool,
+                      min_CN_share: float, min_CN_share_auto: bool,
                       oversample_mult: int, deduper: Deduper, family_cap: int,
                       disc_rate: float | None = None, art_match_rate: float = 0.50,
                       struct_evidence_rate: float = 0.0,
@@ -7538,7 +7538,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
     workers = int(workers or 0)
     if workers == 1:
         return _compose_hard_negs_serial(
-            target_pool, k, seed, min_cjk_share, min_cjk_share_auto,
+            target_pool, k, seed, min_CN_share, min_CN_share_auto,
             oversample_mult, deduper, family_cap,
             disc_rate=disc_rate, art_match_rate=art_match_rate,
             struct_evidence_rate=struct_evidence_rate,
@@ -7570,8 +7570,8 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
     }
     cfg_dict = {
         'seed': seed,
-        'min_cjk_share': min_cjk_share,
-        'min_cjk_share_auto': bool(min_cjk_share_auto),
+        'min_CN_share': min_CN_share,
+        'min_CN_share_auto': bool(min_CN_share_auto),
         'oversample_mult': oversample_mult,
         'disc_rate': disc_rate_eff,
         'art_match_rate': art_match_rate,
@@ -7585,7 +7585,7 @@ def compose_hard_negs(target_pool: List[Dict[str,Any]], k: int, seed: int,
         'use_model_eval': use_model_eval,
         'strict_neg_diag_gate': strict_neg_diag_gate,
         'gray_neg_keep_frac': float(_cfg_attr(cfg, 'gray_neg_keep_frac', 0.35)),
-        'cjk_policy': _cfg_attr(cfg, 'cjk_policy', 'tiered'),
+        'CN_policy': _cfg_attr(cfg, 'CN_policy', 'tiered'),
         'worker_family_cap': max(1, int(math.ceil(producer_batch * max(1.0, eff_mult)))),
         'soft_hint_rate': float(_cfg_attr(cfg, 'soft_hint_rate', 0.18)),
         'deduper_params': deduper_params,
@@ -7780,13 +7780,13 @@ def make_iso_benign_no_model(pos_row: dict) -> Optional[dict]:
             carrier=pos_row.get("carrier"),
             payload_encoding=pos_row.get("payload_encoding"),
         )
-        ratio = cjk_latin_ratio(iso); bins=[0.0,0.12,0.35,1.0]; b=0
+        ratio = CN_latin_ratio(iso); bins=[0.0,0.12,0.35,1.0]; b=0
         for i in range(len(bins)-1):
             if bins[i] <= ratio < bins[i+1]: b=i; break
         return {
             "text": iso, "label": 0, "task": pos_row.get("task","_"), "hard_negative": True,
             "len": nbytes, "len_bucket": length_bucket(nbytes), "feats": feats,
-            "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
+            "latin_over_CN": ratio, "latin_over_CN_bin": b,
             "family": "iso_benign", "delivery": pos_row.get("delivery"),
             "intent": "benign", "carrier": pos_row.get("carrier","none"),
             "pair_id": pos_row.get("pair_id"), "disc_flag": pos_row.get("disc_flag", False),
@@ -7889,7 +7889,7 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
         ]
     
         def ensure_cn_prompt(p: str) -> str:
-            return p if cjk_share(p) >= 0.60 else random.choice(CN_TASK_PROMPTS)
+            return p if CN_share(p) >= 0.60 else random.choice(CN_TASK_PROMPTS)
     
         def _benign_multi_turn(base: str) -> str:
             convo = [
@@ -7926,10 +7926,10 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
             txt = normalize(inject_unicode_noise(txt, p=0.03))
             pair_id = f"NPLAIN-{len(out)+1:07d}"
             rng_pair = stable_rng("plain_pair", seed, pair_id)
-            # --- CJK share enforcement (≥0.60) ---
-            # --- CJK share enforcement (≥0.60) — repair-first ---
-            target_min_cjk = 0.60
-            if cjk_share(txt) < target_min_cjk:
+            # --- CN share enforcement (≥0.60) ---
+            # --- CN share enforcement (≥0.60) — repair-first ---
+            target_min_CN = 0.60
+            if CN_share(txt) < target_min_CN:
                 try:
                     from dsl_core import sinicize_surface, randomize_field_aliases
                 except Exception:
@@ -7938,16 +7938,16 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
                 # 1) 语义释义（不改键名）
                 try_txt = sinicize_surface(txt)
                 # 2) 中性中文外壳
-                if cjk_share(try_txt) < target_min_cjk:
+                if CN_share(try_txt) < target_min_CN:
                     try_txt = neutral_cn_wrap(try_txt, rng_pair)
                 # 3) 字段别名中文化（与正类同分布）
-                if cjk_share(try_txt) < target_min_cjk:
+                if CN_share(try_txt) < target_min_CN:
                     try_txt = randomize_field_aliases(try_txt, p_cn=float(_cfg_attr(cfg, 'alias_p_cn', ALIAS_P_CN)), rng=rng_pair)
                 # 4) 轻注水（非代码载体再作为兜底一次）
-                if cjk_share(try_txt) < target_min_cjk and not CODE_BLOCK_RE.search(try_txt):
-                    tfix = enforce_cjk_share_lite(try_txt, target=target_min_cjk, max_inserts=10)
+                if CN_share(try_txt) < target_min_CN and not CODE_BLOCK_RE.search(try_txt):
+                    tfix = enforce_CN_share_lite(try_txt, target=target_min_CN, max_inserts=10)
                     if tfix: try_txt = tfix
-                if cjk_share(try_txt) < target_min_cjk:
+                if CN_share(try_txt) < target_min_CN:
                     continue  # 仍不达标才放弃
                 txt = try_txt
             txt, _soft_applied = maybe_apply_soft_hints(
@@ -7980,7 +7980,7 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
                 txt,
                 carrier=carrier_name,
             )
-            ratio = cjk_latin_ratio(txt); bins=[0.0,0.12,0.35,1.0]; b=0
+            ratio = CN_latin_ratio(txt); bins=[0.0,0.12,0.35,1.0]; b=0
             for i in range(len(bins)-1):
                 if bins[i] <= ratio < bins[i+1]: b=i; break
             # history length for negatives
@@ -8023,7 +8023,7 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
             out.append(dict(
                 text=txt, label=0, task=t["task"], hard_negative=hard,
                 len=nbytes, len_bucket=length_bucket(nbytes), feats=feats,
-                latin_over_cjk=ratio, latin_over_cjk_bin=b,
+                latin_over_CN=ratio, latin_over_CN_bin=b,
                 family="plain", delivery=("multi_turn" if ("用户:" in txt or "助手:" in txt) else "single"), intent="benign", carrier=carrier_name or "none",
                 history_len=hist_len, history_len_bucket=hist_bucket,
                 pair_id=None, attack_success=None,
@@ -8206,7 +8206,7 @@ def _compose_topic_shift_negatives_serial(target_pool, k: int, seed: int, dedupe
                 txt,
                 carrier="none",
             )
-            ratio = cjk_latin_ratio(txt); bins=[0.0,0.12,0.35,1.0]; b=0
+            ratio = CN_latin_ratio(txt); bins=[0.0,0.12,0.35,1.0]; b=0
             for i in range(len(bins)-1):
                 if bins[i] <= ratio < bins[i+1]: b=i; break
             hist_len = txt.count('用户:') + txt.count('助手:')
@@ -8214,7 +8214,7 @@ def _compose_topic_shift_negatives_serial(target_pool, k: int, seed: int, dedupe
             out.append(dict(
                 text=txt, label=0, task=t["task"], hard_negative=True,
                 len=nbytes, len_bucket=length_bucket(nbytes), feats=feats,
-                latin_over_cjk=ratio, latin_over_cjk_bin=b,
+                latin_over_CN=ratio, latin_over_CN_bin=b,
                 family="topic_shift", delivery="multi_turn", intent="benign_shift", carrier="none",
                 history_len=hist_len, history_len_bucket=hist_bucket,
                 pair_id=None,
@@ -8522,7 +8522,7 @@ def _dsl_to_row(sample: dict, cfg: Optional[Config] = None) -> dict:
     """
     Adapt a DSL generator sample into a training row.
     将 DSL 生成样本转为训练行格式。
-    - English: Maps meta fields to intent/carrier/delivery, enforces CJK ratio
+    - English: Maps meta fields to intent/carrier/delivery, enforces CN ratio
       repair, and records evidence flags and length/features.
     - 中文：映射元信息为意图/载体/交付，执行中文占比修复，并记录证据标志与长度特征。
     """
@@ -8560,7 +8560,7 @@ def _dsl_to_row(sample: dict, cfg: Optional[Config] = None) -> dict:
             carrier=spec.get("carrier", "jsonc"),
             delivery=spec.get("delivery", "direct"),
             evidence=evidence_list,
-            min_cjk_share=float(spec.get("min_cjk_share", 0.6)),
+            min_CN_share=float(spec.get("min_CN_share", 0.6)),
             multi_turn_rounds=int(spec.get("multi_turn_rounds", 0)),
             constraints=constraints,
             speech_family=spec.get("speech_family", "formal"),
@@ -8629,8 +8629,8 @@ def _dsl_to_row(sample: dict, cfg: Optional[Config] = None) -> dict:
         txt,
         carrier=carrier,
     )
-    ratio = cjk_latin_ratio(txt)
-    s = float(_cfg_attr(cfg, 'min_cjk_share', 0.60))
+    ratio = CN_latin_ratio(txt)
+    s = float(_cfg_attr(cfg, 'min_CN_share', 0.60))
     thr = (1.0 - s) / s
     # 中文占比门（>=60% 或 CLI 指定逻辑）
     bins = [0.0, 0.12, 0.35, 1.0]
@@ -8647,15 +8647,15 @@ def _dsl_to_row(sample: dict, cfg: Optional[Config] = None) -> dict:
             from dsl_core import randomize_field_aliases, sinicize_surface
             alias_p_cn = float(_cfg_attr(cfg, 'alias_p_cn', 0.70))
             txt2 = randomize_field_aliases(sinicize_surface(txt), p_cn=alias_p_cn)
-            new_ratio = cjk_latin_ratio(txt2)
+            new_ratio = CN_latin_ratio(txt2)
             if new_ratio <= thr:
                 txt = txt2
                 ratio = new_ratio
             else:
-                audit_reject("cjk_share_below_threshold", {"phase":"dsl_adapt","ratio":ratio,"thr":thr,"text":txt[:140]})
+                audit_reject("CN_share_below_threshold", {"phase":"dsl_adapt","ratio":ratio,"thr":thr,"text":txt[:140]})
                 return None
         except Exception as e:
-            audit_reject("cjk_fix_error", {"phase":"dsl_adapt","err":str(e)})
+            audit_reject("CN_fix_error", {"phase":"dsl_adapt","err":str(e)})
             return None
     # 若文本经过修复，更新度量与分桶
     nbytes = byte_len(txt); feats = feature_probe_clean(
@@ -8683,7 +8683,7 @@ def _dsl_to_row(sample: dict, cfg: Optional[Config] = None) -> dict:
     row.update({
         "task": spec.get("task", "wiki_summarize"),
         "len": nbytes, "len_bucket": length_bucket(nbytes), "feats": feats,
-        "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
+        "latin_over_CN": ratio, "latin_over_CN_bin": b,
         "family": spec.get("family", "dsl"),
         "delivery": delivery,
         "mechanism": mech_path_key or mechanism,
@@ -8791,18 +8791,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # ========== 3) Language & formatting policy // 语种与格式策略 ==========
     lang = ap.add_argument_group("Language & Formatting // 语种与格式")
     lang.add_argument(
-        "--min_cjk_share", type=float, default=0.60,
-        help="Minimum CJK character share per row (strict). "
+        "--min_CN_share", type=float, default=0.60,
+        help="Minimum CN character share per row (strict). "
              "// 每条样本的最小中日韩字符占比（严格约束）"
     )
     lang.add_argument(
-        "--min_cjk_share_auto", action="store_true", default=True,
-        help="Enable randomized CJK-share bins (always ≥ min_cjk_share). "
+        "--min_CN_share_auto", action="store_true", default=True,
+        help="Enable randomized CN-share bins (always ≥ min_CN_share). "
              "// 启用中文占比的随机分桶（始终 ≥ 最小阈值）"
     )
     lang.add_argument(
-        "--cjk_policy", choices=["hard","tiered","audit"], default="tiered",
-        help="Enforcement policy for the CJK constraint: "
+        "--CN_policy", choices=["hard","tiered","audit"], default="tiered",
+        help="Enforcement policy for the CN constraint: "
              "hard=strict per-sample enforcement; tiered=relax for gray/diagnostic buckets; audit=track only. "
              "// 中文占比策略：hard=逐条严格强制；tiered=对灰样/诊断分层放宽；audit=仅审计记录"
     )
@@ -9157,7 +9157,7 @@ DEFAULTS: Dict[str, Any] = {
     'balance_mode': 'strict',
     'base_weight': 0.4,
     'carrier_mix_prob': 0.25,
-    'cjk_policy': 'tiered',
+    'CN_policy': 'tiered',
     'code_switch_prob': 0.06,
     'coverage_min_per_combo': 3,
     'dedupe_preserve_carrier': True,
@@ -9183,8 +9183,8 @@ DEFAULTS: Dict[str, Any] = {
     'jaccard_thresh': 0.9,
     'mask_format_features_rate': 0.5,
     'mask_on': 'both',
-    'min_cjk_share': 0.6,
-    'min_cjk_share_auto': True,
+    'min_CN_share': 0.6,
+    'min_CN_share_auto': True,
     'minhash_bands': 16,
     'minhash_n': 64,
     'mirror_placeholderless': 0.3,
@@ -9325,7 +9325,7 @@ def main():
                     row = _project_shape(raw, sh, rng)
                     contract = derive_task_contract("wiki_summarize")
                     ok_benign = bool(is_benign_strict(row["text"], contract)) if int(row.get("label",0)) == 0 else True
-                    ratio = cjk_latin_ratio(row["text"]); bins=[0.0,0.12,0.35,1.0]; b=0
+                    ratio = CN_latin_ratio(row["text"]); bins=[0.0,0.12,0.35,1.0]; b=0
                     for i in range(len(bins)-1):
                         if bins[i] <= ratio < bins[i+1]: b=i; break
                     bucket.append({**row, "ok_benign": ok_benign, "len": byte_len(row["text"]),
@@ -9333,8 +9333,8 @@ def main():
                                        row["text"],
                                        carrier=row.get("carrier"),
                                        payload_encoding=row.get("payload_encoding"),
-                                   ), "latin_over_cjk": ratio,
-                                   "latin_over_cjk_bin": b})
+                                   ), "latin_over_CN": ratio,
+                                   "latin_over_CN_bin": b})
             # Aggregate report
 
             def _cnt(pred):
@@ -9350,7 +9350,7 @@ def main():
                     } for sh in (shapes or ["in_context"])
                 },
                 "source_mix": dict(Counter(r.get("source","ext") for r in bucket)),
-                "latin_over_cjk_bins": dict(Counter(r.get("latin_over_cjk_bin",0) for r in bucket)),
+                "latin_over_CN_bins": dict(Counter(r.get("latin_over_CN_bin",0) for r in bucket)),
             }
             if args.ext_eval_report:
                 with open(args.ext_eval_report, "w", encoding="utf-8") as f:
@@ -9370,14 +9370,14 @@ def main():
         carrier_mix_prob=args.carrier_mix_prob, stack_prob=args.stack_prob,
         struct_evidence_rate=args.struct_evidence_rate, disc_rate=args.disc_rate,
         art_match_rate=args.art_match_rate, code_switch_prob=args.code_switch_prob,
-        min_cjk_share=args.min_cjk_share, min_cjk_share_auto=args.min_cjk_share_auto,
+        min_CN_share=args.min_CN_share, min_CN_share_auto=args.min_CN_share_auto,
         pick_strategy=args.pick_strategy, coverage_min_per_combo=args.coverage_min_per_combo,
         targets_json=args.targets_json,
         require_side_effects=args.require_side_effects, se_votes=args.se_votes,
         adv_mutate=bool(getattr(args, "adv_mutate", False)),
         adv_iters=int(getattr(args, "adv_iters", 6)),
         gray_neg_keep_frac=float(getattr(args, "gray_neg_keep_frac", 0.35)),
-        cjk_policy=str(getattr(args, "cjk_policy", "tiered")),
+        CN_policy=str(getattr(args, "CN_policy", "tiered")),
         mt_tool_override_rate=float(getattr(args, "mt_tool_override_rate", 0.25)),
     )
     set_active_config(cfg)
@@ -9523,7 +9523,7 @@ def main():
             carrier_blacklist = set(pin.get("carrier_blacklist") or [])
             pin = {
                 **pin,
-                "min_cjk_share": args.min_cjk_share,
+                "min_CN_share": args.min_CN_share,
                 "structural_pos_ratio": args.structural_p,
                 "alias_p_cn": args.alias_p_cn,
                 "anchor_free_p": max(args.anchor_free_p, 0.85),
@@ -9555,9 +9555,9 @@ def main():
                     if r:
                         pos_cands.append(r)
                     else:
-                        audit_reject("cjk_ratio_not_met", {"phase": "dsl_adapt"})
+                        audit_reject("CN_ratio_not_met", {"phase": "dsl_adapt"})
                 except Exception as e:
-                    audit_reject("cjk_ratio_exception", {"phase": "dsl_adapt", "err": str(e)})
+                    audit_reject("CN_ratio_exception", {"phase": "dsl_adapt", "err": str(e)})
                     continue
             print("[dsl-coverage]", coverage)
             # 硬阈值：renderer 缺失率不得过高（避免大量自然语降级掩盖结构多样性）
@@ -9570,11 +9570,11 @@ def main():
             except Exception:
                 pass
             try:
-                rej = (coverage or {}).get("reject_cjk_by_carrier") or {}
+                rej = (coverage or {}).get("reject_CN_by_carrier") or {}
                 att = (coverage or {}).get("attempts_by_carrier") or {}
                 total_att = max(1, sum(att.values()))
                 avg_rate = (sum(rej.values()) / total_att) if total_att > 0 else 0.0
-                coverage["avg_cjk_reject_rate"] = avg_rate
+                coverage["avg_CN_reject_rate"] = avg_rate
                 for ca, rj in rej.items():
                     tot = max(1, att.get(ca, 0))
                     rate = rj / tot
@@ -9765,9 +9765,9 @@ def main():
                                         if row:
                                             pos_cands.append(row)
                                         else:
-                                            audit_reject("cjk_ratio_not_met", {"phase": "dsl_refill"})
+                                            audit_reject("CN_ratio_not_met", {"phase": "dsl_refill"})
                                     except Exception as e:
-                                        audit_reject("cjk_ratio_exception", {"phase": "dsl_refill", "err": str(e)})
+                                        audit_reject("CN_ratio_exception", {"phase": "dsl_refill", "err": str(e)})
                                 current = int((coverage.get("by_combo_counts") or {}).get(key_str, 0))
                                 produced_for_combo = current - baseline
                             refill_report[key_str] = {"needed": needed, "added": produced_for_combo}
@@ -9849,9 +9849,9 @@ def main():
                                             if row:
                                                 pos_cands.append(row)
                                             else:
-                                                audit_reject("cjk_ratio_not_met", {"phase": "dsl_style_refill"})
+                                                audit_reject("CN_ratio_not_met", {"phase": "dsl_style_refill"})
                                         except Exception as e:
-                                            audit_reject("cjk_ratio_exception", {"phase": "dsl_style_refill", "err": str(e)})
+                                            audit_reject("CN_ratio_exception", {"phase": "dsl_style_refill", "err": str(e)})
                                     counts = coverage.get(field) or {}
                                     current = int(counts.get(val, 0))
                                     produced = current - initial
@@ -9894,7 +9894,7 @@ def main():
         else:
             pos_cands = compose_attacks(
                 target_pool, pos_n, seed=args.seed,
-                min_cjk_share=args.min_cjk_share, min_cjk_share_auto=args.min_cjk_share_auto,
+                min_CN_share=args.min_CN_share, min_CN_share_auto=args.min_CN_share_auto,
                 oversample_mult=args.oversample_mult, deduper=deduper_pos,
                 family_cap=max(1, int(math.ceil(pos_n * max(0.01, min(0.9, args.family_max_frac))))),
                 artifact_rate=args.artifact_rate,
@@ -9959,7 +9959,7 @@ def main():
         ) if shift_quota>0 else []
         neg_cands = compose_hard_negs(
             target_pool, other_quota, seed=args.seed,
-            min_cjk_share=args.min_cjk_share, min_cjk_share_auto=args.min_cjk_share_auto,
+            min_CN_share=args.min_CN_share, min_CN_share_auto=args.min_CN_share_auto,
             oversample_mult=args.oversample_mult, deduper=deduper_neg,
             family_cap=max(1, int(math.ceil(other_quota * max(0.01, min(0.9, args.family_max_frac))))),
             disc_rate=args.disc_rate, art_match_rate=args.art_match_rate,
@@ -10015,9 +10015,9 @@ def main():
                     if not is_benign_strict(tfix, contract_neg):
                         continue
                     neg_row["text"] = tfix
-                # enforce CJK share for paired negatives（与正类保持一致策略：优先重采，不注水）
-                pos_target = float((r.get("meta") or {}).get("cjk_target", max(0.60, (0.7 if args.min_cjk_share_auto else args.min_cjk_share))))
-                if cjk_share(neg_row["text"]) < pos_target:
+                # enforce CN share for paired negatives（与正类保持一致策略：优先重采，不注水）
+                pos_target = float((r.get("meta") or {}).get("CN_target", max(0.60, (0.7 if args.min_CN_share_auto else args.min_CN_share))))
+                if CN_share(neg_row["text"]) < pos_target:
                     try:
                         from dsl_core import sinicize_surface, randomize_field_aliases
                     except Exception:
@@ -10026,17 +10026,17 @@ def main():
                     # 1) 语义释义（不改键名）
                     try_txt = sinicize_surface(neg_row["text"])
                     # 2) 中性中文外壳
-                    if cjk_share(try_txt) < pos_target:
+                    if CN_share(try_txt) < pos_target:
                         try_txt = neutral_cn_wrap(try_txt, rng_pair)
                     # 3) 字段别名中文化（与正类同分布）
                     alias_p_cn = float(getattr(args, "alias_p_cn", ALIAS_P_CN))
-                    if cjk_share(try_txt) < pos_target:
+                    if CN_share(try_txt) < pos_target:
                         try_txt = randomize_field_aliases(try_txt, p_cn=alias_p_cn, rng=rng_pair)
                     # 4) 轻注水（兜底一次；若你不想在 paired 里注水，可删掉这 4~6 行）
-                    if cjk_share(try_txt) < pos_target and not CODE_BLOCK_RE.search(try_txt):
-                        tfix = enforce_cjk_share_lite(try_txt, target=pos_target, max_inserts=20)
+                    if CN_share(try_txt) < pos_target and not CODE_BLOCK_RE.search(try_txt):
+                        tfix = enforce_CN_share_lite(try_txt, target=pos_target, max_inserts=20)
                         if tfix: try_txt = tfix
-                    if cjk_share(try_txt) < pos_target:
+                    if CN_share(try_txt) < pos_target:
                         continue
                     neg_row["text"] = try_txt
                 # 对称附件与中性变换 + 遮蔽：使用 pair_id 派生 RNG，确保位点一致
@@ -10072,13 +10072,13 @@ def main():
                         ts,
                         carrier=r.get("carrier"),
                     )
-                    ratio = cjk_latin_ratio(ts); bins=[0.0,0.12,0.35,1.0]; b=0
+                    ratio = CN_latin_ratio(ts); bins=[0.0,0.12,0.35,1.0]; b=0
                     for i in range(len(bins)-1):
                         if bins[i] <= ratio < bins[i+1]: b=i; break
                     paired_negs.append({
                         "text": ts, "label": 0, "task": r.get("task","_"), "hard_negative": True,
                         "len": nbytes, "len_bucket": length_bucket(nbytes), "feats": feats,
-                        "latin_over_cjk": ratio, "latin_over_cjk_bin": b,
+                        "latin_over_CN": ratio, "latin_over_CN_bin": b,
                         "family": "mirror_taskshift", "delivery": "multi_turn", "intent": "benign",
                         "carrier": r.get("carrier","none"),
                         "pair_id": r.get("pair_id"),
@@ -10146,7 +10146,7 @@ def main():
         rows.append(dict(
             text=txt_final, label=1, task=r["task"], hard_negative=False,
             len=r["len"], len_bucket=r["len_bucket"], feats=r["feats"],
-            latin_over_cjk=r["latin_over_cjk"], latin_over_cjk_bin=r["latin_over_cjk_bin"],
+            latin_over_CN=r["latin_over_CN"], latin_over_CN_bin=r["latin_over_CN_bin"],
             family=r.get("family"),
             threat_goal=r.get("threat_goal"),
             delivery=r.get("delivery"),
@@ -10171,7 +10171,7 @@ def main():
         rows.append(dict(
             text=txt, label=0, task=r["task"], hard_negative=True,
             len=r["len"], len_bucket=r["len_bucket"], feats=r["feats"],
-            latin_over_cjk=r["latin_over_cjk"], latin_over_cjk_bin=r["latin_over_cjk_bin"],
+            latin_over_CN=r["latin_over_CN"], latin_over_CN_bin=r["latin_over_CN_bin"],
             family=r.get("family"), delivery=r.get("delivery"),
             intent=r.get("intent", "format_anchor"), carrier="none",
             pair_id=None, attack_success=None
@@ -10323,12 +10323,12 @@ def main():
                     carrier=r.get('carrier'),
                     payload_encoding=r.get('payload_encoding'),
                 )
-                ratio = cjk_latin_ratio(r['text']); bins=[0.0,0.12,0.35,1.0]; b=0
+                ratio = CN_latin_ratio(r['text']); bins=[0.0,0.12,0.35,1.0]; b=0
                 for i2 in range(len(bins)-1):
                     if bins[i2] <= ratio < bins[i2+1]: b=i2; break
                 if ratio >= bins[-1]: b = len(bins)-1
                 r['len'] = nbytes; r['len_bucket'] = length_bucket(nbytes); r['feats'] = feats
-                r['latin_over_cjk'] = ratio; r['latin_over_cjk_bin'] = b
+                r['latin_over_CN'] = ratio; r['latin_over_CN_bin'] = b
         except Exception as _e:
             audit_reject('devtest_code_mix_error', {'err': str(_e)})
     _apply_code_mix_for_devtest(rows, frac=0.15)
@@ -10568,8 +10568,8 @@ def main():
                 'no_keyword_pos_rate': _no_keyword_pos_rate(rows),
                 'dsl_coverage': coverage if 'coverage' in locals() else None,
                 'dsl_effect_rates_scdss': dsl_effect_rates,
-                'plain_cjk_attempts_by_carrier': dict(PLAIN_ATTEMPTS_BY_CARRIER),
-                'plain_cjk_reject_by_carrier':   dict(PLAIN_REJECT_CJK_BY_CARRIER),
+                'plain_CN_attempts_by_carrier': dict(PLAIN_ATTEMPTS_BY_CARRIER),
+                'plain_CN_reject_by_carrier':   dict(PLAIN_REJECT_CN_BY_CARRIER),
                 'plain_rewrite_hits_by_carrier': {
                     'sinicize': dict(PLAIN_SINICIZE_HITS_BY_CARRIER),
                     'struct_cn': dict(PLAIN_STRUCT_CN_HITS_BY_CARRIER),
@@ -10602,14 +10602,14 @@ def main():
         except Exception as e:
             print("[reweight][warn] failed to persist:", e)
         # Extra report.json (verifiable distribution)
-        latin_bins = Counter(r.get('latin_over_cjk_bin') for r in rows)
+        latin_bins = Counter(r.get('latin_over_CN_bin') for r in rows)
         json_rate = sum(1 for r in rows if JSON_BLOCK_RE.search(r.get('text','') or ''))/(len(rows)+1e-9)
         fence_rate = sum(1 for r in rows if CODE_BLOCK_RE.search(r.get('text','') or ''))/(len(rows)+1e-9)
         carrier_combo = Counter(((r.get('carrier') or 'none').split('+')[0], r.get('delivery') or 'direct') for r in rows)
         report = dict(
             counts_by_family=dict(fam), counts_by_intent=dict(intents),
             carrier_combo_hist={str(k): v for k,v in carrier_combo.items()},
-            latin_over_cjk_bins={str(k): v for k,v in latin_bins.items()},
+            latin_over_CN_bins={str(k): v for k,v in latin_bins.items()},
             json_block_rate=round(json_rate,4), code_fence_rate=round(fence_rate,4),
             audit_reject_hist= AUDIT_REASON_COUNT,
         )
@@ -10626,11 +10626,11 @@ def main():
         key3 = lambda r: (r.get('intent','_'), r.get('delivery') or 'direct', (r.get('carrier') or 'none').split('+')[0])
         cov_pos3 = Counter(key3(r) for r in pos)
         cov_neg3 = Counter(key3(r) for r in neg)
-        # length buckets & CJK bins
+        # length buckets & CN bins
         len_pos = Counter(r.get('len_bucket') for r in pos)
         len_neg = Counter(r.get('len_bucket') for r in neg)
-        cjk_pos = Counter(r.get('latin_over_cjk_bin') for r in pos)
-        cjk_neg = Counter(r.get('latin_over_cjk_bin') for r in neg)
+        CN_pos = Counter(r.get('latin_over_CN_bin') for r in pos)
+        CN_neg = Counter(r.get('latin_over_CN_bin') for r in neg)
         # Artifact words hit rate
 
         def _art_rate(rows_):
@@ -10683,13 +10683,13 @@ def main():
         # Dedup rejection proxy
         dedup_rejects = int(AUDIT_REASON_COUNT.get('dedup', 0))
 
-        def _avg_cjk_share(rows_):
-            # 使用已有的 cjk_share(text) 函数，计算样本级平均中文占比
-            return round(sum(cjk_share(r.get('text','')) for r in rows_) / max(1,len(rows_)), 3)
-        cjk_share_all = {
-            'pos': _avg_cjk_share(pos),
-            'neg': _avg_cjk_share(neg),
-            'all': _avg_cjk_share(rows_all),
+        def _avg_CN_share(rows_):
+            # 使用已有的 CN_share(text) 函数，计算样本级平均中文占比
+            return round(sum(CN_share(r.get('text','')) for r in rows_) / max(1,len(rows_)), 3)
+        CN_share_all = {
+            'pos': _avg_CN_share(pos),
+            'neg': _avg_CN_share(neg),
+            'all': _avg_CN_share(rows_all),
         }
         # Build report
         rep = {
@@ -10698,7 +10698,7 @@ def main():
                 'neg': {str(k): v for k,v in cov_neg3.items()},
             },
             'length_buckets': {'pos': dict(len_pos), 'neg': dict(len_neg)},
-            'latin_over_cjk_bins': {'pos': dict(cjk_pos), 'neg': dict(cjk_neg)},
+            'latin_over_CN_bins': {'pos': dict(CN_pos), 'neg': dict(CN_neg)},
             'artifact_word_rate': {'pos': art_pos_rate, 'neg': art_neg_rate},
             'feature_probe_avg': {'pos': feat_pos, 'neg': feat_neg},
             'json_fence_carrier_rates': {
@@ -10726,7 +10726,7 @@ def main():
                 'stack_prob': args.stack_prob,
             },
             'template_ver': TEMPLATE_VER,
-            'cjk_share_overall': cjk_share_all,
+            'CN_share_overall': CN_share_all,
         }
 
         if dedupe_meta:
@@ -10763,12 +10763,12 @@ def main():
             rep['symmetry_field_families'] = dict(MASKED_FIELD_FAMILY_COUNTER)
         except Exception:
             rep['symmetry_field_families'] = {}
-        # 统计 token 级 CJK share 的分布
+        # 统计 token 级 CN share 的分布
 
-        def _cjk_token_share(r): 
-            return cjk_share(r.get('text',''))
-        cjk_vals_pos = [ _cjk_token_share(r) for r in pos ]
-        cjk_vals_neg = [ _cjk_token_share(r) for r in neg ]
+        def _CN_token_share(r): 
+            return CN_share(r.get('text',''))
+        CN_vals_pos = [ _CN_token_share(r) for r in pos ]
+        CN_vals_neg = [ _CN_token_share(r) for r in neg ]
 
         def _hist(vals, bins=(0.0,0.6,0.7,0.8,0.9,1.01)):
             H = { f"[{bins[i]:.2f},{bins[i+1]:.2f})": 0 for i in range(len(bins)-1) }
@@ -10785,15 +10785,15 @@ def main():
             arr = _np.array(vals, dtype=float)
             return { str(q): float(_np.quantile(arr, q)) for q in qs }
         rep.update({
-        'cjk_token_share_hist': {
-            'pos': _hist(cjk_vals_pos),
-            'neg': _hist(cjk_vals_neg)
+        'CN_token_share_hist': {
+            'pos': _hist(CN_vals_pos),
+            'neg': _hist(CN_vals_neg)
         },
-        'cjk_token_share_quantiles': {
-            'pos': _quantiles(cjk_vals_pos),
-            'neg': _quantiles(cjk_vals_neg)
+        'CN_token_share_quantiles': {
+            'pos': _quantiles(CN_vals_pos),
+            'neg': _quantiles(CN_vals_neg)
         },
-        'cjk_threshold_used': 0.60
+        'CN_threshold_used': 0.60
         })
         try:
             with open(str(out_path).replace('.jsonl','_quality_report.json'), 'w', encoding='utf-8') as fq:
