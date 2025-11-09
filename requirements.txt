@@ -2,19 +2,17 @@
 # Core runtime for the composer + DSL
 numpy>=1.24
 regex>=2024.5.15
-
-# Optional helpers (auto-detected by capability probes)
 orjson>=3.10
 datasets>=2.20.0
-opencc>=1.1.6
-
-# Optional dedupe / ANN accelerators
 simhash>=2.1.2
 datasketch>=1.5.9
 annoy>=1.17
+faiss-cpu>=1.7.4 ; platform_system != "Windows"
+
+# Optional helpers (require explicit usage)
+opencc>=1.1.6
 numba>=0.58
 xxhash>=3.4
-faiss-cpu>=1.7.4 ; platform_system != "Windows"
 
 # Soft-evidence extraction pipeline (extract_and_bank_zh_phrases.py)
 jieba>=0.42.1
