@@ -5,7 +5,6 @@ Quota enforcement helpers for the compose pipeline.
 from __future__ import annotations
 
 import multiprocessing as mp
-import sys
 import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -161,12 +160,6 @@ class quota_scope:
 
 def set_quota_manager(manager: Optional[QuotaManager]) -> None:
     compose_state.set_quota_manager(manager)
-    legacy = sys.modules.get("make_malicious_prompts_cn_compose_v2")
-    if legacy is not None:
-        try:
-            setattr(legacy, "_QUOTA_MANAGER", manager)
-        except Exception:
-            pass
 
 
 def should_apply_feature(key: str, base_prob: float, rng: random.Random) -> bool:
