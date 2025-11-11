@@ -1,4 +1,4 @@
-"""Soft evidence utilities, CN templates, and delivery/style adapters."""
+﻿"""Soft evidence utilities, CN templates, and delivery/style adapters."""
 from __future__ import annotations
 
 import random
@@ -129,10 +129,10 @@ ORAL_OPENERS = {
 ORAL_CLOSERS = {
     "forum": [
         "（以上仅供参考）",
-        "（抛砖引玉，欢迎补充）"
+        "（欢迎继续补充）",
     ],
     "forum_sub": [
-        "（分区建议，供参考）",
+         "（分区建议，供参考）",
         "（仅作交流，不构成流程指令）"
     ],
     "ticket": [
@@ -165,14 +165,24 @@ ORAL_CLOSERS = {
     ],
     "product_distribution": [
         "（发布与分发以此为准）",
-        "（渠道配置完成后按此口径执行）"
+        "（配置完成后按此口径执行）"
     ],
 }
 COMMON_ORAL_OPENERS = [
-    "先说在前头", "直说了", "实话讲", "我这边一个想法", "不绕弯子", "说人话版来一下"
+    "先说在前面",
+    "直接讲重点",
+    "简单交代一下背景",
+    "我这边补充一点",
+    "不拐弯，直接说",
+    "引用同事的提醒：",
 ]
 COMMON_ORAL_CLOSERS = [
-    "先到这儿", "就按这个走", "你看行不", "麻烦啦", "辛苦", "有不妥再调"
+    "先聊到这",
+    "就按这个口径",
+    "辛苦按上述执行",
+    "有疑问再回复",
+    "维持现状即可",
+    "以上内容仅供内部参考",
 ]
 for _phr in COMMON_ORAL_OPENERS:
     for _vals in ORAL_OPENERS.values():
@@ -284,6 +294,7 @@ _SOFT_RX.update({
     "format_soft": re.compile(r"(保持|维持).{0,8}(格式|口径|模板).{0,8}(一致|统一)|按(模板|格式)返回", re.I),
     "eval_hint": re.compile(r"(评分草案|评测项|score\b|review|grader|评估表|打分项)", re.I),
 })
+
 
 CONTRACT_SOFT = {"contract_override", "system_takeover"}
 
@@ -471,6 +482,7 @@ SOFT_PARAPHRASE_BANK = {
     ],
 }
 
+
 # —— Micro‑Grammar for soft evidence ——
 MICRO_GRAMMAR: dict[str, dict[str, list[str]]] = {
     "result_slot": {
@@ -551,6 +563,7 @@ MICRO_GRAMMAR: dict[str, dict[str, list[str]]] = {
         "brevity": ["", "", "", ""],
     },
 }
+
 
 def gen_soft_phrase(ev: str, spec: 'AttackSpec', rnd=None) -> str:
     """组合小语法 + 风格/语域扰动，生成一条软证据表述。"""
@@ -1226,6 +1239,7 @@ def apply_delivery(text: str, spec: AttackSpec) -> str:
 # ===== Style Adapter (post-render, pre-obfuscation) — 仅改自然语，不碰结构围栏 =====
 FENCE_RX = re.compile(r"(```.*?```|\[长文摘录开始\].*?\[长文摘录结束\]|【摘录·起】.*?【摘录·止】)", re.S)
 
+
 def _split_text_blocks(t: str):
     parts, last = [], 0
     t = t or ""
@@ -1328,3 +1342,4 @@ def apply_style(text: str, spec: AttackSpec, rnd: random.Random) -> str:
         else:
             out.append(_style_adapter_free_text(seg, spec, rnd))
     return ''.join(out)
+

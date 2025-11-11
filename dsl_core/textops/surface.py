@@ -13,14 +13,13 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # pragma: no cover - fallback when opencc is absent
     OpenCC = None  # type: ignore
 
-_cn2tw = _cn2hk = _tw2cn = None
+_cn2tw = _tw2cn = None
 if OpenCC is not None:  # pragma: no cover - exercised when opencc is installed
     try:
         _cn2tw = OpenCC("s2twp")
-        _cn2hk = OpenCC("s2hk")
         _tw2cn = OpenCC("tw2s")
     except Exception:
-        _cn2tw = _cn2hk = _tw2cn = None
+        _cn2tw = _tw2cn = None
 
 
 def apply_cn_region(text: str, region: str) -> str:
@@ -28,8 +27,6 @@ def apply_cn_region(text: str, region: str) -> str:
     try:
         if region == "tw" and _cn2tw:
             return _cn2tw.convert(text)
-        if region == "hk" and _cn2hk:
-            return _cn2hk.convert(text)
         if region == "cn_mainland" and _tw2cn:
             return _tw2cn.convert(text)
     except Exception:

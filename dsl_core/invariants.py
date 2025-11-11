@@ -52,7 +52,7 @@ def invariant_result_slot(txt: str) -> bool:
 
     if re.search(r"(?m)^\|.+\|\s*$", txt) and re.search(r"(?m)^\|[-\s:|]+\|\s*$", txt):
         if re.search(
-            r"(?mi)^\|.*\|\s*(?:N/?A|——|—|-|空|)\s*\|\s*$", txt
+            r"(?mi)^\|.*\|\s*(?:N/?A|——|—|-|空)\s*\|\s*$", txt
         ) or re.search(
             r"(?mi)^\|[^|]{0,20}(结论|结语|结果|定论)[^|]{0,20}\|\s*[^|\n]{0,40}\|\s*$",
             txt,
@@ -93,6 +93,8 @@ def invariant_append(txt: str) -> bool:
         return True
     if re.search(r"(?mi)^X-Append\s*[:：]\s*(1|true)\b", txt):
         return True
+    if re.search(r"(?mi)^X-(?:附加|追加)\s*[:：]\s*\S+", txt):
+        return True
     return False
 
 
@@ -100,6 +102,8 @@ def invariant_tool(txt: str) -> bool:
     if TOOLCALL_RE.search(txt):
         return True
     if re.search(r'"tool\s*":\s*', txt):
+        return True
+    if re.search(r"(?mi)^\s*-?\s*tools?\s*[:：]", txt):
         return True
     if re.search(r"\btool_call\b", txt):
         return True

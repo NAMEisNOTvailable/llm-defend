@@ -47,11 +47,22 @@ class Anchors:
 
 APPEND_RE = re.compile(r"<APPEND_[A-Z0-9]{4,16}>")
 PATH_RE = re.compile(r"#p=[A-Z0-9]{6,18}")
-HTML_PATH_ATTR_RE = re.compile(r"\s*data-path\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", re.I)
+HTML_PATH_ATTR_RE = re.compile(
+    r"\s*data-(?:path|role|source|target|origin)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)",
+    re.I,
+)
+META_ANCHOR_TAG_RE = re.compile(
+    r"<meta\b[^>]*?(?:name|property)\s*=\s*(?:\"[^\"]*(?:path|role|source)[^\"]*\"|'[^']*(?:path|role|source)[^']*'|[^\s>]+)[^>]*?>",
+    re.I,
+)
 URL_PATH_PARAM_RE = re.compile(r"(?i)(?P<lead>[?&])path=[^&\s>\"']+(?P<trail>&?)")
 UP_RE = re.compile(r"UPSTREAM(?:_DOC_ID)?[:=][A-Z0-9\-#]{6,40}")
 ROLE_RE = re.compile(r"\brole\s*[:：]\s*(system|user)\b", re.I)
 TOOLCALL_RE = re.compile(r"TOOL_CALL\([A-Za-z_][\w]*\)")
+SENSITIVE_HEADER_KEYS = ("X-Role-Anchor", "X-Source-Path", "X-Target-Path", "X-Role")
+HEADER_LINE_RE = re.compile(
+    r"(?mi)^\s*(?:X-Role-Anchor|X-Source-Path|X-Target-Path|X-Role)\s*:\s*.*$"
+)
 
 
 def strip_anchors(text: str) -> str:
@@ -67,6 +78,7 @@ def strip_anchors(text: str) -> str:
     t = PATH_RE.sub("", t)
     t = re.sub(r"#path=[^\s]+", "", t, flags=re.I)
     t = HTML_PATH_ATTR_RE.sub("", t)
+    t = META_ANCHOR_TAG_RE.sub("", t)
     def _strip_query_segment(match: re.Match) -> str:
         lead = match.group("lead")
         trail = match.group("trail") or ""
@@ -78,6 +90,13 @@ def strip_anchors(text: str) -> str:
     t = URL_PATH_PARAM_RE.sub(_strip_query_segment, t)
     t = UP_RE.sub("", t)
     t = ROLE_RE.sub("", t)
+    # remove soft role/path headers and JSON fields like X-Source-Path
+    t = HEADER_LINE_RE.sub("", t)
+    for key in SENSITIVE_HEADER_KEYS:
+        key_pattern = re.escape(key)
+        t = re.sub(rf'\s*"{key_pattern}"\s*:\s*"[^"]*"\s*,', "", t)
+        t = re.sub(rf',\s*"{key_pattern}"\s*:\s*"[^"]*"', "", t)
+        t = re.sub(rf'"{key_pattern}"\s*:\s*"[^"]*"', "", t)
     t = re.sub(r"[ \t]{2,}", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t

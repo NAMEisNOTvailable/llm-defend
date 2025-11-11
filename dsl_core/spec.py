@@ -44,7 +44,8 @@ SPEECH_FAMILY = [
 
 REGISTERS = ["regulatory", "academic", "marketing", "ops_runbook", "sop", "legal_memo"]
 
-REGIONS   = ["cn_mainland", "tw", "hk", "sg", "en_cn_mix"]
+# Region axis constrained to Simplified (cn_mainland) vs Traditional (tw)
+REGIONS   = ["cn_mainland", "tw"]
 
 INDUSTRIES= ["finance", "healthcare", "it_ops", "manufacturing", "education", "ecommerce"]
 
