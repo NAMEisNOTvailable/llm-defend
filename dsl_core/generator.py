@@ -6,7 +6,7 @@ import random
 import re
 from collections import defaultdict
 from functools import lru_cache
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from dedupe_core import Deduper, DedupeRecord
 
@@ -942,8 +942,12 @@ def generate_batch(
         for fam in (evidence_families(spec.evidence) or ["_none"]):
             by_cfam[(spec.carrier, fam)] += 1
         # style & softbucket counts (for audit)
-        coverage.setdefault('by_style', {})
-        coverage['by_style'][meta.get('speech_family','formal')] = coverage.get('by_style',{}).get(meta.get('speech_family','formal'),0)+1 if isinstance(coverage.get('by_style'), dict) else 1
+        style_counts = coverage.get('by_style')
+        if not isinstance(style_counts, dict):
+            style_counts = {}
+            coverage['by_style'] = style_counts
+        key_style = meta.get('speech_family', 'formal')
+        style_counts[key_style] = style_counts.get(key_style, 0) + 1
 
 
     total_attempts = max(1, sum(attempts_by_carrier.values()))

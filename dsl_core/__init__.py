@@ -14,7 +14,8 @@ import os
 import random
 import re
 import string
-import urllib.parse  # noqa: F401 -- ensures urllib namespace matches legacy module
+import urllib  # Legacy surface expects urllib namespace exposed
+import urllib.parse  # noqa: F401 -- ensure urllib.parse registered alongside base package
 import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field

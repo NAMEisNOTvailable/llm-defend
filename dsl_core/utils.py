@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from functools import lru_cache
 import base64
@@ -311,9 +311,22 @@ def CN_share(s: str) -> float:
     return cn / (total + 1e-6)
 
 
-HEADER_KV = re.compile(r"^[A-Za-z\u4e00-\u9fff\-]{2,30}:\s?.{0,120}$", re.M)
+HEADER_KEY_NAME_RE = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fff]{2,48}$")
+HEADER_KV = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fff]{2,48}\s*:\s?.{0,160}$", re.M)
 HTTP_METHOD_RE = re.compile(r"(?m)^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+\S+")
-YAML_KEY_LINE_RE = re.compile(r"(?m)^[\w\-]{1,32}:\s?.+$")
+YAML_KEY_LINE_RE = re.compile(r"(?m)^\s*[A-Za-z0-9_\-\u4e00-\u9fff]{1,48}\s*:\s?.+$")
+_HEADER_TRANSLATION = str.maketrans({"\uFF1A": ":", "\uFE15": ":", "\uA789": ":", "\uFE30": ":", "\uFE63": "-", "\uFF0D": "-"})
+EMAIL_SUBJECT_KEYS = frozenset({"subject", "\u4e3b\u9898", "\u4e3b\u984c", "\u4ef6\u540d", "\u984c\u540d", "\u984c\u76ee"})
+EMAIL_ADDRESS_KEYS = frozenset({"from", "to", "cc", "bcc", "\u53d1\u4ef6\u4eba", "\u6536\u4ef6\u4eba", "\u6284\u9001", "\u5bc6\u9001", "\u5bc4\u4ef6\u8005", "\u6536\u4ef6\u8005"})
+HTTP_HEADER_KEY_HINTS = frozenset({
+    "host",
+    "role",
+    "result-slot",
+    "content-type",
+    "user-agent",
+    "accept",
+    "authorization",
+})
 EVD_HINT_HTTP = re.compile(
     r"(?:\bRole\b|角色|\bPath\b|路径|Ref[- ]?(?:Chunk|Doc)|引用|来源|\bTool\b|工具|\bUpstream\b|上游|\bSession\b|会话)",
     re.I,
@@ -323,6 +336,39 @@ EVD_HINT_FRONT = re.compile(
     re.I,
 )
 TOOL_KV = re.compile(r'"?(name|tool)"?\s*:\s*"?([A-Za-z_]\w*)"?', re.I)
+
+
+def _normalize_header_text(text: str) -> str:
+    return (text or "").translate(_HEADER_TRANSLATION)
+
+
+def _split_header_kv(line: str) -> Optional[tuple[str, str]]:
+    if not line:
+        return None
+    normalized = _normalize_header_text(line)
+    if ":" not in normalized:
+        return None
+    key, value = normalized.split(":", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key or not value:
+        return None
+    if not HEADER_KEY_NAME_RE.match(key):
+        return None
+    return key, value
+
+
+def _normalize_header_key(key: str) -> str:
+    return _normalize_header_text(key).strip().lower()
+
+
+def _is_known_http_header_key(key: str) -> bool:
+    key_norm = _normalize_header_key(key)
+    if not key_norm:
+        return False
+    if key_norm in HTTP_HEADER_KEY_HINTS:
+        return True
+    return key_norm.startswith("x-") and len(key_norm) > 2
 
 
 def _looks_like_email(text: str) -> bool:

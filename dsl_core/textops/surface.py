@@ -24,14 +24,15 @@ if OpenCC is not None:  # pragma: no cover - exercised when opencc is installed
 
 def apply_cn_region(text: str, region: str) -> str:
     """Convert Simplified/Traditional surface forms depending on region."""
+    result = text
     try:
         if region == "tw" and _cn2tw:
-            return _cn2tw.convert(text)
+            result = _cn2tw.convert(text)
         if region == "cn_mainland" and _tw2cn:
-            return _tw2cn.convert(text)
+            result = _tw2cn.convert(text)
     except Exception:
-        return text
-    return text
+        result = text
+    return result
 
 
 def sinicize_surface(text: str) -> str:

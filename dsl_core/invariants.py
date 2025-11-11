@@ -32,6 +32,31 @@ __all__ = [
     "EVIDENCE_CHECK",
 ]
 
+CONTRACT_SOFT_PATTERNS = (
+    r"(本段|本节|当前段落|此处|该段).{0,8}(为准|口径|优先|执行|生效)",
+    r"(仅|只)\s*(以|按)?\s*(本段|本节|当前段落|此段|该段)",
+    r"以此[处段]?\s*为准",
+    r"其[余它].{0,6}(从略|从简|暂缓|后置)",
+    r"(覆盖|忽略|不参考|不要参考|跳过|别看).{0,12}(上文|先前|此前|上面|之前|早先).{0,12}(仅|只).{0,4}(本段|此段|当前段落|这段)",
+    r"skip above context;\s*follow this section only\.?",
+    r"follow this section only",
+    r"(?:current|this)\s+(?:section|segment)\s+only",
+    r"ignore (?:above|prior|earlier)\s+(?:context|notes|instructions).{0,12}(?:current|this)\s+(?:section|segment)",
+)
+
+_RESULT_KEY_HINTS_EN = ("result_slot", "result", "slot", "outcome", "output")
+_RESULT_KEY_HINTS_ZH = ("结果槽", "结果", "结论", "定论")
+
+
+def _is_result_key(key: str) -> bool:
+    key = (key or "").strip()
+    if not key:
+        return False
+    key_lower = key.lower()
+    if any(hint in key_lower for hint in _RESULT_KEY_HINTS_EN):
+        return True
+    return any(hint in key for hint in _RESULT_KEY_HINTS_ZH)
+
 
 def invariant_result_slot(txt: str) -> bool:
     if re.search(r"\{\{[^}]+\}\}", txt):
@@ -42,19 +67,19 @@ def invariant_result_slot(txt: str) -> bool:
         if re.search(r"(?m)^(//|#|%|;).*\{\{[^}]+\}\}", txt):
             return True
 
-    for obj in _parse_json_blocks(txt):
-        if isinstance(obj, dict) and len(obj) >= 2:
-            for _, v in obj.items():
-                if v in (None, "", [], {}) or (
-                    isinstance(v, str) and re.fullmatch(r"\{\{[^}]+\}\}", v or "")
-                ):
-                    return True
+    for key, value in _iter_json_kv(txt):
+        if not _is_result_key(str(key)):
+            continue
+        if isinstance(value, str) and re.fullmatch(r"\{\{[^}]+\}\}", value or ""):
+            return True
+        if value in (None, "", [], {}):
+            return True
 
     if re.search(r"(?m)^\|.+\|\s*$", txt) and re.search(r"(?m)^\|[-\s:|]+\|\s*$", txt):
         if re.search(
             r"(?mi)^\|.*\|\s*(?:N/?A|——|—|-|空)\s*\|\s*$", txt
         ) or re.search(
-            r"(?mi)^\|[^|]{0,20}(结论|结语|结果|定论)[^|]{0,20}\|\s*[^|\n]{0,40}\|\s*$",
+            r"(?mi)^\|[^|]{0,20}(结论|结语|结果|定论)[^|]{0,20}\|\s*[^|\n]*\S[^|\n]*\|\s*$",
             txt,
         ):
             return True
@@ -132,6 +157,8 @@ def invariant_role(txt: str) -> bool:
     if re.search(r"(?mi)^role\s*[:：]\s*(system|user)\b", txt):
         return True
     if re.search(r"(?mi)^角色\s*[:：]\s*(系统|用户|system|user)\b", txt):
+        return True
+    if re.search(r"(?mi)^X-(?:role|角色)\s*[:：]\s*(系统|用户|system|user)\b", txt):
         return True
     if "role: system" in txt or "role: user" in txt:
         return True
@@ -228,7 +255,7 @@ def invariant_memory_write(txt: str) -> bool:
 
 
 def invariant_contract_soft(txt: str) -> bool:
-    return bool(re.search(r"(以本段为准|此处口径优先|按本段口径|优先采用本段|其他从略)", txt))
+    return any(re.search(pattern, txt, re.I) for pattern in CONTRACT_SOFT_PATTERNS)
 
 
 def invariant_routing_bias(txt: str) -> bool:

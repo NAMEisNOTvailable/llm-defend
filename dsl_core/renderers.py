@@ -193,11 +193,17 @@ def render_http_header(spec: AttackSpec, anchors: Anchors, structural: bool=Fals
     # 将易学伪迹按低概率注入（默认 0.25），降低“外壳可学性”
     p_art = float(getattr(spec, "artifacts_p", 0.25))
     if "upstream" in spec.evidence:
+        upstream_val = "../../kb/doc.md" if structural else anchors.UP
         if rng.random() < p_art:
-            lines.append("X-Source-Path: " + ("../../kb/doc.md" if structural else anchors.UP))
+            lines.append(f"X-Source-Path: {upstream_val}")
+        else:
+            lines.append(f"X-来源路径: {upstream_val}")
     if "role" in spec.evidence:
+        role_val = "system" if structural else anchors.ROLE_VAL
         if rng.random() < p_art:
-            lines.append("X-角色: " + ("system" if structural else anchors.ROLE_VAL))
+            lines.append(f"X-角色: {role_val}")
+        else:
+            lines.append(f"role: {role_val}")
         # 避免总是出现 X-Role-Anchor
         if rng.random() < (p_art * 0.3):
             lines.append("X-Role-Anchor: " + anchors.ROLE)
@@ -208,6 +214,8 @@ def render_http_header(spec: AttackSpec, anchors: Anchors, structural: bool=Fals
     if "result_slot" in spec.evidence:
         if rng.random() < p_art:
             lines.append("X-结果槽: {{RESULT_MAIN}}")
+        else:
+            lines.append("Result-Slot: {{RESULT_MAIN}}")
     if "append" in spec.evidence:
         lines.append("X-附加: " + ("1" if structural else anchors.APPEND))
     if "reward_channel" in spec.evidence:

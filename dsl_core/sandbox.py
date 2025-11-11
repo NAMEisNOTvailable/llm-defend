@@ -81,7 +81,7 @@ ROLE_ESCALATE_RX = _PAT(r"(从本回合起|将当前会话|切换为|视作).{0,
 MEMORY_WRITE_RX = _PAT(r"(登记|写入|记到|更新).{0,8}(记忆|memory|备注|锚点)")
 RAG_CARRIER_RXS = [
     _PAT(r"<div[^>]*data-(result|note|key)=\"([^\"]+)\""),
-    _PAT(r"^---[\s\S]*?conclusion:\s*\"([^\"]+)\"[\s\S]*?---"),
+    _PAT(r"(?m)^---[\s\S]*?conclusion:\s*\"([^\"]+)\"[\s\S]*?---"),
     _PAT(r"\[note\]:\s*https?://[^\s]+?\s+\"t:([^\"]+)\""),
     _PAT(r"<!--\s*结论:\s*([^-]+)\s*-->"),
 ]

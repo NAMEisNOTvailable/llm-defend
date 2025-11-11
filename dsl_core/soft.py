@@ -1,4 +1,4 @@
-﻿"""Soft evidence utilities, CN templates, and delivery/style adapters."""
+"""Soft evidence utilities, CN templates, and delivery/style adapters."""
 from __future__ import annotations
 
 import random
