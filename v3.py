@@ -168,6 +168,7 @@ from compose.capabilities import (
     sandbox_rag_poison,
     sandbox_tool_param,
     get_default_deduper_kwargs,
+    ensure_dedupe_core,
     _parse_json_blocks,
 )
 
@@ -934,6 +935,8 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
         soft_hint_rate = float(cfg_get('soft_hint_rate', 0.18, cfg))
         rng = compose_rng("plain_neg_serial", seed=seed)
         out = []
+        suspect_neg = 0
+        total_neg_checked = 0
         if not isinstance(target_pool, list):
             target_pool = list(target_pool)
         random.shuffle(target_pool)
@@ -1087,8 +1090,6 @@ def _compose_plain_negatives_serial(target_pool, k: int, seed: int, deduper: Ded
                 txt = mask_format_features_sym(txt, mask_format_features_rate, rmask)
                 masked_applied = (txt != before_mask)
             # 可选：轻量负样本诊断门（仅在 strict 模式启用）
-            suspect_neg = 0
-            total_neg_checked = 0
             if strict_neg_diag_gate:
                 total_neg_checked += 1
                 try:
@@ -1957,6 +1958,12 @@ def main():
     except Exception as exc:
         audit_soft("syn_cluster_mining_error", exc, {"phase": "syn_cluster"})
     # Deduper instances // 去重器
+    if not ensure_dedupe_core():
+        raise RuntimeError("dedupe_core 未能初始化 (ensure_dedupe_core failed)")
+    from compose import capabilities as _capabilities
+    global Deduper, get_default_deduper_kwargs
+    Deduper = _capabilities.Deduper
+    get_default_deduper_kwargs = _capabilities.get_default_deduper_kwargs
     base_dedupe_kwargs = get_default_deduper_kwargs(
         sim_bits=args.simhash_bits,
         sim_thresh=args.simhash_thresh,
@@ -3314,11 +3321,14 @@ def main():
             print(f"[mirror] added placeholderless mirrors: {len(aug)} (p={args.mirror_placeholderless})")
     total_neg_checked_all = sum(int(r.get('total_neg_checked', 0)) for r in rows if r.get('label') == 0)
     suspect_neg_all = sum(int(r.get('suspect_neg', 0)) for r in rows if r.get('label') == 0)
-    rep['neg_suspect_report'] = {
-    'checked': int(total_neg_checked_all),
-    'suspect': int(suspect_neg_all),
-    'rate': round((suspect_neg_all / (total_neg_checked_all + 1e-9)), 3)
+    neg_report = {
+        'checked': int(total_neg_checked_all),
+        'suspect': int(suspect_neg_all),
+        'rate': round((suspect_neg_all / (total_neg_checked_all + 1e-9)), 3),
     }
+    rep_obj = locals().get('rep')
+    if isinstance(rep_obj, dict):
+        rep_obj['neg_suspect_report'] = neg_report
     # write the quality report for verifiable diversity/anti-artifact claims
     report_dataset_stats(rows, outp, dedupe_meta)
     # 简易泄漏压力测试（字符 n-gram 线性打分）

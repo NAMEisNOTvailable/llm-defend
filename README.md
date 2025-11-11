@@ -1,140 +1,85 @@
-﻿# Chinese Prompt-Injection Dataset Composer (v2)
+# LLM-Defend: Chinese Prompt-Injection Dataset Composer
 
-This repository assembles Chinese prompt-injection datasets with hard negatives, DSL-driven renderers, layered de-duplication, and now an automated pipeline for harvesting soft-evidence phrases from raw corpora. It consists of five cooperating modules:
+This repository provides a modular pipeline for generating Chinese-heavy jailbreak and safety datasets. The tooling focuses on intent-level coverage, controlled lexical artifacts, and reproducible sampling so the resulting corpora are suitable for benchmarking LLM defenses.
 
-| File | Purpose |
+## Repository layout
+
+| Path | Description |
 | --- | --- |
-| `make_malicious_prompts_cn_compose_v2.py` | End-to-end CLI: loads corpora (HF datasets or local JSON), synthesises positives/negatives, dedupes, audits, and writes stats. Capability probes cover optional packages (datasets, simhash, faiss, annoy, datasketch, etc.) and print a startup banner. |
-| `extract_and_bank_zh_phrases.py` | GPU-friendly KeyBERT-style (SentenceTransformer-based) candidate miner for Chinese corpora; filters, dedupes, clusters, and feeds phrases back into the DSL soft-evidence banks with order-insensitive embedding caching and optional manual overrides. |
-| `dsl_core` package | DSL that renders injection intents, enforces invariants, and exposes coverage, anchor-free/anchor-required heuristics, soft-evidence checks, and JSON/markdown inspectors. Provided by the `dsl_core/__init__.py` facade which merges the dedicated spec/utils/anchors/textops/sandbox/soft/renderers/generator submodules. |
-| `dedupe_core.py` | Reusable SimHash + MinHash-LSH + hashed trigram cosine deduper with optional FAISS/Annoy/Numba/xxhash acceleration. Defaults are tuned for Chinese paraphrases and style wrapping. |
-| `micro_grammar.py` | Micro-grammar bank for soft-evidence phrases with deterministic seeding, adaptive slot permutations, DSL style wrapping, and helpers to refill & rebuild DSL banks safely. |
+| `v3.py` | End-to-end CLI that composes Chinese prompt-injection samples (positives) plus hard negatives, runs audits, and writes dataset/statistics files. Invokes the refactored modules in `compose/`. |
+| `compose/` | Package that houses the refactor of the legacy monolithic script. Submodules cover CLI parsing, attack families, leakage checks, balancing, RNG wiring, multiprocessing workers, serialization, and auditing utilities. |
+| `dedupe/` & `dedupe_core.py` | Shared SimHash + MinHash-LSH + hashed trigram cosine deduplication logic with optional Annoy/FAISS/Numba accelerators. |
+| `dsl_core/` | Domain specific language (DSL) for rendering intents, invariants, anchors, sandboxed execution, and soft evidence hooks. |
+| `micro_grammar.py` | Deterministic soft-evidence grammar bank used to refresh DSL categories and provide anchor-free hints. |
+| `extract_and_bank_zh_phrases.py` | SentenceTransformer-based miner that discovers high-signal Chinese phrases from corpora and feeds them back into the DSL soft-evidence banks. |
+| `stable_random.py` | Deterministic RNG helpers shared across the composer and extractor. |
+| `source/` | Bundled seed corpora and loaders (e.g., JailBench, MultiJail_zh, combined safety prompts) plus `load_dataset.py` for HuggingFace/local ingestion. |
 
 ## Installation
-Use **Python 3.9+ (3.10 recommended)** before creating the virtual environment.
 
-1. Create a virtual environment.
-2. Install the grouped dependencies:
+The toolchain targets **Python 3.9+ (3.10 recommended)**.
+
+1. Create and activate a virtual environment.
+2. Install the dependencies:
    ```bash
    pip install -r requirements.txt
    ```
-   `requirements.txt` groups dependencies by feature set:
-   - Core runtime: `numpy`, `regex`.
-   - Optional helpers detected at runtime: `orjson`, `datasets`, `opencc`.
-   - Optional dedupe / ANN accelerators: `simhash`, `datasketch`, `annoy`, `numba`, `xxhash`, `faiss-cpu` (Linux/macOS).
-   - Soft-evidence extraction + banking: `jieba` (install `jieba-fast` as a drop-in accelerator when wheels are available), `sentence-transformers`, `scikit-learn`, `torch`. Install this block when you run `extract_and_bank_zh_phrases.py`; comment the lines out if you only need the composer.
-3. (Recommended) Install accelerators for dedupe/audit hot paths:
-   ```bash
-   pip install simhash datasketch annoy xxhash numba
-   # On Linux/macOS you can also: pip install faiss-cpu
-   ```
-   These unlock faster SimHash/MinHash pipelines and ANN probes inside `dedupe_core`.
+   * Core runtime: `numpy`, `regex`, `orjson`, and `datasets` power the composer and DSL modules.
+   * Optional dedupe accelerators: `simhash`, `datasketch`, `annoy`, `faiss-cpu`, `numba`, and `xxhash` unlock faster similarity checks in `dedupe/`.
+   * Soft-evidence extraction: `jieba`, `sentence-transformers`, `scikit-learn`, `torch`, and `psutil` are needed only when running `extract_and_bank_zh_phrases.py` (install `jieba-fast` when wheels are available).
 
-Repo-local helpers: the composer scripts always import the bundled `stable_random.py` (deterministic seeding) and `dedupe_core.py` (SimHash/MinHash/ANN dedupe). Optional capabilities auto-load the modular `dsl_core` package (facade + submodules) and `micro_grammar.py` when you pass `--use_dsl`, `--micro_grammar_refresh`, or related toggles, so keep these modules on your `PYTHONPATH`.
+## Generating a dataset
 
-GPU users should match the `torch` wheel to their CUDA runtime (or stay on CPU by omitting `--cuda` when running the extractor).
+Run the CLI directly via `v3.py`. It prints a capability report summarizing which optional modules were detected, then composes the dataset while enforcing CN-share, coverage, artifact, and audit policies.
 
-## Capability Detection
-`make_malicious_prompts_cn_compose_v2.py` prints a capability report at startup. Each optional dependency either enables a faster path (e.g., native SimHash, FAISS, Annoy) or activates DSL helpers (`dsl_core.core`, reward filters, sandbox suite). When a module is missing the script records the disabled capability and continues with conservative fallbacks.
+```bash
+python v3.py \
+  --out data.jsonl \
+  --n 6000 --seed 42 \
+  --family_max_frac 0.08 \
+  --artifact_rate 0.25 \
+  --min_CN_share_auto
+```
 
-## Soft Evidence Extraction
-`extract_and_bank_zh_phrases.py` mines high-signal soft-evidence phrases from newline-delimited corpora (`--input`) and merges them into the DSL banks.
+Key outputs:
 
-Pipeline highlights:
-- Pre-warms and optionally hydrates micro-grammars so the DSL's soft-evidence buckets contain fresh prototypes before scoring.
-- Uses a KeyBERT-style extractor (SentenceTransformer `BAAI/bge-small-zh-v1.5` embeddings) to surface multi-token Chinese phrases while enforcing a CJK share floor.
-- Streams embeddings in adaptive GPU-sized chunks, re-budgeting when documents straddle chunk boundaries so doc/candidate tensors stay co-located on the target device.
-- Keeps only action-like phrases that clear the `_softish_score` gate, then applies the shared `Deduper` for SimHash + MinHash + cosine filtering.
-- Persists phrase embedding caches keyed by SHA-1 fingerprints so reruns hit even when phrase order drifts, with logs indicating exact vs. fingerprint matches.
-- Clusters surviving phrases with SentenceTransformer community detection and auto-routes each cluster to the highest priority soft-evidence kind (or a `--kind` override).
-- Optionally re-banks every cluster member (`--bank_all`) and emits coverage probes via `dsl_core.probe_soft_coverage`.
+* `data.jsonl` – prompt-injection attempts and hard negatives with `text`, `label`, and metadata fields.
+* `data_audit.jsonl` – per-row diagnostics covering intents, carriers, delivery strategies, and audit reasons.
+* `data_stats.json` – aggregated coverage, symmetry, leakage, and distribution reports.
 
-Example run:
+The full set of arguments is defined in `compose/cli.py`; groups include I/O controls, CN-share policy, sampling strategy, dedupe thresholds, DSL toggles, and optional adversarial mutation/effects modules. Defaults are centralized in `compose/constants.py`.
+
+### Coverage & balancing
+
+The composer enforces coverage across intents, carriers, and delivery channels using weights and quotas defined in `compose/state.py`. Symmetry audits in `compose/symmetry.py` and leakage checks in `compose/leakage.py` guard against obvious artifacts. Hard negatives originate from curated sources (`compose/sources.py`) and can be extended with local JSON/JSONL via `--targets_json`.
+
+### Deduplication
+
+Deduping relies on `dedupe.core.Deduper`, which combines SimHash, MinHash-LSH, and cosine similarity over hashed trigrams. Optional FAISS and Annoy indices (configured in `dedupe/backends/`) accelerate near-duplicate search when the corresponding packages are installed. Defaults can be overridden through CLI flags (`--simhash_bits`, `--simhash_thresh`, `--minhash_n`, `--minhash_bands`, `--jaccard_thresh`, `--cosine_thresh`).
+
+### DSL and soft evidence
+
+When `--use_dsl` or related toggles are enabled, the pipeline loads `dsl_core` to render structured attack templates, apply anchor invariants, and inject soft evidence. `micro_grammar.py` maintains deterministic slot permutations and category-specific thresholds. For larger corpora, run the extractor to refresh the DSL banks:
+
 ```bash
 python extract_and_bank_zh_phrases.py \
-  --input zh_lines.txt \
+  --input source/zh_lines.txt \
   --cluster_thr 0.85 \
   --bank_all \
   --cuda
 ```
-The script prints a JSON summary (candidate counts, routing stats, coverage deltas, `cluster_singleton_ratio` diagnostics) so you can capture the run in logs and judge whether the clustering threshold needs adjustment. Cache hits are reported as `match=exact` or `match=fingerprint` so you know when the order-insensitive fingerprint kicked in. It updates the in-memory DSL, making the newly banked phrases immediately available to the composer and auditors.
 
-## Running the Composer
-Typical CLI usage:
-```bash
-python make_malicious_prompts_cn_compose_v2.py \
-  --out data.jsonl \
-  --n 6000 --seed 42 \
-  --neg_ratio 0.15 \
-  --family_max_frac 0.08 \
-  --artifact_rate 0.25 \
-  --min_cjk_share_auto
-```
-Small-run guardrails:
-- If `n` is smaller than the coverage budget, the CLI now auto-lowers `coverage_min_per_combo` to 1 and prints an `[auto-config]` notice instead of hard failing.
-- After rendering, candidates pass a coherence gate (`is_coherent_cn`) and a `mechanism_truth_record` check; anchor-free specs get a light soft-hint backfill when they miss the soft-evidence floor.
+The extractor streams documents, mines multi-token Chinese phrases with `BAAI/bge-small-zh-v1.5` embeddings, dedupes candidates with the shared `Deduper`, clusters them, and updates the in-memory DSL before writing JSON summaries of coverage and cache hits.
 
-Outputs:
-- `data.jsonl` - minimal training rows (`text`, `label`).
-- `data_audit.jsonl` - diagnostic metadata (intent, carrier, coverage, side-effects, anchor-free hits).
-- `data_stats.json` - aggregated audits (symmetry, anchor-free ratios, semantic neighbour percentiles, leakage scores).
+## Reproducibility
 
-Key toggles:
-- `--use_dsl`, `--coverage_min_per_combo`, `--structural_p`, `--anchor_free_p` control DSL rendering and coverage. (When passing pin overrides directly, prefer the `structural_pos_ratio` key; using `structural_p` emits a deprecation warning.)
-- `--soft_hint_rate`, `--alias_p_cn`, `--tail_mix_p` drive soft-evidence injection and style wrapping.
-- `--simhash_bits`, `--simhash_thresh`, `--minhash_n`, `--minhash_bands`, `--jaccard_thresh` tune dedup thresholds.
-- `--targets_json` lets you supply local corpora when HF datasets are unavailable; `_HAS_HF_DATASETS` controls which adapters run.
-- `--workers` controls how many CPU processes handle soft-gate filtering in parallel (set to 1 to disable multiprocessing).
+`stable_random.py` and `compose/rng.py` centralize seed handling so repeated runs with the same configuration yield consistent samples. Thread affinities and BLAS environment variables are tuned in `v3.py` to keep CPU usage predictable. Soft evidence caches and audit sidecars live next to the requested output path; reruns reuse them when signatures match.
 
-`micro_grammar.py` now:
-- Uses permutation-based slot orders when none are provided (up to 6 slots) for more surface diversity.
-- Seeds each grammar with a `blake2b`-derived integer so sampling is repeatable across runs and hosts.
-- Dedupes per evidence bucket, keeps closures pinned to the live DSL lists, and neutralises tone joiners when strong phrases fire.
-- Wraps candidates through `dsl_core.apply_style` when the DSL is available and falls back gracefully otherwise.
-- Provides `attach_to_dsl_core`, `refill_bank`, and `rebuild_soft_check` so regenerated phrases update the DSL banks in-place while respecting category-specific semantic thresholds. The extractor reuses these hooks during prewarm and hydration.
+## Extending the pipeline
 
-## Deduplication
-`dedupe_core.Deduper` combines SimHash, MinHash-LSH, hashed trigram cosine, and optional ANN search. Defaults (`sim_thresh=1`, `jaccard_thresh=0.90`, `cosine_thresh=0.92`) balance Chinese paraphrase coverage with aggressive duplicate removal; adjust if style wrapping is either too strict or too permissive.
+* Add new attack templates or carriers by extending the registries in `compose/attacks.py`, `compose/carriers.py`, and the delivery utilities in `compose/state.py` and `compose/payload.py`.
+* Integrate new safety corpora through `compose/sources.py` or by placing datasets under `source/` and updating `load_dataset.py`.
+* Customize audits by editing `compose/audit.py`, `compose/leakage.py`, or `compose/effects_eval.py`.
 
-Example:
-```python
-from dedupe_core import Deduper
-
-texts = ["prompt A", "prompt B", "prompt A!!!"]
-keeper = Deduper(jaccard_thresh=0.90, cosine_thresh=0.92)
-rows = []
-for txt in texts:
-    ok, reason, record = keeper.probe(txt)
-    if ok:
-        keeper.add_record(record)
-        rows.append(txt)
-    else:
-        print('dropped', reason)
-```
-
-## Deterministic RNG
-`stable_random.py` centralises reproducible seeding helpers used across the composer, extractor, and grammars.
-
-- `stable_seed_hex` / `stable_seed_int` hash arbitrary context into deterministic seeds.
-- `stable_rng` and `derive_rng` hand out `random.Random` instances that match across hosts.
-- `RandomBinder` and its `random_module_binding` context manager temporarily bind Python's module-level `random` helpers to those deterministic RNGs, ensuring thread workers and helper modules respect the same seed.
-
-## DSL Batch API
-Use `dsl_core.generate_batch` to render intent-level injections programmatically:
-```python
-from dsl_core import generate_batch
-samples, coverage = generate_batch(
-    n=1000,
-    seed=42,
-    pin={"min_cjk_share": 0.65, "structural_pos_ratio": 0.55},
-    coverage_axes=("strategy","channel","carrier","delivery"),
-    min_per_combo=2,
-)
-```
-Coverage stats help you enforce anchor-free ratios, mechanism variety, and structural wrap requirements.
-
-## Notes
-- Capability logging and auditing utilities surface any fallback paths (regex failures, DSL gaps, dedupe skips).
-- HF datasets are probed lazily; when unavailable, adapters fall back to local JSON sources.
-- Tests are limited to compile-time checks; integrate additional CI or data validation as needed.
+Each submodule is importable directly from the `compose` package (`from compose import attacks, audit, utils, ...`), enabling interactive experimentation and downstream tooling without running the CLI.
 

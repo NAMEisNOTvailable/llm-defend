@@ -334,7 +334,41 @@ def maybe_strip_soft_hints(
     return cleaned, cleaned != text
 
 def _load_simhash():
-    from simhash import weighted_fingerprint as weighted_fp, hamming_distance as hamm_dist
+    try:
+        from simhash import weighted_fingerprint as weighted_fp  # type: ignore[attr-defined]
+    except Exception:
+        from simhash import Simhash  # type: ignore
+
+        def weighted_fp(features, *, hashbits: int = 64):
+            """Fallback weighted fingerprint using :class:`simhash.Simhash`.
+
+            Older ``simhash`` wheels (the versions available in this execution
+            environment) expose only the high level ``Simhash`` API.  The
+            composer only relies on the fingerprint integer so we replicate the
+            behaviour with ``Simhash`` which accepts the same ``(feature,
+            weight)`` iterable.  When the richer helper is available the branch
+            above uses it directly.
+            """
+
+            try:
+                return Simhash(features, f=hashbits).value
+            except Exception:
+                # ``Simhash`` also accepts sequences of features without
+                # weights.  Gracefully drop weights if callers provide them in
+                # ``(feature, weight)`` pairs.
+                stripped = [f[0] if isinstance(f, (tuple, list)) and f else f for f in features]
+                return Simhash(stripped, f=hashbits).value
+
+    try:
+        from simhash import hamming_distance as hamm_dist  # type: ignore[attr-defined]
+    except Exception:
+        def hamm_dist(a: int, b: int) -> int:
+            """Compute the Hamming distance between two fingerprints."""
+
+            x = (int(a) ^ int(b)) & ((1 << 64) - 1)
+            # ``bit_count`` is available on ``int`` starting with Python 3.8.
+            return x.bit_count()
+
     return weighted_fp, hamm_dist
 
 _simhash_probe = _probe_capability('simhash', _load_simhash)
@@ -497,7 +531,12 @@ else:
     INDUSTRY_CHOICES: Tuple[str, ...] = tuple(_dsl_core_bindings.get('INDUSTRIES', ()))
     PERSONA_CHOICES: Tuple[str, ...] = tuple(_dsl_core_bindings.get('PERSONAS', ()))
 
-    _micro_grammar = _probe_capability('micro_grammar', lambda: __import__('micro_grammar'))
+    _micro_disabled = os.getenv('COMPOSE_DISABLE_MICRO_GRAMMAR', '').strip().lower() in {'1', 'true', 'yes'}
+    _micro_grammar = None
+    if _micro_disabled:
+        _register_capability('micro_grammar', False, 'disabled via COMPOSE_DISABLE_MICRO_GRAMMAR')
+    else:
+        _micro_grammar = _probe_capability('micro_grammar', lambda: __import__('micro_grammar'))
     if _micro_grammar is not None:
         _dsl_core_module = None
         try:
@@ -632,7 +671,10 @@ def ensure_simhash_fast(*, force: bool = False) -> bool:
         return True
     if force:
         _CAPABILITY_CACHE.pop('dsl_core.simhash_fast', None)
-    probe = _probe_capability('dsl_core.simhash_fast', _load_simhash_fast)
+    try:
+        probe = _probe_capability('dsl_core.simhash_fast', _load_simhash_fast)
+    except Exception:
+        probe = None
     if probe is None:
         _dc_simhash_weighted_fast = None
         _SIMHASH_FAST_READY = False
@@ -656,7 +698,10 @@ def ensure_shingle_fast(*, force: bool = False) -> bool:
         return True
     if force:
         _CAPABILITY_CACHE.pop('dsl_core.shingle_fast', None)
-    probe = _probe_capability('dsl_core.shingle_fast', _load_shingle_fast)
+    try:
+        probe = _probe_capability('dsl_core.shingle_fast', _load_shingle_fast)
+    except Exception:
+        probe = None
     if probe is None:
         _dc_sketch_5gram_fast = None
         _SHINGLE_FAST_READY = False
