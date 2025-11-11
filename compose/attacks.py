@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 import re
 from collections import Counter
@@ -367,6 +368,12 @@ class AdaptiveOversample:
         return max(self.target, int(math.ceil(self.target * self.current)))
 
     def max_attempts(self) -> int:
+        override = os.getenv("COMPOSE_MAX_ATTEMPTS", "").strip()
+        if override:
+            try:
+                return max(1, int(override))
+            except ValueError:
+                pass
         return max(20000, int(self.target * self.max_multiplier * 50))
 
     def maybe_update(self, attempts: int, accepted: int, constraints_met: bool) -> bool:

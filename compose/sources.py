@@ -450,6 +450,8 @@ def _collect_hf_targets(
     limit: Optional[int],
     workers: int = 1,
 ) -> List[Dict[str, Any]]:
+    if os.getenv("HF_DATASETS_OFFLINE", "").strip().lower() in {"1", "true", "yes"}:
+        return []
     loader = _hf_loader()
     if loader is None:
         return []
@@ -719,6 +721,8 @@ def _collect_curated_targets(
     workers: int,
     limit: Optional[int],
 ) -> List[Dict[str, Any]]:
+    if os.getenv("HF_DATASETS_OFFLINE", "").strip().lower() in {"1", "true", "yes"}:
+        return []
     rng = random.Random(seed)
     loader_workers = _auto_io_workers(workers)
     max_per_task = 4000
