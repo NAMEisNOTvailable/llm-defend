@@ -38,7 +38,7 @@ Dependencies // 依赖:
 
 - pip install datasets regex  # third-party runtime deps // 第三方运行依赖
 - stable_random.py & dedupe_core.py (bundled modules for deterministic RNG + SimHash/MinHash dedupe) // 仓库内置模块：稳定随机数 + 去重管线
-- Optional: dsl_core.py & micro_grammar.py when `--use_dsl` / `--micro_grammar_*` toggles are enabled // 可选：启用 DSL / 微语法功能时需加载
+- Optional: the dsl_core package (`dsl_core/__init__.py` + submodules) & micro_grammar.py when `--use_dsl` / `--micro_grammar_*` toggles are enabled // ????? DSL / ????????? dsl_core ??dsl_core/__init__.py + ?????? ?? micro_grammar.py
 
 """
 
@@ -1974,7 +1974,7 @@ def main():
     with quota_scope(pos_n, quota_cfg, shared=use_shared_pos) as pos_quota_bundle:
         if args.use_dsl:
             if generate_batch is None:
-                raise RuntimeError("dsl_core.py 未导入成功，无法使用 --use_dsl")
+                raise RuntimeError("dsl_core ?????? (dsl_core/__init__.py + ????)????? --use_dsl")
             refresh_stats = None
             try:
                 refresh_stats = refresh_micro_grammar_bank(args.seed)

@@ -6,7 +6,7 @@ This repository assembles Chinese prompt-injection datasets with hard negatives,
 | --- | --- |
 | `make_malicious_prompts_cn_compose_v2.py` | End-to-end CLI: loads corpora (HF datasets or local JSON), synthesises positives/negatives, dedupes, audits, and writes stats. Capability probes cover optional packages (datasets, simhash, faiss, annoy, datasketch, etc.) and print a startup banner. |
 | `extract_and_bank_zh_phrases.py` | GPU-friendly KeyBERT-style (SentenceTransformer-based) candidate miner for Chinese corpora; filters, dedupes, clusters, and feeds phrases back into the DSL soft-evidence banks with order-insensitive embedding caching and optional manual overrides. |
-| `dsl_core.py` | DSL that renders injection intents, enforces invariants, and exposes coverage, anchor-free/anchor-required heuristics, soft-evidence checks, and JSON/markdown inspectors. |
+| `dsl_core` package | DSL that renders injection intents, enforces invariants, and exposes coverage, anchor-free/anchor-required heuristics, soft-evidence checks, and JSON/markdown inspectors. Provided by the `dsl_core/__init__.py` facade which merges the dedicated spec/utils/anchors/textops/sandbox/soft/renderers/generator submodules. |
 | `dedupe_core.py` | Reusable SimHash + MinHash-LSH + hashed trigram cosine deduper with optional FAISS/Annoy/Numba/xxhash acceleration. Defaults are tuned for Chinese paraphrases and style wrapping. |
 | `micro_grammar.py` | Micro-grammar bank for soft-evidence phrases with deterministic seeding, adaptive slot permutations, DSL style wrapping, and helpers to refill & rebuild DSL banks safely. |
 
@@ -29,6 +29,8 @@ Use **Python 3.9+ (3.10 recommended)** before creating the virtual environment.
    # On Linux/macOS you can also: pip install faiss-cpu
    ```
    These unlock faster SimHash/MinHash pipelines and ANN probes inside `dedupe_core`.
+
+Repo-local helpers: the composer scripts always import the bundled `stable_random.py` (deterministic seeding) and `dedupe_core.py` (SimHash/MinHash/ANN dedupe). Optional capabilities auto-load the modular `dsl_core` package (facade + submodules) and `micro_grammar.py` when you pass `--use_dsl`, `--micro_grammar_refresh`, or related toggles, so keep these modules on your `PYTHONPATH`.
 
 GPU users should match the `torch` wheel to their CUDA runtime (or stay on CPU by omitting `--cuda` when running the extractor).
 
