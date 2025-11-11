@@ -116,6 +116,8 @@ def _prune_json_structure(value: Any, *, allow_remove: bool) -> Any:
     if isinstance(value, dict):
         result = {}
         for key, val in value.items():
+            if str(key) in SENSITIVE_HEADER_KEYS:
+                continue
             pruned = _prune_json_structure(val, allow_remove=True)
             if pruned is _JSON_REMOVED:
                 continue

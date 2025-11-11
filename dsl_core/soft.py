@@ -1273,8 +1273,6 @@ def _style_adapter_free_text(s: str, spec: AttackSpec, rnd: random.Random) -> st
     # region/register/industry light rewrites (words only)
     region_map = {
         "tw": {"系统": "系統", "路径": "路徑", "评分": "評分"},
-        "hk": {"系统": "系統", "附件": "附檔", "用户": "用戶"},
-        "sg": {"附加": "附註"},
     }.get(getattr(spec, 'region', 'cn_mainland'), {})
     for k, v in region_map.items():
         y = y.replace(k, v)

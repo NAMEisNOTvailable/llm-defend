@@ -9,8 +9,8 @@ __all__ = ["CODE_BLOCK_RE", "apply_cn_eco_noise"]
 
 _EMOS = ["😊","😂","😅","😉","🤔","😐","😑","🙂","🙃","🤫","😴","😮"]
 _FILLERS = ["欸","唉","呃","嘛","哈","嗨","哎呀","诶呀","呐","喔","对吧","嘿","emmm","emm","233","哈哈哈"]
-_PUNCT_SWAP = {"，":".","。":",","：":":","；":";","！":"!","？":"?","——":"-","～":"~"}
-CODE_BLOCK_RE = re.compile(r"```(?P<lang>[A-Za-z0-9_+-]+)?\s*\n([\s\S]*?)```", re.M)
+_PUNCT_SWAP = {"，":".","。":",","：":":","；":";","！":"!","？":"?","—":"-","～":"~"}
+CODE_BLOCK_RE = re.compile(r"```(?P<lang>[A-Za-z0-9_+-]+)?\s*\n([\s\S]*?)```", re.M | re.S)
 
 
 def _apply_cn_eco_free(seg: str, rng: random.Random, rate: float) -> str:
