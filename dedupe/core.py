@@ -17,8 +17,8 @@ from collections import deque
 
 import numpy as np
 
-from .backends import annoy as annoy_backend
-from .backends import faiss as faiss_backend
+from . import annoy as annoy_backend
+from . import faiss as faiss_backend
 from .index import (
     LSHMinhashIndex,
     _UINT64_MASK,

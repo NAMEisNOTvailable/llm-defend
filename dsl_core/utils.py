@@ -23,10 +23,9 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     _json_fast = None  # type: ignore
 
-try:
-    from compat_regex import regex as _re  # type: ignore
-except Exception:  # pragma: no cover - fallback env
-    _re = re  # type: ignore
+import regex as _regex_mod  # type: ignore
+
+_re = _regex_mod
 
 _h64 = _dedupe_h64
 
@@ -272,21 +271,13 @@ def _rx_any(words: Iterable[str]):
 
 
 _TOKEN_PATTERN = r"[\u4e00-\u9fff]+|[A-Za-z]+|\d+|[^\s\w]"
-try:
-    from compat_regex import regex as _re2  # type: ignore
-except Exception:
-    _re2 = None
+_re2 = _regex_mod
 
-if _re2:
-    _HAN_TOKEN_RE = _re2.compile(r"\p{Han}+|[A-Za-z]+|\d+|[^\s\w]", _re2.UNICODE)
+_HAN_TOKEN_RE = _re2.compile(r"\p{Han}+|[A-Za-z]+|\d+|[^\s\w]", _re2.UNICODE)
 
-    def _HAN_HAS(token: str) -> bool:
-        return bool(_re2.search(r"\p{Han}", token))
-else:
-    _HAN_TOKEN_RE = re.compile(_TOKEN_PATTERN, re.UNICODE)
 
-    def _HAN_HAS(token: str) -> bool:
-        return bool(re.search(r"[\u4e00-\u9fff]", token))
+def _HAN_HAS(token: str) -> bool:
+    return bool(_re2.search(r"\p{Han}", token))
 
 _TOKEN_PUNCT_RE = re.compile(r"^[^\w\u4e00-\u9fff]+$")
 
