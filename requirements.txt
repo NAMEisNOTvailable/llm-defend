@@ -1,0 +1,28 @@
+﻿# Requires Python >= 3.9 (3.10 recommended)
+# Core runtime for the composer + DSL
+numpy>=1.24
+regex>=2024.5.15
+orjson>=3.10
+datasets>=2.20.0
+simhash>=2.1.2
+datasketch>=1.5.9
+annoy>=1.17
+faiss-cpu>=1.7.4 ; platform_system != "Windows"
+
+# Optional helpers (require explicit usage)
+opencc>=1.1.6
+numba>=0.58
+xxhash>=3.4
+
+# Soft-evidence extraction pipeline (extract_and_bank_zh_phrases.py)
+FlagEmbedding>=1.2
+hanlp>=2.1
+hdbscan>=0.8
+jieba>=0.42.1
+numexpr>=2.8
+sentence-transformers>=2.7.0
+scikit-learn>=1.3
+psutil>=5.9  # optional: CPU memory budgeting for extractor
+torch>=2.1
+umap-learn>=0.5  # provides the umap module used for dimensionality reduction
+# Optional: install jieba-fast for faster tokenisation when wheels are available
