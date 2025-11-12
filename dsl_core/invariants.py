@@ -193,7 +193,7 @@ def _json_kv_pairs(s: str):
         data = json.loads(s)
         yield from _walk_json(data)
     except Exception:
-        return
+        pass
 
 
 def _walk_json(node):

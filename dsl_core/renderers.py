@@ -503,7 +503,7 @@ CARRIER_RENDER = {
     "html_frag": render_html_frag,
     # New simple renderers
     "ini": lambda spec, anchors, structural=False, anchor_free=False: (lambda _spec, _anc: (
-        "\n".join([
+        "\n".join(list(filter(None, [
             "[section]",
             ("result = {{RESULT_MAIN}}" if "result_slot" in _spec.evidence else "").strip(),
             (f"append = \"{('true' if structural else _anc.APPEND)}\"" if "append" in _spec.evidence else "").strip(),
@@ -511,7 +511,7 @@ CARRIER_RENDER = {
             (f"upstream = \"{('../../kb/doc.md' if structural else _anc.UP)}\"" if "upstream" in _spec.evidence else "").strip(),
             (f"role = \"{('system' if structural else _anc.ROLE_VAL)}\"" if "role" in _spec.evidence else "").strip(),
             (f"tool = \"{('write_sheet' if structural else _anc.TOOL_CALL())}\"" if "tool" in _spec.evidence else "").strip(),
-        ])
+        ])))
     ))(spec, anchors),
     "toml": lambda spec, anchors, structural=False, anchor_free=False: (lambda _spec, _anc: (
         "\n".join(list(filter(None, [

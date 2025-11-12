@@ -60,12 +60,98 @@ URL_PATH_PARAM_RE = re.compile(r"(?i)(?P<lead>[?&])path=[^&\s>\"']+(?P<trail>&?)
 UP_RE = re.compile(r"UPSTREAM(?:_DOC_ID)?[:=][A-Z0-9\-#]{6,40}")
 ROLE_RE = re.compile(r"\brole\s*[:：]\s*(system|user)\b", re.I)
 TOOLCALL_RE = re.compile(r"TOOL_CALL\([A-Za-z_][\w]*\)")
-SENSITIVE_HEADER_KEYS = ("X-Role-Anchor", "X-Source-Path", "X-Target-Path", "X-Role")
-HEADER_LINE_RE = re.compile(
-    r"(?mi)^\s*(?:X-Role-Anchor|X-Source-Path|X-Target-Path|X-Role)\s*:\s*.*$"
+SENSITIVE_HEADER_KEYS = (
+    "X-Role-Anchor",
+    "X-Source-Path",
+    "X-Target-Path",
+    "X-Role",
+    "X-来源路径",
+    "X-角色",
+    "X-结果路径",
+    "X-结果槽",
+    "X-工具",
+    "X-附加",
 )
+SENSITIVE_JSON_KEYS = SENSITIVE_HEADER_KEYS + (
+    "role",
+    "role_hint",
+    "role_anchor",
+    "path",
+    "path_hint",
+    "source_path",
+    "target_path",
+    "result",
+    "result_slot",
+    "result_path",
+    "tool",
+    "tool_call",
+    "tool_args",
+    "upstream",
+    "upstream_id",
+    "upstream_doc",
+    "append",
+    "append_flag",
+    "reward_channel",
+    "reward_field",
+    "memory_write",
+    "loop_state",
+    "loop_state_drift",
+    "directives",
+    "role_list",
+    "角色",
+    "角色锚",
+    "路径",
+    "来源",
+    "来源路径",
+    "引用路径",
+    "结果",
+    "结果槽",
+    "结果路径",
+    "上游",
+    "上游引用",
+    "工具",
+    "工具调用",
+    "附加",
+    "奖励通道",
+    "奖励字段",
+    "记忆写入",
+    "回合状态",
+)
+SENSITIVE_JSON_KEY_SET = frozenset(SENSITIVE_JSON_KEYS)
+SENSITIVE_JSON_ASCII_HINTS = (
+    "role",
+    "path",
+    "sourcepath",
+    "targetpath",
+    "upstream",
+    "tool",
+    "resultslot",
+    "resultpath",
+    "result",
+    "append",
+    "reward",
+    "memory",
+    "loopstate",
+    "anchor",
+)
+SENSITIVE_JSON_CJK_HINTS = (
+    "角色",
+    "路径",
+    "来源",
+    "上游",
+    "工具",
+    "结果",
+    "槽",
+    "附加",
+    "奖励",
+    "记忆",
+    "回合",
+    "锚",
+)
+_HEADER_KEY_PATTERN = "|".join(re.escape(k) for k in SENSITIVE_HEADER_KEYS)
+HEADER_LINE_RE = re.compile(rf"(?mi)^\s*(?:{_HEADER_KEY_PATTERN})\s*:\s*.*$")
 JSON_FENCE_RE = re.compile(
-    r"(?P<open>```json[^\S\r\n]*\r?\n)(?P<body>.*?)(?P<close>\r?\n```)",
+    r"(?P<open>```(?:json|jsonc|json5|jsonl)\b[^\S\r\n]*\r?\n)(?P<body>.*?)(?P<close>\r?\n```)",
     re.I | re.S,
 )
 
@@ -78,6 +164,20 @@ def _strip_query_segment(match: re.Match) -> str:
     if lead == "&":
         return "&" if trail == "&" else ""
     return ""
+
+
+def _is_sensitive_key_name(key: Any) -> bool:
+    key_str = str(key or "")
+    if not key_str:
+        return False
+    if key_str in SENSITIVE_JSON_KEY_SET:
+        return True
+    normalized = key_str.replace("-", "").replace("_", "").lower()
+    if any(token in normalized for token in SENSITIVE_JSON_ASCII_HINTS):
+        return True
+    if any(token in key_str for token in SENSITIVE_JSON_CJK_HINTS):
+        return True
+    return False
 
 
 def _strip_anchor_tokens(text: str) -> str:
@@ -116,7 +216,7 @@ def _prune_json_structure(value: Any, *, allow_remove: bool) -> Any:
     if isinstance(value, dict):
         result = {}
         for key, val in value.items():
-            if str(key) in SENSITIVE_HEADER_KEYS:
+            if _is_sensitive_key_name(key):
                 continue
             pruned = _prune_json_structure(val, allow_remove=True)
             if pruned is _JSON_REMOVED:
@@ -136,7 +236,7 @@ def _render_json_body(data: Any, original_body: str) -> str:
 
 
 def _clean_json_fences(text: str) -> str:
-    if "```json" not in (text or ""):
+    if not JSON_FENCE_RE.search(text or ""):
         return text or ""
 
     def _replace(match: re.Match) -> str:
@@ -168,7 +268,7 @@ def strip_anchors(text: str) -> str:
     t = _strip_anchor_tokens(t)
     # remove soft role/path headers and JSON fields like X-Source-Path
     t = HEADER_LINE_RE.sub("", t)
-    for key in SENSITIVE_HEADER_KEYS:
+    for key in SENSITIVE_JSON_KEYS:
         key_pattern = re.escape(key)
         t = re.sub(rf'\s*"{key_pattern}"\s*:\s*"[^"]*"\s*,', "", t)
         t = re.sub(rf',\s*"{key_pattern}"\s*:\s*"[^"]*"', "", t)

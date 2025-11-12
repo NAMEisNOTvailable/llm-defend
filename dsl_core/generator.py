@@ -132,7 +132,7 @@ def adjudicate_invariants(text: str, spec: AttackSpec) -> Tuple[bool, List[str]]
         fails.append("carrier:yaml")
     if carrier == "code_comment" and "/*" not in text and "//" not in text:
         fails.append("carrier:code_comment")
-    if carrier == "email" and not _looks_like_email(text) and not anchor_free_flag:
+    if carrier == "email" and not _looks_like_email(text):
         fails.append("carrier:email")
     if carrier == "http_header" and not _looks_like_http_header(text):
         fails.append("carrier:http_header")
@@ -144,7 +144,7 @@ def adjudicate_invariants(text: str, spec: AttackSpec) -> Tuple[bool, List[str]]
         fails.append("carrier:latex")
     if carrier == "mermaid" and "```mermaid" not in text:
         fails.append("carrier:mermaid")
-    if carrier == "front_matter" and not anchor_free_flag and not text_stripped.startswith("---"):
+    if carrier == "front_matter" and not text_stripped.startswith("---"):
         fails.append("carrier:front_matter")
 
     # 交付模式：multi_turn 基本不变量
@@ -914,7 +914,7 @@ def generate_batch(
             if attempts_per_combo[key_tmp] >= block_fail_threshold and success_per_combo.get(key_tmp, 0) == 0:
                 blocked_combos.add(key_tmp)
             continue
-        final_txt = preview_txt
+        final_txt = txt  # Always emit the adjudicated text so anchors survive when required
         seen_signatures.add(sig)
         success_per_combo[key] += 1
         success_per_combo[key_tmp] += 1

@@ -133,10 +133,10 @@ def _resolve_structural_ratio(pin: Optional[dict[str, Any]] | None) -> float:
             except Exception:
                 return default
             if isinstance(pin, dict):
-                pin.setdefault("structural_pos_ratio", value)
+                pin["structural_pos_ratio"] = value
             return value
-        if getter("structural_p", None) is not None:
-            ratio = getter("structural_p", None)
+        legacy_ratio = getter("structural_p", None)
+        if legacy_ratio is not None:
             if not _STRUCT_RATIO_DEPRECATION_WARNED:
                 warnings.warn(
                     "DSL pin key 'structural_p' is deprecated; use 'structural_pos_ratio' instead.",
@@ -145,11 +145,11 @@ def _resolve_structural_ratio(pin: Optional[dict[str, Any]] | None) -> float:
                 )
                 _STRUCT_RATIO_DEPRECATION_WARNED = True
             try:
-                value = float(ratio)
+                value = float(legacy_ratio)
             except Exception:
                 value = default
             if isinstance(pin, dict):
-                pin.setdefault("structural_pos_ratio", value)
+                pin["structural_pos_ratio"] = value
             return value
     return default
 
