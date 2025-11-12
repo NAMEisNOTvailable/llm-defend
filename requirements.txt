@@ -15,9 +15,14 @@ numba>=0.58
 xxhash>=3.4
 
 # Soft-evidence extraction pipeline (extract_and_bank_zh_phrases.py)
+FlagEmbedding>=1.2
+hanlp>=2.1
+hdbscan>=0.8
 jieba>=0.42.1
+numexpr>=2.8
 sentence-transformers>=2.7.0
 scikit-learn>=1.3
 psutil>=5.9  # optional: CPU memory budgeting for extractor
 torch>=2.1
+umap-learn>=0.5  # provides the umap module used for dimensionality reduction
 # Optional: install jieba-fast for faster tokenisation when wheels are available
