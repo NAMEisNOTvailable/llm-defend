@@ -59,10 +59,15 @@ python extract_and_bank_zh_phrases.py --input source/zh_lines.txt --bank_all
 - [Usage and Outputs](docs/USAGE.md)
 - [Data and Reproducibility](docs/DATA_AND_REPRODUCIBILITY.md)
 - [Source Data Notes](source/README.md)
+- [Data Provenance](DATA_PROVENANCE.md)
 
 ## Related Project
 
 This repository complements [`llm-safety-evaluation`](https://github.com/NAMEisNOTvailable/llm-safety-evaluation), which evaluates Mandarin-English prompt-injection behaviour across multiple LLMs.
+
+## License and Data
+
+Original source code and documentation are licensed under the MIT License. Bundled corpora, mirrored datasets, benchmark prompts, generated prompt corpora, and other data files are not relicensed by this repository. See [Data Provenance](DATA_PROVENANCE.md) before reusing data or generated outputs.
 
 ## Status
 

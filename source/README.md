@@ -16,3 +16,5 @@ Use `extract_and_bank_zh_phrases.py` from the repository root when refreshing ph
 ```bash
 python extract_and_bank_zh_phrases.py --input source/zh_lines.txt --bank_all
 ```
+
+These files are research inputs and are not relicensed by the repository's MIT code license. See [`../DATA_PROVENANCE.md`](../DATA_PROVENANCE.md) for source and reuse notes.
