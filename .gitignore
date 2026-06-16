@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Generated outputs
+outputs/
+*_audit.jsonl
+*_stats.json
+
+# Local/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

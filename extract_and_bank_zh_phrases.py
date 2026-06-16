@@ -2087,7 +2087,7 @@ def main(args):
         return _main_impl(args)
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--input", type=str, default="zh_lines.txt")
+    p.add_argument("--input", type=str, default="source/zh_lines.txt")
     p.add_argument("--seed", type=int, default=2025)
     p.add_argument("--cuda", action="store_true")
     p.add_argument("--top_n", type=int, default=25)
