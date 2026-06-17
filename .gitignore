@@ -10,6 +10,16 @@ outputs/
 *_audit.jsonl
 *_stats.json
 
+# Local/private source data prepared outside the public repository
+source/*.csv
+source/*.json
+source/*.jsonl
+source/*.ndjson
+source/*.txt
+source/datasets/
+!source/samples/
+!source/samples/**
+
 # Local/editor noise
 .DS_Store
 Thumbs.db

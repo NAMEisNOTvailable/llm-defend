@@ -29,8 +29,10 @@ hf_datasets: Optional[Any] = None
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SOURCE_DIR = _REPO_ROOT / "source"
+_PUBLIC_SAMPLE_FILE = _SOURCE_DIR / "samples" / "public_toy_prompts.jsonl"
 
 _DEFAULT_TARGET_FILES: List[Path] = [
+    _PUBLIC_SAMPLE_FILE,
     _SOURCE_DIR / "combined_prompts.jsonl",
     _SOURCE_DIR / "Safety_prompt_instruction_attack_scenarios.jsonl",
     _SOURCE_DIR / "Safety_prompt_typical_safety_scenarios.jsonl",
@@ -985,7 +987,7 @@ def _yield_wildchat(
         remaining = max(0, n - produced)
     if remaining == 0:
         return
-    fallback = _load_local_targets(_DEFAULT_TARGET_FILES[:1], seed=seed + 7)
+    fallback = _load_local_targets(_DEFAULT_TARGET_FILES, seed=seed + 7)
     if not fallback:
         return
     for row in _sample_rows(fallback, remaining, rng):

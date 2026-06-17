@@ -15,13 +15,26 @@ Important files:
 
 ## Data Handling
 
-Raw and derived source inputs are kept under `source/` so the repository root remains focused on executable entry points and package folders.
+The public repository keeps only original toy samples under `source/samples/`.
+Full raw and derived source inputs are intentionally excluded from public git
+because they include third-party, gated, derived, and potentially unsafe prompt
+corpora.
 
-The current local sources are provenance-tracked in [`../DATA_PROVENANCE.md`](../DATA_PROVENANCE.md). They include Safety-Prompts, JailBench, JailJudge, and MultiJail-derived inputs, plus local compilation/extraction files such as `combined_prompts.jsonl` and `zh_lines.txt`.
+Use `scripts/prepare_source_data.py` with an access-controlled local export
+before running experiments that require the complete source corpus. Expected
+local sources are provenance-tracked in
+[`../DATA_PROVENANCE.md`](../DATA_PROVENANCE.md). They include Safety-Prompts,
+JailBench, JailJudge, and MultiJail-derived inputs, plus local
+compilation/extraction files such as `combined_prompts.jsonl` and
+`zh_lines.txt`.
 
-The root-level duplicate `zh_lines.txt` was removed because the canonical local copy is `source/zh_lines.txt`.
+The full prepared files remain local/private and are ignored by git. The public
+toy sample is only for smoke tests and documentation.
 
-For reproducible research, record the upstream dataset revision, accepted license/access terms, preprocessing script, random seed, and generated audit sidecar for each run. The bundled local snapshots are useful for portfolio review, but fresh upstream exports are preferred when running new quantitative experiments.
+For reproducible research, record the upstream dataset revision, accepted
+license/access terms, preprocessing script, random seed, and generated audit
+sidecar for each run. Fresh upstream exports are preferred when running new
+quantitative experiments.
 
 ## Review Notes
 
