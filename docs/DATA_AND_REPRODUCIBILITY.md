@@ -15,9 +15,13 @@ Important files:
 
 ## Data Handling
 
-Raw and bundled corpora are kept under `source/` so the repository root remains focused on executable entry points and package folders.
+Raw and derived source inputs are kept under `source/` so the repository root remains focused on executable entry points and package folders.
 
-The root-level duplicate `zh_lines.txt` was removed because the canonical copy is `source/zh_lines.txt`.
+The current local sources are provenance-tracked in [`../DATA_PROVENANCE.md`](../DATA_PROVENANCE.md). They include Safety-Prompts, JailBench, JailJudge, and MultiJail-derived inputs, plus local compilation/extraction files such as `combined_prompts.jsonl` and `zh_lines.txt`.
+
+The root-level duplicate `zh_lines.txt` was removed because the canonical local copy is `source/zh_lines.txt`.
+
+For reproducible research, record the upstream dataset revision, accepted license/access terms, preprocessing script, random seed, and generated audit sidecar for each run. The bundled local snapshots are useful for portfolio review, but fresh upstream exports are preferred when running new quantitative experiments.
 
 ## Review Notes
 

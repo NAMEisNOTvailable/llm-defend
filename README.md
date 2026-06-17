@@ -11,7 +11,7 @@ This repository is presented as an AI safety and LLM security portfolio project.
 | Domain | LLM security, prompt-injection data generation, Chinese adversarial prompting |
 | Main entry point | `v3.py` |
 | Core packages | `compose/`, `dedupe/`, `dsl_core/` |
-| Data sources | `source/` |
+| Data sources | Provenance-tracked Safety-Prompts, JailBench, JailJudge, and MultiJail-derived inputs under `source/` |
 | Key outputs | Generated JSONL datasets, audit sidecars, coverage/statistics reports |
 
 ## What This Demonstrates
@@ -28,7 +28,7 @@ This repository is presented as an AI safety and LLM security portfolio project.
 compose/       Dataset composition pipeline, CLI options, balancing, workers, audits
 dedupe/        Similarity and deduplication backends
 dsl_core/      DSL schemas, renderers, anchors, invariants, and sandbox helpers
-source/        Bundled corpora and source datasets used by the composer
+source/        Provenance-tracked third-party and locally derived source inputs used by the composer
 docs/          Architecture, usage, and reproducibility notes
 v3.py          Main orchestration CLI
 ```
@@ -67,7 +67,7 @@ This repository complements [`llm-safety-evaluation`](https://github.com/NAMEisN
 
 ## License and Data
 
-Original source code and documentation are licensed under the MIT License. Bundled corpora, mirrored datasets, benchmark prompts, generated prompt corpora, and other data files are not relicensed by this repository. See [Data Provenance](DATA_PROVENANCE.md) before reusing data or generated outputs.
+Original source code and documentation are licensed under the MIT License. Third-party and locally derived source inputs under `source/`, benchmark prompts, generated prompt corpora, and other data files are not relicensed by this repository. See [Data Provenance](DATA_PROVENANCE.md) before reusing data or generated outputs.
 
 ## Status
 

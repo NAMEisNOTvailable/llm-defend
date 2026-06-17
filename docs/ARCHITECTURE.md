@@ -18,7 +18,7 @@
 | `compose/` | CLI, generation state, attack rendering, quota/balancing, workers, audits, and serialization |
 | `dedupe/` | SimHash, MinHash-LSH, hashed trigram comparison, and optional vector/ANN dedupe helpers |
 | `dsl_core/` | Attack specs, anchors, invariants, renderers, soft evidence, and sandbox utilities |
-| `source/` | Local corpora and dataset loaders used for prompt composition |
+| `source/` | Provenance-tracked third-party and locally derived source inputs used for prompt composition |
 
 ## Design Priorities
 
