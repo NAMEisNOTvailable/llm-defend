@@ -56,12 +56,12 @@ Prepared full data includes adversarial, unsafe, or policy-violating prompt
 examples because the project is about LLM security evaluation. Those examples
 are intentionally excluded from the public repository and should be handled only
 for defensive evaluation, reproducible safety research, and portfolio review.
-They should not be treated as endorsement, operational guidance, or a
-deployable attack dataset.
+They are provided for defensive evaluation context, not endorsement or
+operational guidance.
 
-## Reviewer Guidance
+## Reuse Guidance
 
-For portfolio review, inspect the code, public sample layout, provenance
+For portfolio inspection, review the code, public sample layout, provenance
 boundary, and reproducibility design. For reuse outside review, cite the
 upstream datasets, comply with their licenses and acceptable-use terms, and keep
 derived outputs clearly separated from original source code.

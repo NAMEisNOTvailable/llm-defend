@@ -3,7 +3,7 @@
 
 The public repository intentionally does not mirror full third-party or derived
 prompt corpora. This helper copies an explicitly supplied private/exported
-source directory into the local `source/` tree for reviewers or experiments
+source directory into the local `source/` tree for experiments
 that already have permission to access those files.
 """
 

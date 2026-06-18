@@ -20,7 +20,7 @@ This repository is presented as an AI safety and LLM security portfolio project.
 - Built a DSL-driven generation system for attack families, carriers, payloads, anchors, and hard negatives.
 - Implemented multi-stage deduplication using SimHash, MinHash-LSH, hashed trigram similarity, and optional ANN/vector backends.
 - Added Chinese-language micro-grammar tooling to improve lexical variety while controlling CN-share and prompt style.
-- Produced audit and statistics outputs so generated datasets can be reviewed rather than treated as opaque synthetic data.
+- Produced audit and statistics outputs that make generated datasets easier to inspect and compare.
 
 ## Repository Structure
 

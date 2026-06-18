@@ -1,6 +1,6 @@
 # Architecture Notes
 
-`llm-defend` is organised as a dataset-composition pipeline rather than a single script.
+`llm-defend` is organised as a modular dataset-composition pipeline.
 
 ## Main Flow
 

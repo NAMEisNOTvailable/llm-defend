@@ -55,4 +55,4 @@ from the local private `zh_lines.txt` file:
 python extract_and_bank_zh_phrases.py --input source/zh_lines.txt --bank_all
 ```
 
-The extractor is intentionally separate from the main composer so reviewers can inspect generation and phrase-bank refresh as different workflow stages.
+The extractor is separate from the main composer so generation and phrase-bank refresh can be inspected as different workflow stages.
