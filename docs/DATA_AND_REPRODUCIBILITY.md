@@ -15,8 +15,8 @@ Important files:
 
 ## Data Handling
 
-The public repository keeps only original toy samples under `source/samples/`.
-Full raw and derived source inputs are intentionally excluded from public git
+The repository keeps only original toy samples under `source/samples/`.
+Full raw and derived source inputs are intentionally excluded from git
 because they include third-party, gated, derived, and potentially unsafe prompt
 corpora.
 
@@ -28,7 +28,7 @@ JailBench, JailJudge, and MultiJail-derived inputs, plus local
 compilation/extraction files such as `combined_prompts.jsonl` and
 `zh_lines.txt`.
 
-The full prepared files remain local/private and are ignored by git. The public
+The full prepared files remain local and are ignored by git. The
 toy sample is only for smoke tests and documentation.
 
 For reproducible research, record the upstream dataset revision, accepted

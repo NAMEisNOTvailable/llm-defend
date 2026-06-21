@@ -596,7 +596,7 @@ def read_lines(path):
         return [ln.strip() for ln in f if ln.strip()]
 
 def _bank_sim_scores_for(local_vecs: torch.Tensor, kinds: list[str]) -> Optional[torch.Tensor]:
-    """??????? bank ?????????? kinds ?? max?????? bank ?? None?"""
+    """Return each local vector's best similarity to the selected phrase banks."""
     sims = None
     for k in kinds:
         bank = BANK_EMBS.get(k)
@@ -613,7 +613,7 @@ def _fused_rescore(
     kinds: list[str],
     gamma: float = 0.35,
 ) -> list[str]:
-    """???????doc??? + bank??????????gamma?[0,1]"""
+    """Rescore phrases with document similarity and phrase-bank similarity."""
     with torch.inference_mode():
         s_doc = util.cos_sim(doc_vec, local_vecs)[0]
     s_bank = _bank_sim_scores_for(local_vecs, kinds)
@@ -843,7 +843,7 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
                             cand_idx = torch.topk(s_bank, k=topk).indices.tolist()
                             extras = [remain[i] for i in cand_idx]
                             picked = list(dict.fromkeys(picked + extras))
-                # ---- C. ??????? ----
+                # ---- C. Fused rescoring ----
                 idx_map = {t: i for i, t in enumerate(local_texts)}
                 sel_idx = torch.tensor([idx_map[t] for t in picked if t in idx_map], device=local_vecs.device)
                 if sel_idx.numel():
@@ -937,7 +937,7 @@ def keybert_candidates(docs, st_model, top_n=20, ngram_word=(2,6), ngram_char=(3
                     cand_idx = torch.topk(s_bank, k=topk).indices.tolist()
                     extras = [remain[i] for i in cand_idx]
                     picked = list(dict.fromkeys(picked + extras))
-        # ---- C. ??????? ----
+        # ---- C. Fused rescoring ----
         idx_map = {t: i for i, t in enumerate(local_texts)}
         sel_idx = torch.tensor([idx_map[t] for t in picked if t in idx_map], device=local_vecs.device)
         if sel_idx.numel():
@@ -1120,7 +1120,7 @@ def _soft_gate_worker_range(payload):
         phrases = _PHRASES_VIEW[start:end]
     else:
         phrases = chunk
-    _ensure_jieba_initialized()  # 每个进程初始�?jieba
+    _ensure_jieba_initialized()  # Initialize jieba in each worker process.
     passed = []
     for offset, s in enumerate(phrases):
         idx = start + offset
@@ -1475,7 +1475,7 @@ def _load_candidate_cache(path_str: str) -> Optional[tuple[list[str], list[str],
         pass
     try:
         suffix_combo = ''.join(cache_path.suffixes) or cache_path.suffix
-        # suffix_combo 可能�?".pkl.gz"；endswith('.gz') 会命�?gzip
+        # suffix_combo may be ".pkl.gz"; endswith(".gz") selects gzip.
         opener = gzip.open if suffix_combo.endswith('.gz') else open
         with opener(cache_path, 'rb') as f:
             payload = pickle.load(f)

@@ -10,7 +10,7 @@ outputs/
 *_audit.jsonl
 *_stats.json
 
-# Local/private source data prepared outside the public repository
+# Local source data prepared outside this repository
 source/*.csv
 source/*.json
 source/*.jsonl

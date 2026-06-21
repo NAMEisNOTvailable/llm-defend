@@ -1,7 +1,7 @@
 # Source Data
 
-This public repository intentionally does not mirror full third-party, gated,
-derived, or potentially unsafe prompt-source corpora.
+This repository intentionally does not mirror full third-party, gated, derived,
+or potentially unsafe prompt-source corpora.
 
 Committed public files under this directory are limited to:
 
@@ -13,10 +13,10 @@ Committed public files under this directory are limited to:
 Full local experiment inputs such as `combined_prompts.jsonl`, `zh_lines.txt`,
 Safety-Prompts exports, JailBench exports, JailJudge files, and MultiJail
 exports are ignored by git and should be prepared from an access-controlled
-private export or directly from upstream sources:
+local export or directly from upstream sources:
 
 ```bash
-python scripts/prepare_source_data.py --private-source ../llm-defend-private-data/source
+python scripts/prepare_source_data.py --source-dir ../llm-defend-source/source
 ```
 
 After preparing the full source data locally, phrase banks can be refreshed with:

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Prepare local source data for llm-defend experiments.
 
-The public repository intentionally does not mirror full third-party or derived
-prompt corpora. This helper copies an explicitly supplied private/exported
-source directory into the local `source/` tree for experiments
-that already have permission to access those files.
+This repository keeps only toy samples and provenance notes. This helper copies
+an explicitly supplied local source-data directory into the `source/` tree for
+experiments that already have permission to access those files.
 """
 
 from __future__ import annotations
@@ -51,9 +50,9 @@ def main() -> int:
         description="Copy an access-controlled llm-defend source-data export into the local source tree."
     )
     parser.add_argument(
-        "--private-source",
+        "--source-dir",
         default=None,
-        help="Path to a private/exported source directory. Defaults to LLM_DEFEND_PRIVATE_SOURCE if set.",
+        help="Path to a local source-data directory. Defaults to LLM_DEFEND_SOURCE_DIR if set.",
     )
     parser.add_argument(
         "--dest",
@@ -68,21 +67,21 @@ def main() -> int:
     parser.add_argument(
         "--check-only",
         action="store_true",
-        help="Only report which expected files are available in --private-source.",
+        help="Only report which expected files are available in --source-dir.",
     )
     args = parser.parse_args()
 
     import os
 
-    source_arg = args.private_source or os.getenv("LLM_DEFEND_PRIVATE_SOURCE")
+    source_arg = args.source_dir or os.getenv("LLM_DEFEND_SOURCE_DIR")
     if not source_arg:
-        parser.error("provide --private-source or set LLM_DEFEND_PRIVATE_SOURCE")
+        parser.error("provide --source-dir or set LLM_DEFEND_SOURCE_DIR")
 
     src_root = Path(source_arg).expanduser().resolve()
     dst_root = (_repo_root() / args.dest).resolve()
 
     if not src_root.exists() or not src_root.is_dir():
-        raise SystemExit(f"Private source directory not found: {src_root}")
+        raise SystemExit(f"Source data directory not found: {src_root}")
 
     counts = {"available": 0, "copied": 0, "exists": 0, "missing": 0}
     for rel_path in EXPECTED_SOURCE_FILES:
@@ -97,7 +96,7 @@ def main() -> int:
         print(f"Missing {counts['missing']} expected file(s); inspect upstream access and export steps.")
         return 1
     if args.check_only:
-        print(f"Validated source export at {src_root}")
+        print(f"Validated source data at {src_root}")
     else:
         print(f"Prepared source data in {dst_root}")
     return 0

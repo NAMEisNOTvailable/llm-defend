@@ -8,7 +8,7 @@ Run commands from the repository root:
 python v3.py --out outputs/demo.jsonl --n 500 --seed 42 --use_dsl
 ```
 
-For a public-repository-only smoke run, use the toy sample explicitly:
+For a smoke run that uses only committed files, pass the toy sample explicitly:
 
 ```bash
 python v3.py --out outputs/demo.jsonl --n 50 --seed 42 --use_dsl \
@@ -38,18 +38,18 @@ For an output path such as `outputs/demo.jsonl`, the pipeline can produce:
 
 ## Source Data Preparation
 
-The public repository does not ship the full third-party or derived prompt
+The repository does not ship the full third-party or derived prompt
 source corpus. Prepare it from an access-controlled local export before running
 experiments that need the full data:
 
 ```bash
-python scripts/prepare_source_data.py --private-source ../llm-defend-private-data/source
+python scripts/prepare_source_data.py --source-dir ../llm-defend-source/source
 ```
 
 ## Phrase Bank Refresh
 
 After full source data has been prepared locally, refresh Chinese phrase banks
-from the local private `zh_lines.txt` file:
+from the local `zh_lines.txt` file:
 
 ```bash
 python extract_and_bank_zh_phrases.py --input source/zh_lines.txt --bank_all

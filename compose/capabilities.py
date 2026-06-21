@@ -133,7 +133,8 @@ def _probe_capability(
             dur = time.perf_counter() - start_ts if start_ts is not None else 0.0
             print(f"[capability][probe] {name} fail ({dur:.4f}s): {_fmt_exc(exc)}")
         _register_capability(name, False, _fmt_exc(exc))
-        raise
+        _CAPABILITY_CACHE[name] = None
+        return None
     detail = success_detail
     if isinstance(result, CapabilityProbeResult):
         if result.detail:

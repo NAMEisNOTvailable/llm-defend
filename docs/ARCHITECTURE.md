@@ -19,7 +19,7 @@
 | `dedupe/` | SimHash, MinHash-LSH, hashed trigram comparison, and optional vector/ANN dedupe helpers |
 | `dsl_core/` | Attack specs, anchors, invariants, renderers, soft evidence, and sandbox utilities |
 | `source/` | Public toy samples plus local-only prepared source data ignored by git |
-| `scripts/` | Data-preparation helpers for private/upstream source exports |
+| `scripts/` | Data-preparation helpers for local upstream-source exports |
 
 ## Design Priorities
 

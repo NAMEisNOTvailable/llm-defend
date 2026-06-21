@@ -1,8 +1,10 @@
 # LLM Defend
 
+[![Smoke tests](https://github.com/NAMEisNOTvailable/llm-defend/actions/workflows/smoke.yml/badge.svg)](https://github.com/NAMEisNOTvailable/llm-defend/actions/workflows/smoke.yml)
+
 Chinese-first prompt-injection dataset composer for building coverage-balanced adversarial prompts, hard negatives, and reproducible LLM safety evaluation inputs.
 
-This repository is presented as an AI safety and LLM security portfolio project. It focuses on deterministic dataset generation, Chinese prompt-injection coverage, deduplication, and research-grade auditability.
+The project focuses on deterministic dataset generation, Chinese prompt-injection coverage, deduplication, and research-grade auditability for LLM security evaluation.
 
 ## Project Snapshot
 
@@ -11,7 +13,7 @@ This repository is presented as an AI safety and LLM security portfolio project.
 | Domain | LLM security, prompt-injection data generation, Chinese adversarial prompting |
 | Main entry point | `v3.py` |
 | Core packages | `compose/`, `dedupe/`, `dsl_core/` |
-| Data sources | Public toy samples plus prepare scripts/provenance for private or upstream source data |
+| Data sources | Toy samples plus preparation scripts/provenance for local upstream-source data |
 | Key outputs | Generated JSONL datasets, audit sidecars, coverage/statistics reports |
 
 ## What This Demonstrates
@@ -28,7 +30,7 @@ This repository is presented as an AI safety and LLM security portfolio project.
 compose/       Dataset composition pipeline, CLI options, balancing, workers, audits
 dedupe/        Similarity and deduplication backends
 dsl_core/      DSL schemas, renderers, anchors, invariants, and sandbox helpers
-source/        Public toy samples plus notes for preparing local/private source inputs
+source/        Toy samples plus notes for preparing local source inputs
 scripts/       Data-preparation helpers
 docs/          Architecture, usage, and reproducibility notes
 v3.py          Main orchestration CLI
@@ -53,12 +55,12 @@ Prepare full source data from an access-controlled local export before running
 experiments that require the complete third-party or derived corpora:
 
 ```bash
-python scripts/prepare_source_data.py --private-source ../llm-defend-private-data/source
+python scripts/prepare_source_data.py --source-dir ../llm-defend-source/source
 python extract_and_bank_zh_phrases.py --input source/zh_lines.txt --bank_all
 ```
 
-The public repository intentionally does not mirror the full prompt-source
-corpora. Review [`DATA_PROVENANCE.md`](DATA_PROVENANCE.md) before preparing or
+This repository intentionally does not mirror the full prompt-source corpora.
+Review [`DATA_PROVENANCE.md`](DATA_PROVENANCE.md) before preparing or
 reusing any non-toy data.
 
 ## Documentation
@@ -77,10 +79,10 @@ This repository complements [`llm-safety-evaluation`](https://github.com/NAMEisN
 
 Original source code, documentation, and public toy samples are licensed under
 the MIT License. Full third-party and locally derived source inputs are not
-distributed in this public repository and are not relicensed by it. See [Data
+distributed in this repository and are not relicensed by it. See [Data
 Provenance](DATA_PROVENANCE.md) before preparing, reusing, or publishing any
 non-toy data or generated outputs.
 
 ## Status
 
-Research portfolio project. The code is intended to demonstrate AI safety tooling, reproducible dataset generation, and security-focused evaluation design.
+Research tooling project for AI safety data generation, reproducible dataset construction, and security-focused evaluation design.
