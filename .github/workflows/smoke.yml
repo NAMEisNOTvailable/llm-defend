@@ -48,5 +48,44 @@ jobs:
           ):
               importlib.import_module(module_name)
 
+          import ast
+
+          tree = ast.parse(open("v3.py", encoding="utf-8").read())
+          func = next(
+              node for node in tree.body
+              if isinstance(node, ast.FunctionDef) and node.name == "is_benign_strict"
+          )
+          names = {node.id for node in ast.walk(func) if isinstance(node, ast.Name)}
+          if "ok_inv" in names or "ok_inv2" in names:
+              raise SystemExit("is_benign_strict uses the old ambiguous ok_inv naming")
+
+          def returns_false(node):
+              return (
+                  isinstance(node, ast.Return)
+                  and isinstance(node.value, ast.Constant)
+                  and node.value.value is False
+              )
+
+          invariant_guards = [
+              node for node in ast.walk(func)
+              if isinstance(node, ast.If)
+              and isinstance(node.test, ast.Name)
+              and node.test.id in {"inv_hit", "inv_hit2"}
+              and node.body
+              and returns_false(node.body[0])
+          ]
+          if {node.test.id for node in invariant_guards} != {"inv_hit", "inv_hit2"}:
+              raise SystemExit("is_benign_strict must reject when invariant hits are present")
+
+          except_handlers = [
+              node for node in ast.walk(func)
+              if isinstance(node, ast.ExceptHandler)
+          ]
+          if len(except_handlers) < 2 or not all(
+              handler.body and returns_false(handler.body[0])
+              for handler in except_handlers[-2:]
+          ):
+              raise SystemExit("is_benign_strict must fail closed on invariant-check exceptions")
+
           print("Python smoke checks passed.")
           PY

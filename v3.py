@@ -896,13 +896,13 @@ def is_benign_strict(text: str, contract: TaskContract) -> bool:
     if ov:
         return False
     # 1) 契约一致性：良性任务不得出现覆盖/结果槽强制/越权工具/上游泄露/路径写入等
-    ok_inv = True
+    inv_hit = False
     try:
         events = parse_events_from_text(text)
-        ok_inv, _ = adjudicate_event_invariants(contract, events)
+        inv_hit, _ = adjudicate_event_invariants(contract, events)
     except Exception:
-        ok_inv = True
-    if not ok_inv:
+        return False
+    if inv_hit:
         return False
     # 2) 结构等价对照：将现文本做“无注入等价化”后再次过一遍上面的检查
     iso = neutralize_anchors(strip_attack_intent(text))
@@ -910,11 +910,11 @@ def is_benign_strict(text: str, contract: TaskContract) -> bool:
         return False
     try:
         events2 = parse_events_from_text(iso)
-        ok_inv2, _ = adjudicate_event_invariants(contract, events2)
-        if not ok_inv2:
+        inv_hit2, _ = adjudicate_event_invariants(contract, events2)
+        if inv_hit2:
             return False
     except Exception:
-        pass  # 如果 DSL 不可用，忽略此步
+        return False
     return True
 # ----  plain negatives (真实世界良性指令) ----
 
